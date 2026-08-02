@@ -1,6 +1,7 @@
 .env
 logs/
 memory/global_mem*.txt
+memory/ocr_history.jsonl
 __pycache__/
 *.pyc
 .pytest_cache/
