@@ -45,15 +45,28 @@ _COMMANDS: Final[dict[str, str]] = {
 }
 
 # Created lazily so importing gacore.cli works in non-console environments (tests, CI).
+# Falls back to builtin input() when no real console is available (e.g. PyCharm Run,
+# piping, CI without a TTY) where prompt_toolkit would raise NoConsoleScreenBufferError.
 _session: PromptSession | None = None
+_use_fallback: bool = False
 
 
 def _default_input(prompt: str) -> str:
-    """Read one line via prompt_toolkit (Ctrl-D raises EOFError, Ctrl-C KeyboardInterrupt)."""
-    global _session
+    """Read one line: prompt_toolkit if a console is available, else builtin input()."""
+    global _session, _use_fallback
+    if _use_fallback:
+        return input(prompt)
     if _session is None:
-        _session = PromptSession()
-    return _session.prompt(prompt)
+        try:
+            _session = PromptSession()
+        except Exception:  # noqa: BLE001 — no console / no TTY
+            _use_fallback = True
+            return input(prompt)
+    try:
+        return _session.prompt(prompt)
+    except Exception:  # noqa: BLE001 — console disappeared mid-session
+        _use_fallback = True
+        return input(prompt)
 
 
 def _interrupt_payload(chunk: dict) -> dict | None:
