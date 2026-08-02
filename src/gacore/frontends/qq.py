@@ -66,6 +66,7 @@ _LOG_FILE: str = os.environ.get("QQ_LOG_FILE", "").strip()
 _SPLIT_LIMIT: Final = 4500  # QQ markdown message length safety margin
 _RECONNECT_INITIAL: Final = 5
 _RECONNECT_MAX: Final = 300
+_HTTP_TIMEOUT: Final = 30  # botpy default (5s) is too short for slow TLS handshakes
 
 # --------------------------------------------------------------------------- state
 
@@ -136,7 +137,7 @@ def _build_intents() -> botpy.Intents:
 def _make_bot_class(app: QQApp):
     class QQBot(botpy.Client):
         def __init__(self) -> None:
-            super().__init__(intents=_build_intents(), ext_handlers=False)
+            super().__init__(intents=_build_intents(), ext_handlers=False, timeout=_HTTP_TIMEOUT)
 
         async def on_ready(self) -> None:
             name = getattr(getattr(self, "robot", None), "name", "QQBot")
@@ -168,17 +169,25 @@ class QQApp:
     # --------------------------------------------------------------- sending
 
     async def _send_markdown(self, chat_id: str, content: str, *, is_group: bool, msg_id: str | None) -> None:
-        """Send text as markdown, falling back to plain text on error."""
+        """Send text as markdown, falling back to plain text on error. Retries on timeout."""
         if not self.client:
             return
         api = self.client.api.post_group_message if is_group else self.client.api.post_c2c_message
         key = "group_openid" if is_group else "openid"
         for part in _split_text(content):
             seq = _next_seq()
-            try:
-                await api(**{key: chat_id, "msg_type": 2, "markdown": {"content": part}, "msg_id": msg_id, "msg_seq": seq})
-            except Exception:  # noqa: BLE001 — markdown unsupported, fall back to plain text
-                await api(**{key: chat_id, "msg_type": 0, "content": part, "msg_id": msg_id, "msg_seq": seq})
+            for attempt in range(3):
+                try:
+                    await api(**{key: chat_id, "msg_type": 2, "markdown": {"content": part}, "msg_id": msg_id, "msg_seq": seq})
+                    break
+                except Exception:  # noqa: BLE001 — markdown unsupported or timeout, fall back to plain text
+                    try:
+                        await api(**{key: chat_id, "msg_type": 0, "content": part, "msg_id": msg_id, "msg_seq": seq})
+                        break
+                    except Exception:  # noqa: BLE001 — retry
+                        if attempt == 2:
+                            logger.error(f"QQ send failed after 3 attempts: {chat_id}")
+                        await asyncio.sleep(1)
 
     async def send_text(self, chat_id: str, content: str, *, msg_id: str | None = None, is_group: bool = False) -> None:
         await self._send_markdown(chat_id, content, is_group=is_group, msg_id=msg_id)
@@ -250,7 +259,7 @@ class QQApp:
             old_thread = _user_threads.pop(chat_id, None)
             if old_thread:
                 try:
-                    self.graph.delete_thread(old_thread)
+                    self.graph.checkpointer.delete_thread(old_thread)
                 except (KeyError, ValueError, LookupError):
                     pass
             return await self.send_text(chat_id, "✅ 已开启新对话", msg_id=msg_id, is_group=is_group)

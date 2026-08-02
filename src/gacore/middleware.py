@@ -58,13 +58,24 @@ class GAPromptMiddleware(AgentMiddleware[GAState, None, Any]):
         self, request: ModelRequest[None], handler: Any
     ) -> ModelResponse[Any] | AIMessage:
         """Replace the request's system message with the GA per-turn prompt."""
+        req = self._inject_prompt(request)
+        return handler(req)
+
+    async def awrap_model_call(
+        self, request: ModelRequest[None], handler: Any
+    ) -> ModelResponse[Any] | AIMessage:
+        """Async twin of wrap_model_call — required when the graph runs via astream()."""
+        req = self._inject_prompt(request)
+        return await handler(req)
+
+    def _inject_prompt(self, request: ModelRequest[None]) -> ModelRequest[None]:
+        """Build the per-turn system message and return an overridden request."""
         state = request.state
         prompt = build_system_prompt(state, self.cfg)
         folded = fold_history(state.get("messages") or [])
         if folded:
             prompt += f"\n\n{EARLIER_HEADER}\n" + "\n".join(folded)
-        req = request.override(system_message=SystemMessage(content=prompt))
-        return handler(req)
+        return request.override(system_message=SystemMessage(content=prompt))
 
 
 class GATurnLogicMiddleware(AgentMiddleware[GAState, None, Any]):

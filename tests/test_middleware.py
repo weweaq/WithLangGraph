@@ -197,6 +197,29 @@ def _graph(llm: Any, cfg: Config):
     )
 
 
+async def test_graph_astream_async_execution(tmp_cfg: Config, message_llm: Any) -> None:
+    """End to end async (astream): the middleware chain must work without NotImplementedError.
+
+    The QQ frontend drives the graph with astream(); GAPromptMiddleware therefore needs
+    awrap_model_call, and the hook nodes must be callable in async context too.
+    """
+    llm = message_llm(
+        [
+            AIMessage(content="first answer"),
+        ]
+    )
+    graph = _graph(llm, tmp_cfg)
+    state = new_state("hello", tmp_cfg)
+
+    chunks = []
+    async for chunk in graph.astream(state, {"configurable": {"thread_id": "async-e2e"}}, stream_mode="updates"):
+        chunks.append(chunk)
+
+    final = graph.get_state({"configurable": {"thread_id": "async-e2e"}})
+    assert final.values["exit_reason"] == "CURRENT_TASK_DONE"
+    assert any("model" in c for c in chunks)
+
+
 def test_graph_done_hooks_continue_then_complete(
     tmp_cfg: Config, message_llm: Any
 ) -> None:
