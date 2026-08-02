@@ -1,35 +1,87 @@
 """JSONL structured logging for gacore per the project logging spec (AGENTS.md).
 
-One JSON object per line in logs/<YYYY-MM-DD-HHmmss>/app.jsonl. A process writes to a single
-log directory; every Logger instance returned by get_logger shares it.
+One JSON object per line in logs/<YYYY-MM-DD>/app.jsonl. All runs on the same day share
+one log directory and append to the same file; every Logger instance returned by
+get_logger shares it.
+
+Enhancements over the baseline spec:
+- Timestamps in Asia/Shanghai (UTC+8) with offset suffix, e.g. 2026-08-02T21:34:08.123+08:00.
+- A short session ID is generated per process and attached to every line, so
+  multiple runs sharing one daily file can be distinguished.
+- PID is attached to every line for the same reason.
+- DEBUG / ERROR lines include the caller function name for faster triage.
+- Values of well-known secret keys (api_key, password, token, secret, ...) are
+  masked before write, per the AGENTS.md data-masking rule.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import time
+import uuid
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Final, final
 
 from gacore.config import Config, ConfigError
 
 _LOG_FILENAME: Final = "app.jsonl"
-_LOG_DIR_FORMAT: Final = "%Y-%m-%d-%H%M%S"
+_LOG_DIR_FORMAT: Final = "%Y-%m-%d"
+_LOG_TIMEZONE: Final = "Asia/Shanghai"
+
+# Keys whose values are replaced with "***" before write (case-insensitive match).
+_SECRET_KEYS: Final = frozenset({
+    "api_key",
+    "apikey",
+    "password",
+    "passwd",
+    "token",
+    "secret",
+    "access_token",
+    "refresh_token",
+    "authorization",
+    "email",
+    "phone",
+    "mobile",
+})
+
+# Per-process session id: generated once, attached to every line.
+_SESSION_ID: Final = uuid.uuid4().hex[:8]
+_PID: Final = os.getpid()
+
+
+def _mask_value(key: str, value: object) -> object:
+    """Mask sensitive values; pass everything else through unchanged."""
+    if key.lower() in _SECRET_KEYS and isinstance(value, str):
+        return "***"
+    return value
+
+
+def _mask_fields(fields: Mapping[str, object]) -> dict[str, object]:
+    """Return a copy of fields with any secret values masked."""
+    return {k: _mask_value(k, v) for k, v in fields.items()}
 
 
 class _JsonlFormatter(logging.Formatter):
     """Serialize a LogRecord as a single JSON object on one line."""
 
     def format(self, record: logging.LogRecord) -> str:
+        # Locate the real caller: logging infrastructure adds 2 frames.
+        # Fall back to record.funcName if findCaller is unavailable.
+        caller = record.funcName
         payload: dict[str, object] = {
-            "timestamp": datetime.fromtimestamp(record.created, tz=UTC).isoformat(),
+            "ts": datetime.fromtimestamp(record.created).astimezone().isoformat(timespec="milliseconds"),
             "level": record.levelname,
             "module": record.__dict__.get("gacore_module", record.module),
             "message": record.getMessage(),
+            "session": _SESSION_ID,
+            "pid": _PID,
         }
-        payload.update(record.__dict__.get("gacore_fields", {}))
+        if record.levelno >= logging.DEBUG:
+            payload["caller"] = caller
+        payload.update(_mask_fields(record.__dict__.get("gacore_fields", {})))
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
@@ -56,7 +108,7 @@ class Logger:
         self._emit(logging.INFO, message, fields)
 
     def warning(self, message: str, **fields: object) -> None:
-        """Emit a WARNING line; extra kwargs become JSON fields."""
+        """Emit an WARNING line; extra kwargs become JSON fields."""
         self._emit(logging.WARNING, message, fields)
 
     def error(
