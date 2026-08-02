@@ -21,9 +21,11 @@ gacore 用 [LangGraph](https://langchain-ai.github.io/langgraph/) 重新实现�
   `GATurnLogicMiddleware`（exit_reason 短路、max_turns 守卫、空响应重试、
   done_hooks 续接、任务完成），通过官方 `hook_config`/`jump_to` 通道改变控制流，
   见 ARCHITECTURE.md 的拓扑图。
-- **9 个原子工具**：`code_run`、`file_read`、`file_patch`、`file_write`、
-  `web_scan`、`web_execute_js`、`update_working_checkpoint`、`start_long_term_update`、`ask_user`，
-  与 GA 的工具集一一对应。
+- **10 个原子工具**：`code_run`、`file_read`、`file_patch`、`file_write`、
+   `web_scan`、`web_execute_js`、`browser_history`、`update_working_checkpoint`、
+   `start_long_term_update`、`ask_user`。其中 `browser_history` 读取 Edge 浏览历史
+   （SQLite），支持关键词 / 域名 / 时间范围过滤，返回 url、title、visit_count、
+   last_visit_time；其余 9 个与 GA 的工具集一一对应。
 - **工作记忆 / 长期记忆（L1 / L2）**：`update_working_checkpoint` 写入工作记忆
   （每轮注入系统提示词），`start_long_term_update` 把内容蒸馏到
   `memory/global_mem.txt`（L2 全局事实）与 `memory/global_mem_insight.txt`（L1 洞察索引）。
@@ -36,8 +38,8 @@ gacore 用 [LangGraph](https://langchain-ai.github.io/langgraph/) 重新实现�
   回环）。
 - **LLM 异常兜底**：官方 `ModelRetryMiddleware`（max_retries=0）把 provider 异常
   转成 `[Agent error: ...]` 消息，图以 `AGENT_ERROR` 干净退出，不崩溃。
-- **JSONL 结构化日志**：每次运行写入独立目录 `logs/YYYY-MM-DD-HHmmss/app.jsonl`，
-  每条日志含 timestamp / level / module / message，错误日志附 error_type / stack_trace / context。
+- **JSONL 结构化日志**：每天写入 `logs/YYYY-MM-DD/app.jsonl`，同一天的运行追加到同一文件，
+   每条日志含 timestamp / level / module / message，错误日志附 error_type / stack_trace / context。
 
 ---
 
@@ -154,15 +156,16 @@ python -m gacore
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m pytest tests -q      # 当前 144 个用例全部通过
+python -m pytest tests -q      # 当前 168 个用例全部通过
 python -m ruff check src tests # lint 干净
 ```
 
-144 个测试覆盖：状态初始化、middleware（before_model 短路 / max_turns 守卫、
+168 个测试覆盖：状态初始化、middleware（before_model 短路 / max_turns 守卫、
 after_model 空响应重试 / done_hooks 续接 / 完成 / AGENT_ERROR）单测与图集成、
 LLM 工厂（openai / anthropic / deepseek 分支与缺失 Key 报错）、工具注册表、
-code_run / file / memory / web 四组工具、ask_user 中断与恢复（含 langgraph 两种
-中断表象）、端到端多轮循环与 done_hooks 续接、流式 REPL 输出与斜杠命令。
+code_run / file / memory / web / browser_history 五组工具、ask_user 中断与恢复
+（含 langgraph 两种中断表象）、端到端多轮循环与 done_hooks 续接、流式 REPL
+输出与斜杠命令。
 
 ---
 
@@ -174,7 +177,7 @@ code_run / file / memory / web 四组工具、ask_user 中断与恢复（含 lan
 | `agent_loop.py`（工具分发、`StepOutcome`） | 预置 `ToolNode` + `Command(update=...)` | 工具执行；控制信号（`exit_reason` / `working`）由工具直接经 Command 回写 |
 | `agent_loop.py`（`no_tool` 分支、`_done_hooks`） | `middleware.py`（`GATurnLogicMiddleware`） | 最终答案校验 + done_hooks 续接（after_model 钩子） |
 | `ga.py`（`turn_end_callback` :570、`_get_anchor_prompt`、`get_global_memory` :602） | `context.py` | 每轮提示词组装（系统提示词 + 折叠历史 + 周期提示） |
-| `ga.py`（`do_code_run` / `do_file_*` / `do_ask_user` 等） | `tools/*.py` | 9 个原子工具 |
+| `ga.py`（`do_code_run` / `do_file_*` / `do_ask_user` 等） | `tools/*.py` | 10 个原子工具（含 `browser_history`，GA 无对应） |
 | `llmcore.py`（`client.chat` / Session） | `llm.py` | LLM 工厂，openai / anthropic / deepseek 三选一 |
 | `mykey.py` / `NativeToolClient` | `llm.py`（环境变量驱动） | 配置方式替换 |
 | `frontends/tui_v3.py` | `cli.py` | 交互前端（REPL） |
@@ -217,10 +220,10 @@ WithLangGraph/
 │   ├── llm.py                # LLM 工厂
 │   ├── config.py             # 配置解析（目录 / max_turns）
 │   ├── logging.py            # JSONL 日志
-│   ├── tools/                # 9 个工具
+│   ├── tools/                # 10 个工具（含 browser_history）
 │   └── memory/               # 记忆模块（预留）
 ├── config/assets/            # sys_prompt.txt（L0 规则）、code_run_header.py
 ├── memory/                   # L1 / L2 记忆文件（运行时生成）
 ├── logs/                     # JSONL 日志（运行时生成）
-└── tests/                    # 144 个测试
+└── tests/                    # 168 个测试
 ```
