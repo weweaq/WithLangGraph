@@ -132,3 +132,93 @@ async def test_on_message_new_resets_thread():
         await app.on_message(msg, is_group=False)
 
     assert "user-1" not in qq._user_threads
+
+
+@pytest.mark.asyncio
+async def test_reboot_denied_for_non_admin():
+    """Given /reboot from a non-admin, the user is refused and no process restart happens."""
+    _processed_ids.clear()
+    qq._ADMIN_IDS = frozenset({"admin-1"})
+
+    graph = MagicMock()
+    app = QQApp(graph)
+    app.client = MagicMock()
+    app.send_text = AsyncMock()
+
+    msg = MagicMock()
+    msg.id = "msg-reboot-nonadmin"
+    msg.content = "/reboot"
+    msg.author = MagicMock()
+    msg.author.user_openid = "user-1"
+    msg.author.id = "user-1"
+
+    with (
+        patch.object(qq, "_ALLOWED", frozenset({"user-1", "admin-1"})),
+        patch.object(qq.os, "execv") as execv,
+    ):
+        await app.on_message(msg, is_group=False)
+
+    out = app.send_text.call_args.args[1]
+    assert "无权限" in out
+    execv.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reboot_denied_when_no_admin_configured():
+    """Given /reboot with an empty QQ_ADMIN_USERS, nobody may restart the process."""
+    _processed_ids.clear()
+    qq._ADMIN_IDS = frozenset()
+
+    graph = MagicMock()
+    app = QQApp(graph)
+    app.client = MagicMock()
+    app.send_text = AsyncMock()
+
+    msg = MagicMock()
+    msg.id = "msg-reboot-noadmin"
+    msg.content = "/reboot"
+    msg.author = MagicMock()
+    msg.author.user_openid = "user-1"
+    msg.author.id = "user-1"
+
+    with (
+        patch.object(qq, "_ALLOWED", frozenset({"user-1"})),
+        patch.object(qq.os, "execv") as execv,
+    ):
+        await app.on_message(msg, is_group=False)
+
+    out = app.send_text.call_args.args[1]
+    assert "无权限" in out
+    execv.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reboot_execs_new_process():
+    """Given /reboot from an admin, a confirm is sent and os.execv restarts the process."""
+    _processed_ids.clear()
+    qq._ADMIN_IDS = frozenset({"admin-1"})
+
+    graph = MagicMock()
+    app = QQApp(graph)
+    app.client = MagicMock()
+    app.send_text = AsyncMock()
+
+    msg = MagicMock()
+    msg.id = "msg-reboot-admin"
+    msg.content = "/reboot"
+    msg.author = MagicMock()
+    msg.author.user_openid = "admin-1"
+    msg.author.id = "admin-1"
+
+    sock = MagicMock()
+    with (
+        patch.object(qq, "_ALLOWED", frozenset({"admin-1"})),
+        patch.object(qq, "_instance_sock", sock),
+        patch.object(qq.os, "execv") as execv,
+    ):
+        await app.on_message(msg, is_group=False)
+
+    first_call_text = app.send_text.call_args.args[1]
+    assert "正在重启" in first_call_text
+    sock.close.assert_called_once()
+    execv.assert_called_once_with(sys.executable, [sys.executable, qq.__file__])

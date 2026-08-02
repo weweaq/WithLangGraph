@@ -13,6 +13,7 @@ Environment variables (see .env.example)::
 
     QQ_APP_ID / QQ_APP_SECRET          QQ Open Platform credentials
     QQ_ALLOWED_USERS = * or openid,...  allowlist (``*`` = public)
+    QQ_ADMIN_USERS = * or openid,...    who may trigger /reboot (``*`` = any allowlisted user)
     QQ_LOG_FILE = logs/qq.log           optional log redirect
 
 ask_user interrupts: when the agent graph pauses on an interrupt, the question is
@@ -24,7 +25,9 @@ continues the same turn without restarting.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -32,8 +35,11 @@ import time
 import traceback
 import uuid
 from collections import deque
+from datetime import datetime
+from pathlib import Path
 from typing import Final
 
+import httpx
 from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
@@ -42,6 +48,7 @@ from gacore.config import Config, load_dotenv
 from gacore.graph import DEFAULT_RECURSION_LIMIT, build_graph
 from gacore.jsonl_logger import get_logger
 from gacore.state import new_state
+from gacore.tools.ocr_tools import ocr_image
 
 load_dotenv()
 
@@ -61,6 +68,10 @@ _APP_SECRET: str = str(os.environ.get("QQ_APP_SECRET", "")).strip()
 _ALLOWED: frozenset[str] = frozenset(
     str(x).strip() for x in os.environ.get("QQ_ALLOWED_USERS", "*").split(",") if str(x).strip()
 )
+# Who may trigger /reboot. Empty = nobody; "*" = anyone in the allowlist; else openid list.
+_ADMIN_IDS: frozenset[str] = frozenset(
+    str(x).strip() for x in os.environ.get("QQ_ADMIN_USERS", "").split(",") if str(x).strip()
+)
 _LOG_FILE: str = os.environ.get("QQ_LOG_FILE", "").strip()
 
 _SPLIT_LIMIT: Final = 4500  # QQ markdown message length safety margin
@@ -74,6 +85,7 @@ _processed_ids: deque[str] = deque(maxlen=2000)          # dedupe by message id
 _pending_interrupt: dict[str, dict] = {}                 # user_id -> graph config awaiting resume
 _user_threads: dict[str, str] = {}                       # user_id -> thread_id
 _graph: CompiledStateGraph | None = None
+_instance_sock: socket.socket | None = None              # single-instance port, released by /reboot
 
 _msg_seq_counter = 0
 _msg_seq_lock = threading.Lock()
@@ -88,6 +100,108 @@ def _next_seq() -> int:
 
 def _is_public() -> bool:
     return "*" in _ALLOWED
+
+
+def _is_admin(user_id: str) -> bool:
+    """Whether a user may trigger /reboot. ``*`` = any allowlisted user; empty list = nobody."""
+    if not _ADMIN_IDS:
+        return False
+    if "*" in _ADMIN_IDS:
+        return _is_public() or user_id in _ALLOWED
+    return user_id in _ADMIN_IDS
+
+
+# --------------------------------------------------------------------------- image helpers
+
+_IMG_TAG_RE: Final = re.compile(r"<img[^>]+src=[\"']([^\"']+)[\"']", re.IGNORECASE)
+_SUMMARY_TAG_RE: Final = re.compile(r"<summary>.*?</summary>", re.DOTALL)
+
+
+def _extract_image_urls(data) -> list[str]:
+    """Extract image URLs from a QQ message: attachments first, then <img> tags in content."""
+    urls: list[str] = []
+    attachments = getattr(data, "attachments", None) or []
+    for att in attachments:
+        url = getattr(att, "url", None)
+        if url and isinstance(url, str):
+            urls.append(url)
+    content = getattr(data, "content", "") or ""
+    urls.extend(m.group(1) for m in _IMG_TAG_RE.finditer(content))
+    return urls
+
+
+async def _download_image(url: str, dest: str) -> bool:
+    """Download an image URL to dest. Returns True on success."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            with open(dest, "wb") as f:
+                f.write(resp.content)
+        return True
+    except Exception:  # noqa: BLE001 — silent degradation
+        logger.warning(f"QQ image download failed: {url}")
+        return False
+
+
+def _build_image_prompt(
+    paths: list[str], ocr_texts: dict[str, str], user_text: str, history_path: str | None = None
+) -> str:
+    """Build a structured prompt embedding OCR-extracted text so the AGENT can analyze it.
+
+    The image content is handed to the model as recognized text (not as a tool call
+    the model must make itself), so the agent always has the content to reason about.
+    When history_path is given, every OCR result is persisted there as JSONL, and the
+    prompt tells the agent it can look up past images via file_read.
+    """
+    n = len(paths)
+    blocks: list[str] = []
+    for i, path in enumerate(paths, start=1):
+        text = ocr_texts.get(path, "")
+        blocks.append(f"图片 {i}（{path}）：\n{text if text else '（OCR 未识别到文字）'}")
+    body = "\n\n".join(blocks)
+    prefix = (
+        f"[用户发送了 {n} 张图片，以下是每张图片 OCR 识别出的文字内容。"
+        f"请基于识别内容理解图片并分析，直接给出结论，不要复述原始识别文本。]\n{body}"
+    )
+    if history_path:
+        prefix += (
+            f"\n\n[历史图片 OCR 记录保存在 {history_path}（JSONL，每行一条，含时间戳与图片路径）。"
+            f"当用户询问之前发送过的图片内容时，用 file_read 读取该文件查询，不要猜测。]"
+        )
+    if user_text:
+        return f"{prefix}\n用户原文：{user_text}"
+    return prefix
+
+
+def _persist_ocr_history(memory_dir: Path, paths: list[str], ocr_texts: dict[str, str]) -> str | None:
+    """Append this batch of OCR results to memory/ocr_history.jsonl; returns the file path.
+
+    Each line is a JSON object: {"ts": iso, "path": image path, "text": recognized text}.
+    Returns None when the write fails (degraded: analysis proceeds without history).
+    """
+    try:
+        memory_dir.mkdir(parents=True, exist_ok=True)
+        history_path = memory_dir / "ocr_history.jsonl"
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        with history_path.open("a", encoding="utf-8") as fh:
+            for path in paths:
+                fh.write(
+                    json.dumps(
+                        {"ts": now, "path": path, "text": ocr_texts.get(path, "")},
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+        return str(history_path)
+    except OSError as exc:
+        logger.error(
+            "QQ image OCR history persist failed",
+            error_type=type(exc).__name__,
+            stack_trace=str(exc),
+            context={"paths": paths},
+        )
+        return None
 
 
 def _split_text(text: str) -> list[str]:
@@ -203,8 +317,6 @@ class QQApp:
             _processed_ids.append(msg_id)
 
             content = (getattr(data, "content", "") or "").strip()
-            if not content:
-                return
 
             author = getattr(data, "author", None)
             user_id = str(
@@ -218,6 +330,17 @@ class QQApp:
                 logger.warning(f"unauthorized QQ user: {user_id}")
                 return
 
+            # --- Image messages: download + route to agent with OCR prompt ---
+            image_urls = _extract_image_urls(data)
+            if image_urls:
+                asyncio.create_task(
+                    self._handle_image_message(chat_id, user_id, image_urls, content, msg_id=msg_id, is_group=is_group)
+                )
+                return
+
+            if not content:
+                return
+
             logger.info(f"QQ message from {user_id} ({'group' if is_group else 'c2c'}): {content[:80]}")
             print(f"[QQ] {user_id} ({'group' if is_group else 'c2c'}): {content[:80]}")
 
@@ -229,7 +352,7 @@ class QQApp:
 
             # 2) Slash commands.
             if content.startswith("/"):
-                await self._handle_command(chat_id, content, msg_id=msg_id, is_group=is_group)
+                await self._handle_command(chat_id, content, user_id=user_id, msg_id=msg_id, is_group=is_group)
                 return
 
             # 3) Normal agent turn.
@@ -240,9 +363,61 @@ class QQApp:
             print("[QQ] handle_message error")
             traceback.print_exc()
 
+    # --------------------------------------------------------------- image handling
+
+    async def _handle_image_message(
+        self,
+        chat_id: str,
+        user_id: str,
+        image_urls: list[str],
+        user_text: str,
+        *,
+        msg_id: str | None,
+        is_group: bool,
+    ) -> None:
+        """Download images, OCR locally, embed recognized text into the prompt, route to agent."""
+        try:
+            await self.send_text(chat_id, "识别中...", msg_id=msg_id, is_group=is_group)
+
+            os.makedirs("temp", exist_ok=True)
+            paths: list[str] = []
+            for i, url in enumerate(image_urls, start=1):
+                dest = os.path.abspath(f"temp/qq_img_{msg_id}_{i}.jpg")
+                if await _download_image(url, dest):
+                    paths.append(dest)
+
+            if not paths:
+                await self.send_text(chat_id, "图片处理失败，请重试", is_group=is_group)
+                return
+
+            # OCR locally first so the agent receives the recognized text directly in
+            # its prompt and can ANALYZE it, instead of being asked to call ocr_image
+            # itself (which would echo the raw tool result back to the user).
+            ocr_texts: dict[str, str] = {}
+            for path in paths:
+                try:
+                    result = await asyncio.to_thread(ocr_image.invoke, {"path": path})
+                    ocr_texts[path] = str((result or {}).get("text") or "")
+                except Exception:  # noqa: BLE001 — per-image OCR failure degrades to empty text
+                    logger.error("QQ image OCR failed", stack_trace=traceback.format_exc(), context={"path": path})
+                    ocr_texts[path] = ""
+
+            # Persist the OCR results so the agent can answer "what was in the image I
+            # sent earlier" — the history file path is surfaced in the prompt.
+            history_path = _persist_ocr_history(Config.default().memory_dir, paths, ocr_texts)
+
+            prompt = _build_image_prompt(paths, ocr_texts, user_text, history_path=history_path)
+            logger.info(f"QQ image OCR from {user_id}: {len(paths)} image(s)")
+            await self._run_agent(chat_id, prompt, user_id, msg_id=msg_id, is_group=is_group)
+        except Exception:  # noqa: BLE001 — silent degradation
+            logger.error("QQ image handling error", stack_trace=traceback.format_exc())
+            await self.send_text(chat_id, "图片处理失败，请重试", is_group=is_group)
+
     # --------------------------------------------------------------- commands
 
-    async def _handle_command(self, chat_id: str, cmd: str, *, msg_id: str | None, is_group: bool) -> None:
+    async def _handle_command(
+        self, chat_id: str, cmd: str, *, user_id: str, msg_id: str | None, is_group: bool
+    ) -> None:
         op = (cmd or "").split()[0].lower()
         if op == "/help":
             return await self.send_text(
@@ -251,10 +426,21 @@ class QQApp:
                 "/help — 显示帮助\n"
                 "/new — 开启新对话(清空上下文)\n"
                 "/status — 查看当前会话状态\n"
-                "/stop — 停止当前任务",
+                "/stop — 停止当前任务\n"
+                "/reboot — 重启服务(管理员)",
                 msg_id=msg_id,
                 is_group=is_group,
             )
+        if op == "/reboot":
+            # Only admins may restart the whole process (reloads code, clears all state).
+            if not _is_admin(user_id):
+                return await self.send_text(chat_id, "⛔ 无权限", msg_id=msg_id, is_group=is_group)
+            await self.send_text(chat_id, "✅ 正在重启，请稍候...", msg_id=msg_id, is_group=is_group)
+            await asyncio.sleep(0.5)  # let the confirm message flush before the process dies
+            if _instance_sock:
+                _instance_sock.close()  # release the single-instance port for the new process
+            os.execv(sys.executable, [sys.executable, __file__])
+            return
         if op == "/new":
             old_thread = _user_threads.pop(chat_id, None)
             if old_thread:
@@ -363,7 +549,15 @@ class QQApp:
 
             # Stream finished: send the final answer (if not already sent via interrupt).
             if reply_parts:
-                final_text = "\n\n".join(p for p in reply_parts if p and not p.startswith("<summary>"))
+                # Strip <summary>...</summary> blocks (GA protocol) instead of dropping
+                # the whole message — the model often puts the summary FIRST, followed
+                # by the real answer, so startswith("<summary>") would swallow the reply.
+                final_parts: list[str] = []
+                for part in reply_parts:
+                    cleaned = _SUMMARY_TAG_RE.sub("", part).strip()
+                    if cleaned:
+                        final_parts.append(cleaned)
+                final_text = "\n\n".join(final_parts)
                 if final_text.strip():
                     await self.send_text(chat_id, final_text, is_group=is_group)
 
@@ -396,12 +590,14 @@ class QQApp:
 
 def _ensure_single_instance(port: int = 19528) -> None:
     """Prevent two QQ frontends from running simultaneously."""
+    global _instance_sock
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.bind(("127.0.0.1", port))
     except OSError:
         print("[QQ] Another instance is already running, skipping...")
         sys.exit(1)
+    _instance_sock = sock
 
 
 def _redirect_log() -> None:
