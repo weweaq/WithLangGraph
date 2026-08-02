@@ -80,13 +80,20 @@ Copy-Item .env.example .env
 
 | 变量 | 说明 | 示例 |
 | :--- | :--- | :--- |
-| `LLM_PROVIDER` | 模型提供方，`openai` 或 `anthropic` | `openai` |
+| `LLM_PROVIDER` | 模型提供方，`openai` / `anthropic` / `deepseek` | `deepseek` |
 | `OPENAI_API_KEY` | OpenAI 系 API Key | `sk-xxx` |
 | `OPENAI_BASE_URL` | OpenAI 兼容网关地址，留空用官方 | `https://api.openai.com/v1` |
 | `OPENAI_MODEL` | OpenAI 模型名 | `gpt-4o` |
 | `ANTHROPIC_API_KEY` | Anthropic API Key | `sk-ant-xxx` |
 | `ANTHROPIC_MODEL` | Anthropic 模型名 | `claude-sonnet-4-5` |
+| `DEEPSEEK_API_KEY` | DeepSeek API Key（`platform.deepseek.com` 获取） | `sk-xxx` |
+| `DEEPSEEK_BASE_URL` | DeepSeek 网关地址，留空用 `https://api.deepseek.com/v1` | `https://api.deepseek.com/v1` |
+| `DEEPSEEK_MODEL` | DeepSeek 模型名 | `deepseek-v4-pro` |
 | `DEFAULT_MAX_TURNS` | 单次任务默认最大轮数 | `40` |
+
+`deepseek` 与 GA 的配置一致（`configure_mykey.py` 中 `type: native_oai`）：走 OpenAI 兼容
+协议，由 `ChatOpenAI` 驱动，默认 base URL 为 `https://api.deepseek.com/v1`、默认模型为
+`deepseek-v4-pro`（可选 `deepseek-v4-flash`）。
 
 另有环境变量可覆盖目录（不写进 .env 也行）：`GACORE_ASSET_DIR`、`GACORE_MEMORY_DIR`、
 `GACORE_LOGS_DIR`、`GACORE_TEMP_DIR`，相对路径以项目根为基准。测试用
@@ -113,7 +120,7 @@ python -m gacore
 - 未配置 `.env`（缺 `LLM_PROVIDER` 或 API Key）时优雅退出，不崩溃：
 
   ```
-  gacore: ConfigError: LLM_PROVIDER must be one of ('openai', 'anthropic'), got ''
+  gacore: ConfigError: LLM_PROVIDER must be one of ('openai', 'anthropic', 'deepseek'), got ''
   ```
 
   退出码为 1。
@@ -129,7 +136,7 @@ python -m ruff check src tests # lint 干净
 ```
 
 144 个测试覆盖：状态初始化、agent / tools / final 三个节点各自的逻辑与路由、
-LLM 工厂（openai / anthropic 分支与缺失 Key 报错）、工具注册表、code_run /
+LLM 工厂（openai / anthropic / deepseek 分支与缺失 Key 报错）、工具注册表、code_run /
 file / memory / web 四组工具、ask_user 中断与恢复（含 langgraph 两种中断表象）、
 端到端多轮循环与 done_hooks 续接。
 
@@ -144,7 +151,7 @@ file / memory / web 四组工具、ask_user 中断与恢复（含 langgraph 两�
 | `agent_loop.py`（`no_tool` 分支、`_done_hooks`） | `nodes/final.py` | 最终答案校验 + done_hooks 续接 |
 | `ga.py`（`turn_end_callback` :570、`_get_anchor_prompt`、`get_global_memory` :602） | `context.py` | 每轮提示词组装（系统提示词 + 折叠历史 + 周期提示） |
 | `ga.py`（`do_code_run` / `do_file_*` / `do_ask_user` 等） | `tools/*.py` | 9 个原子工具 |
-| `llmcore.py`（`client.chat` / Session） | `llm.py` | LLM 工厂，openai / anthropic 二选一 |
+| `llmcore.py`（`client.chat` / Session） | `llm.py` | LLM 工厂，openai / anthropic / deepseek 三选一 |
 | `mykey.py` / `NativeToolClient` | `llm.py`（环境变量驱动） | 配置方式替换 |
 | `frontends/tui_v3.py` | `cli.py` | 交互前端（REPL） |
 | `memory/global_mem*.txt` | `memory/` + `tools/memory_tools.py` | L1 / L2 长期记忆 |

@@ -29,6 +29,13 @@ _ANTHROPIC_ENV: Mapping[str, str] = {
     "ANTHROPIC_MODEL": "claude-sonnet-4-5",
 }
 
+_DEEPSEEK_ENV: Mapping[str, str] = {
+    "LLM_PROVIDER": "deepseek",
+    "DEEPSEEK_API_KEY": "sk-test-123",
+    "DEEPSEEK_MODEL": "deepseek-v4-pro",
+    "DEEPSEEK_BASE_URL": "",
+}
+
 
 class _FakeTool(BaseTool):
     """A minimal BaseTool so bind_tools has a real tool to convert to schema."""
@@ -94,6 +101,31 @@ def test_get_llm_anthropic_uses_configured_model() -> None:
 def test_get_llm_anthropic_missing_key_raises() -> None:
     with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
         get_llm([], {"LLM_PROVIDER": "anthropic"})
+
+
+def test_get_llm_deepseek_uses_configured_model() -> None:
+    bound = get_llm([], _DEEPSEEK_ENV)
+    assert isinstance(bound, RunnableBinding)
+    assert isinstance(bound.bound, ChatOpenAI)
+    assert bound.bound.model_name == "deepseek-v4-pro"
+    assert bound.bound.temperature == 0
+
+
+def test_get_llm_deepseek_defaults_model_and_base_url_when_unset() -> None:
+    bound = get_llm([], {"LLM_PROVIDER": "deepseek", "DEEPSEEK_API_KEY": "sk-test-123"})
+    assert bound.bound.model_name == "deepseek-v4-pro"
+    assert bound.bound.openai_api_base == "https://api.deepseek.com/v1"
+
+
+def test_get_llm_deepseek_passes_through_base_url() -> None:
+    env = {**_DEEPSEEK_ENV, "DEEPSEEK_BASE_URL": "https://api.deepseek.com"}
+    bound = get_llm([], env)
+    assert bound.bound.openai_api_base == "https://api.deepseek.com"
+
+
+def test_get_llm_deepseek_missing_key_raises() -> None:
+    with pytest.raises(ValueError, match="DEEPSEEK_API_KEY"):
+        get_llm([], {"LLM_PROVIDER": "deepseek"})
 
 
 def test_get_llm_binds_tool_schema() -> None:
