@@ -14,8 +14,9 @@ gacore 用 [LangGraph](https://langchain-ai.github.io/langgraph/) 重新实现�
 
 ## 功能特性 (Features)
 
-- **4 节点 StateGraph**：`agent / tools / final` 三个业务节点加 `END` 终结状态，
-  由 3 条条件边驱动（agent 分派、tools 回环、final 校验回环），见 ARCHITECTURE.md 的拓扑图。
+- **2 节点 StateGraph**：唯一的业务节点 `agent`（单轮 LLM 推理 + 最终答案校验）
+  加预置 `ToolNode`，由 1 条条件边驱动（agent 分派、tools 静态回环），见
+  ARCHITECTURE.md 的拓扑图。
 - **9 个原子工具**：`code_run`、`file_read`、`file_patch`、`file_write`、
   `web_scan`、`web_execute_js`、`update_working_checkpoint`、`start_long_term_update`、`ask_user`，
   与 GA 的工具集一一对应。
@@ -131,14 +132,14 @@ python -m gacore
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m pytest tests -q      # 当前 144 个用例全部通过
+python -m pytest tests -q      # 当前 137 个用例全部通过
 python -m ruff check src tests # lint 干净
 ```
 
-144 个测试覆盖：状态初始化、agent / tools / final 三个节点各自的逻辑与路由、
-LLM 工厂（openai / anthropic / deepseek 分支与缺失 Key 报错）、工具注册表、code_run /
-file / memory / web 四组工具、ask_user 中断与恢复（含 langgraph 两种中断表象）、
-端到端多轮循环与 done_hooks 续接。
+137 个测试覆盖：状态初始化、agent 节点（含内联的最终答案校验）逻辑与路由、
+LLM 工厂（openai / anthropic / deepseek 分支与缺失 Key 报错）、工具注册表、
+code_run / file / memory / web 四组工具、ask_user 中断与恢复（含 langgraph 两种
+中断表象）、端到端多轮循环与 done_hooks 续接。
 
 ---
 
@@ -146,9 +147,9 @@ file / memory / web 四组工具、ask_user 中断与恢复（含 langgraph 两�
 
 | GA 文件 | gacore 模块 | 说明 |
 | :--- | :--- | :--- |
-| `agent_loop.py`（`agent_runner_loop` :42-107） | `graph.py` + `nodes/agent.py` | 主循环拆成 StateGraph 拓扑 + agent 节点 |
-| `agent_loop.py`（工具分发、`StepOutcome`） | `nodes/tools.py` | 工具执行、`should_exit` / `key_info` 控制信号提取 |
-| `agent_loop.py`（`no_tool` 分支、`_done_hooks`） | `nodes/final.py` | 最终答案校验 + done_hooks 续接 |
+| `agent_loop.py`（`agent_runner_loop` :42-107） | `graph.py` + `nodes/agent.py` | 主循环拆成 StateGraph 拓扑 + agent 节点（含最终答案校验） |
+| `agent_loop.py`（工具分发、`StepOutcome`） | 预置 `ToolNode` + `Command(update=...)` | 工具执行；控制信号（`exit_reason` / `working`）由工具直接经 Command 回写 |
+| `agent_loop.py`（`no_tool` 分支、`_done_hooks`） | `nodes/agent.py`（内联） | 最终答案校验 + done_hooks 续接 |
 | `ga.py`（`turn_end_callback` :570、`_get_anchor_prompt`、`get_global_memory` :602） | `context.py` | 每轮提示词组装（系统提示词 + 折叠历史 + 周期提示） |
 | `ga.py`（`do_code_run` / `do_file_*` / `do_ask_user` 等） | `tools/*.py` | 9 个原子工具 |
 | `llmcore.py`（`client.chat` / Session） | `llm.py` | LLM 工厂，openai / anthropic / deepseek 三选一 |
@@ -192,11 +193,11 @@ WithLangGraph/
 │   ├── llm.py                # LLM 工厂
 │   ├── config.py             # 配置解析（目录 / max_turns）
 │   ├── logging.py            # JSONL 日志
-│   ├── nodes/                # agent / tools / final 三个节点
+│   ├── nodes/                # agent 节点（含最终答案校验、路由函数）
 │   ├── tools/                # 9 个工具
 │   └── memory/               # 记忆模块（预留）
 ├── config/assets/            # sys_prompt.txt（L0 规则）、code_run_header.py
 ├── memory/                   # L1 / L2 记忆文件（运行时生成）
 ├── logs/                     # JSONL 日志（运行时生成）
-└── tests/                    # 144 个测试
+└── tests/                    # 137 个测试
 ```
