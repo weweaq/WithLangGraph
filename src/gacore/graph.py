@@ -1,14 +1,16 @@
-"""LangGraph graph wiring for gacore: the compiled GAState loop and its convenience runner.
+"""LangGraph agent wiring for gacore: the official create_agent loop and its runner.
 
-Port of GA's agent_loop.py:42-107 on a 2-node ReAct-style topology. The agent node runs one
-LLM turn and applies the final (no_tool) logic itself; tool calls route through langgraph's
-standard prebuilt ToolNode and back, and control channels (exit_reason) terminate the loop.
-ask_user interrupts pause the graph via the checkpointer and resume with a Command.
+Replaces the hand-written 2-node StateGraph with ``langchain.agents.create_agent``: the
+official prebuilt agent topology (model node + prebuilt ToolNode + tool routing) with
+GA's turn logic carried by middleware (gacore.middleware) and the custom GAState schema.
+ask_user interrupts pause the graph via the checkpointer and resume with a Command, as
+before.
 
-The module is deliberately a thin assembly layer: the agent node lives in gacore.nodes and
-the tools are plain @tool/Command-returning functions registered in gacore.tools; this file
-only decides the topology. build_graph() returns a compiled StateGraph over GAState;
-run_once() is a one-shot convenience wrapper for a single user turn on a fresh thread.
+The module is deliberately a thin assembly layer: middleware lives in gacore.middleware,
+the tools are plain @tool/Command-returning functions registered in gacore.tools; this
+file only decides the middleware chain and compiles. build_graph() returns a compiled
+create_agent graph over GAState; run_once() is a one-shot convenience wrapper for a
+single user turn on a fresh thread.
 """
 
 from __future__ import annotations
@@ -16,27 +18,26 @@ from __future__ import annotations
 import uuid
 from typing import Final
 
-from langchain_core.runnables import Runnable
+from langchain.agents import create_agent
+from langchain.agents.middleware import ModelRetryMiddleware
+from langchain_core.language_models.chat_models import BaseChatModel
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
-from langgraph.prebuilt import ToolNode
 
 from gacore.config import Config
 from gacore.llm import get_llm
-from gacore.nodes.agent import make_agent_node, route_after_agent
+from gacore.middleware import GAPromptMiddleware, GATurnLogicMiddleware, format_agent_error
 from gacore.state import GAState, new_state
 from gacore.tools import build_tool_list
 
 DEFAULT_RECURSION_LIMIT: Final = 200
-_AGENT_TARGETS: Final = {"tools": "tools", "agent": "agent", "END": END}
 
 
 def suggested_recursion_limit(max_turns: int | None) -> int:
     """Return a recursion limit that leaves headroom for a full turn budget.
 
-    Each tool round costs two graph steps (agent, tools) and a plain answer one (agent),
+    Each tool round costs two graph steps (model, tools) and a plain answer one (model),
     so max_turns needs a 2x multiplier; the +50 margin absorbs empty-response retries and
     done_hooks loops. Falls back to the module default when max_turns is unknown.
     """
@@ -46,36 +47,49 @@ def suggested_recursion_limit(max_turns: int | None) -> int:
 
 
 def build_graph(
-    llm: Runnable | None = None,
+    llm: BaseChatModel | None = None,
     cfg: Config | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> CompiledStateGraph:
-    """Assemble and compile the full GA agent loop.
+    """Assemble and compile the full GA agent loop via the official create_agent.
 
-    Topology: START -> agent, then a single conditional edge routes tool_calls to the
-    prebuilt ToolNode / plain answers back to agent / control channels to END; tools loop
-    back to the agent on a static edge. A MemorySaver checkpointer is required for ask_user
-    interrupts; pass a custom saver to share state across calls.
+    Middleware chain (first = outermost):
+      - GAPromptMiddleware rebuilds the per-turn system prompt in wrap_model_call.
+      - GATurnLogicMiddleware applies the GA turn control (short-circuit, max_turns
+        guard, empty retry, done_hooks, completion) via before/after_model hooks.
+      - ModelRetryMiddleware (official) converts provider failures into GA agent-error
+        messages instead of crashing the graph; max_retries=0 keeps GA's fail-fast
+        behavior while still formatting the error cleanly.
+
+    A MemorySaver checkpointer is required for ask_user interrupts; pass a custom saver
+    to share state across calls.
 
     Args:
-        llm: The chat model bound to the tool list. When None, get_llm() resolves it
-            from the environment (requires a configured provider/API key).
+        llm: The chat model (unbound; create_agent binds the tool list itself). When
+            None, get_llm() resolves it from the environment (requires a configured
+            provider/API key).
         cfg: Runtime configuration; defaults to Config.default().
         checkpointer: Persistence backend; defaults to a fresh MemorySaver.
     """
     resolved_cfg = cfg or Config.default()
-    resolved_llm = llm or get_llm(build_tool_list(resolved_cfg))
-
-    builder = StateGraph(GAState)
-    builder.add_node("agent", make_agent_node(resolved_llm, resolved_cfg))
-    # handle_tool_errors=True: langgraph's default error handler re-raises non-validation
-    # tool exceptions, but GA parity requires every tool failure to become an error
-    # ToolMessage so the loop never crashes (old GAStatefulToolNode behavior).
-    builder.add_node("tools", ToolNode(build_tool_list(resolved_cfg), handle_tool_errors=True))
-    builder.add_edge(START, "agent")
-    builder.add_conditional_edges("agent", route_after_agent, _AGENT_TARGETS)
-    builder.add_edge("tools", "agent")
-    return builder.compile(checkpointer=checkpointer or MemorySaver())
+    tool_list = build_tool_list(resolved_cfg)
+    resolved_llm = llm or get_llm(tool_list, bind_tools=False)
+    return create_agent(
+        resolved_llm,
+        tools=tool_list,
+        state_schema=GAState,
+        middleware=[
+            GAPromptMiddleware(resolved_cfg),
+            GATurnLogicMiddleware(),
+            ModelRetryMiddleware(
+                max_retries=0,
+                retry_on=(Exception,),
+                on_failure=format_agent_error,
+            ),
+        ],
+        checkpointer=checkpointer or MemorySaver(),
+        name="gacore",
+    )
 
 
 def run_once(

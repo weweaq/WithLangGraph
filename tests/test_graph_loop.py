@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 
+from conftest import BindableFakeMessagesListChatModel
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langgraph.types import Command, Interrupt
@@ -23,30 +24,13 @@ from gacore.graph import build_graph, run_once
 from gacore.state import new_state
 
 
-class _BindableFake:
-    """Adapter over a fake chat model so bind_tools behaves like a real provider.
+class _RaisingFake(BindableFakeMessagesListChatModel):
+    """A fake chat model whose invoke always raises, driving the AGENT_ERROR path."""
 
-    Fake chat models inherit BaseChatModel.bind_tools, which raises NotImplementedError;
-    the agent node bind-then-invoke path needs the provider-style contract restored.
-    """
+    def __init__(self) -> None:
+        super().__init__(responses=[AIMessage(content="unused")])
 
-    def __init__(self, inner: FakeMessagesListChatModel) -> None:
-        self._inner = inner
-
-    def bind_tools(self, tools: list[object]) -> _BindableFake:
-        return self
-
-    def invoke(self, prompt: object) -> AIMessage:
-        return self._inner.invoke(prompt)
-
-
-class _RaisingLLM:
-    """A Runnable stand-in that always raises, driving the AGENT_ERROR path."""
-
-    def bind_tools(self, tools: list[object]) -> _RaisingLLM:
-        return self
-
-    def invoke(self, prompt: object) -> AIMessage:
+    def invoke(self, prompt: object, **kwargs: object) -> AIMessage:
         raise RuntimeError("simulated provider outage")
 
 
@@ -79,7 +63,7 @@ def test_tool_loop_then_final_answer_marks_task_done(
         _tool_call("file_write", {"path": str(target), "content": "hello"}, "call_1"),
         AIMessage(content="Done writing file"),
     ]
-    graph = build_graph(llm=_BindableFake(message_llm(responses)), cfg=tmp_cfg)
+    graph = build_graph(llm=message_llm(responses), cfg=tmp_cfg)
 
     result = run_once(graph, "write a file")
 
@@ -96,7 +80,7 @@ def test_ask_user_abort_exits_loop(
     responses: list[BaseMessage] = [
         _tool_call("ask_user", {"question": "continue?", "options": ["yes", "no"]}, "call_1"),
     ]
-    graph = build_graph(llm=_BindableFake(message_llm(responses)), cfg=tmp_cfg)
+    graph = build_graph(llm=message_llm(responses), cfg=tmp_cfg)
     config = _thread_config()
 
     first = graph.invoke(new_state("proceed", tmp_cfg), config)
@@ -120,7 +104,7 @@ def test_max_turns_guard_stops_endless_tool_loop(
     responses: list[BaseMessage] = [
         _tool_call("update_working_checkpoint", {"key_info": "still going"}, f"call_{i}") for i in range(5)
     ]
-    graph = build_graph(llm=_BindableFake(message_llm(responses)), cfg=tmp_cfg)
+    graph = build_graph(llm=message_llm(responses), cfg=tmp_cfg)
 
     result = run_once(graph, "loop forever", max_turns=2)
 
@@ -137,7 +121,7 @@ def test_done_hooks_fire_before_completion(
         AIMessage(content="answer2"),
         AIMessage(content="final answer"),
     ]
-    graph = build_graph(llm=_BindableFake(message_llm(responses)), cfg=tmp_cfg)
+    graph = build_graph(llm=message_llm(responses), cfg=tmp_cfg)
 
     result = run_once(graph, "task", done_hooks=["hook1 text", "hook2 text"])
 
@@ -155,7 +139,7 @@ def test_empty_response_retries_then_completes(
         AIMessage(content=""),
         AIMessage(content="good answer"),
     ]
-    graph = build_graph(llm=_BindableFake(message_llm(responses)), cfg=tmp_cfg)
+    graph = build_graph(llm=message_llm(responses), cfg=tmp_cfg)
 
     result = run_once(graph, "task")
 
@@ -172,7 +156,7 @@ def test_ask_user_resume_continue_loops_to_completion(
         _tool_call("ask_user", {"question": "continue?"}, "call_1"),
         AIMessage(content="final"),
     ]
-    graph = build_graph(llm=_BindableFake(message_llm(responses)), cfg=tmp_cfg)
+    graph = build_graph(llm=message_llm(responses), cfg=tmp_cfg)
     config = _thread_config()
 
     graph.invoke(new_state("proceed", tmp_cfg), config)
@@ -185,7 +169,7 @@ def test_ask_user_resume_continue_loops_to_completion(
 
 def test_agent_llm_error_exits_with_agent_error(tmp_cfg: Config) -> None:
     """Given an LLM that raises, When the agent node runs, Then the loop exits cleanly with AGENT_ERROR."""
-    graph = build_graph(llm=_RaisingLLM(), cfg=tmp_cfg)
+    graph = build_graph(llm=_RaisingFake(), cfg=tmp_cfg)
 
     result = run_once(graph, "task")
 

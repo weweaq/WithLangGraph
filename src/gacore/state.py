@@ -1,11 +1,18 @@
-"""LangGraph state schema and initializer for gacore."""
+"""LangGraph state schema and initializer for gacore.
+
+The state schema extends the official ``langchain.agents.middleware.AgentState`` (which
+provides the ``messages`` channel with the add_messages reducer plus the ``jump_to``
+temporary control channel used by create_agent middleware) with gacore's overwrite-only
+working channels. Every custom channel has no reducer, so LangGraph's default overwrite
+semantics apply: the latest update replaces the previous value.
+"""
 
 from __future__ import annotations
 
-from typing import Annotated, Final, TypedDict
+from typing import Any, Final
 
-from langchain_core.messages import BaseMessage, HumanMessage
-from langgraph.graph.message import add_messages
+from langchain.agents.middleware import AgentState
+from langchain_core.messages import HumanMessage
 
 from gacore.config import Config
 
@@ -13,15 +20,14 @@ EXIT_REASONS: Final = ("CURRENT_TASK_DONE", "EXITED", "MAX_TURNS_EXCEEDED")
 DEFAULT_MAX_TURNS: Final = 40
 
 
-class GAState(TypedDict, total=False):
-    """LangGraph state schema: full message history plus overwrite-only working channels.
+class GAState(AgentState[Any], total=False):
+    """Agent loop state: official AgentState channels plus gacore's working channels.
 
-    `messages` carries the complete conversation (the add_messages reducer appends). Every
-    other channel has no reducer, so LangGraph's default overwrite semantics apply: the
-    latest update replaces the previous value.
+    Inherited from ``AgentState``: ``messages`` (add_messages reducer) and ``jump_to``
+    (ephemeral control channel consumed by create_agent's routing edges). The remaining
+    channels are gacore-specific and use plain overwrite semantics.
     """
 
-    messages: Annotated[list[BaseMessage], add_messages]
     working: dict
     current_turn: int
     max_turns: int

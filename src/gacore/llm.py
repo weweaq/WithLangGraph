@@ -11,10 +11,7 @@ from collections.abc import Mapping, Sequence
 from typing import Final
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.language_models import LanguageModelInput
 from langchain_core.language_models.chat_models import BaseChatModel
-from langchain_core.messages import AIMessage
-from langchain_core.runnables import Runnable
 from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 
@@ -47,8 +44,13 @@ def get_provider(env: Mapping[str, str] | None = None) -> str:
 def get_llm(
     tool_list: Sequence[BaseTool],
     env: Mapping[str, str] | None = None,
-) -> Runnable[LanguageModelInput, AIMessage]:
-    """Build a chat model for the env-named provider, bound to the given tools.
+    *,
+    bind_tools: bool = True,
+) -> BaseChatModel:
+    """Build a chat model for the env-named provider, optionally bound to the given tools.
+
+    create_agent binds the tool list itself, so callers migrating to it should pass
+    ``bind_tools=False`` to receive a plain (unbound) model.
 
     Raises MissingApiKeyError (a ValueError) when the provider's API key is missing.
     """
@@ -85,4 +87,4 @@ def get_llm(
             )
         case _:
             raise ConfigError(f"LLM_PROVIDER must be one of {_SUPPORTED_PROVIDERS}, got {provider!r}")
-    return llm.bind_tools(list(tool_list))
+    return llm.bind_tools(list(tool_list)) if bind_tools else llm

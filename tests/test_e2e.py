@@ -33,23 +33,6 @@ from gacore.graph import build_graph
 from gacore.state import new_state
 
 
-class _BindableFake:
-    """Adapter over a fake chat model so bind_tools behaves like a real provider.
-
-    Fake chat models inherit BaseChatModel.bind_tools, which raises NotImplementedError;
-    the agent node bind-then-invoke path needs the provider-style contract restored.
-    """
-
-    def __init__(self, inner: FakeMessagesListChatModel) -> None:
-        self._inner = inner
-
-    def bind_tools(self, tools: list[object]) -> _BindableFake:
-        return self
-
-    def invoke(self, prompt: object) -> AIMessage:
-        return self._inner.invoke(prompt)
-
-
 def _tool_call(name: str, args: dict[str, object], call_id: str) -> AIMessage:
     """Build an AIMessage carrying a single tool_call to a registered tool."""
     return AIMessage(
@@ -82,7 +65,7 @@ def test_full_agent_session(
         _tool_call("start_long_term_update", {"topic": "wrote greeting file"}, "call_3"),
         AIMessage(content="Done. The greeting file has been written."),
     ]
-    graph = build_graph(llm=_BindableFake(message_llm(responses)), cfg=tmp_cfg)
+    graph = build_graph(llm=message_llm(responses), cfg=tmp_cfg)
 
     result = graph.invoke(new_state("write a greeting file", tmp_cfg), _thread_config())
 
@@ -108,7 +91,7 @@ def test_ask_user_interrupt_roundtrip(
         _tool_call("ask_user", {"question": "Proceed?", "options": ["yes", "no"]}, "call_1"),
         AIMessage(content="ok continuing"),
     ]
-    graph = build_graph(llm=_BindableFake(message_llm(responses)), cfg=tmp_cfg)
+    graph = build_graph(llm=message_llm(responses), cfg=tmp_cfg)
     config = _thread_config()
 
     first = graph.invoke(new_state("ask me something", tmp_cfg), config)

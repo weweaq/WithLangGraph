@@ -3,71 +3,87 @@
 本文档解释 gacore 的图拓扑、状态通道，以及每个关键设计决策"为什么这么做"。
 阅读对象是正在学习 LangGraph 的读者：对照 GenericAgent（下称 GA）的
 [`agent_loop.py`](https://github.com/lsdefine/GenericAgent/blob/main/agent_loop.py)，
-看同一个 Agent 循环如何从手写 `while` 变成 StateGraph。
+看同一个 Agent 循环如何从手写 `while` 变成官方 `create_agent` + middleware。
 
 ---
 
 ## 1. 图拓扑 (Graph Topology)
 
-gacore 是一个 2 节点的有环图：唯一的业务节点 `agent` 加 langgraph 预置的
-`ToolNode`（`tools`），`END` 是终结状态，`START` 是隐式入口。图上只有 1 条
-条件边（挂在 agent 之后），`tools → agent` 是静态边。
+gacore 的图由官方 `langchain.agents.create_agent` 组装（`graph.py`），不再手写
+节点：`model` 节点（官方模型调用）加预置 `ToolNode`（`tools`），`END` 是终结
+状态。GA 的回合控制逻辑全部搬进两个 `AgentMiddleware`（`middleware.py`），
+它们经 `hook_config(can_jump_to=[...])` 声明跳转能力，`_add_middleware_edge`
+据此把钩子节点接成条件边，读取状态里的 `jump_to` 通道改变走向。
 
 ```mermaid
 graph TD
-    START(["START"]) --> agent["agent 节点<br/>单轮 LLM 推理 + 最终答案校验"]
-    agent -->|"AIMessage 含 tool_calls"| tools["tools 节点<br/>预置 ToolNode 执行工具"]
-    agent -->|"无 tool_calls 且无 exit_reason"| agent
-    agent -->|"exit_reason 已设置"| END(["END"])
-    tools -->|静态边| agent
+    START(["START"]) --> bm["GATurnLogic.before_model<br/>短路 / max_turns 守卫"]
+    bm -->|"exit_reason 已设置 或 超轮"| END(["END"])
+    bm --> model["model 节点<br/>官方 create_agent 模型调用"]
+    model --> am["GATurnLogic.after_model<br/>空重试 / done_hooks / 完成判定"]
+    am -->|"jump_to=model（重试 / 续接）"| bm
+    am -->|"AIMessage 含 tool_calls"| tools["tools 节点<br/>预置 ToolNode 执行工具"]
+    am -->|"正常回答 → CURRENT_TASK_DONE"| END
+    tools -->|静态边| model
 ```
 
 流程（对照 GA `agent_loop.py` 的主循环）：
 
-1. **agent**：做一轮 LLM 调用。进入时先做 max_turns 守卫，再拼提示词、
-   `bind_tools` 后 `invoke`。返回的 AIMessage 可能带 `tool_calls`。
-   **最终答案校验（GA 的 `no_tool` 分支 / `_done_hooks`）就在这个节点里完成**：
-   空回答重试最多 3 次、`done_hooks` 非空则续接、否则正常收尾置
-   `CURRENT_TASK_DONE`。
-2. **条件边（`route_after_agent`）**：
-   - `exit_reason` 已设置 → `END`（终止信号优先于一切）；
-   - 最后一个消息是带 `tool_calls` 的 AIMessage → `tools`；
-   - 否则（纯文本回答）→ 回 `agent` 继续下一轮。
-3. **tools**：langgraph 预置 `ToolNode` 执行最后一条 AIMessage 里的全部
-   `tool_calls`，每个调用对应一个 `ToolMessage`。需要写状态通道的工具
-   （`ask_user` 的 `exit_reason`、`update_working_checkpoint` 的 `working`）
-   返回 `Command(update=...)`，由 LangGraph 原生处理（见第 3 节决策 c）。
-4. **静态边 `tools → agent`**：工具结果送回 agent 进入下一轮。
+1. **GATurnLogic.before_model**（`@hook_config(can_jump_to=["end"])`）：进入模型前
+   检查——`exit_reason` 已设置（ask_user 中止后恢复）或 `current_turn` 超过
+   `max_turns`，返回 `{"jump_to": "end"}` 直接收尾，不再消耗一次模型调用；
+   否则 `current_turn + 1` 继续。
+2. **model**：官方节点。`GAPromptMiddleware.wrap_model_call` 用
+   `ModelRequest.override(system_message=...)` 注入 GA 每轮动态提示词
+   （系统规则 + working checkpoint + 周期提示 + 折叠历史），再调用模型。
+   工具列表由 create_agent 在内部 `bind_tools`（`llm.py` 的 `get_llm`
+   支持 `bind_tools=False` 返回未绑定模型）。
+3. **GATurnLogic.after_model**（`@hook_config(can_jump_to=["model", "end"])`）：
+   GA 的 `no_tool` 最终校验就在这里：
+   - 消息带 `tool_calls` → 返回 `None`，官方默认路由送去 `tools`；
+   - 空回答 → 追加纠正 HumanMessage 并 `jump_to="model"` 重试（最多 3 次，
+     耗尽则 `EXITED`）；
+   - `done_hooks` 非空 → 弹出第一条作为 HumanMessage，`jump_to="model"` 续接；
+   - 正常回答 → `exit_reason="CURRENT_TASK_DONE"`（默认路由到 END）。
+4. **tools**：langgraph 预置 `ToolNode` 执行模型发出的 `tool_calls`。需要写状态
+   通道的工具（`ask_user` 的 `exit_reason`、`update_working_checkpoint` 的
+   `working`）返回 `Command(update=...)`，由 LangGraph 原生处理。
 
-注意这里**故意不用 `goto`**：langgraph 1.2.10 里 `Command.goto` 是**追加**语义，
-会把目标追加到现有边上，导致 `tools → agent` 和 `goto` 的目标叠加成死循环。
-控制流完全由 agent 节点的条件边决定，工具只通过 `Command(update=...)` 改状态。
+**控制流改写的机制**（本次迁移学到的核心）：middleware 钩子本身只返回状态更新，
+不直接控制流；真正改道的是 `create_agent` 为声明了 `can_jump_to` 的钩子生成的
+**条件边**——它们读状态里的 `jump_to` 通道（`EphemeralValue`，每步后自动清空），
+`{"jump_to": "end"}` 短路、`{"jump_to": "model"}` 回环。这是"用官方机制表达
+自定义控制流"的标准姿势，比手写条件边函数更贴近 create_agent 的设计意图。
 
 ---
 
 ## 2. 状态通道 (State Channels)
 
-`GAState`（`src/gacore/state.py`）是一个 TypedDict。只有 `messages` 配了
-`add_messages` 归约器（追加语义），其余通道都用 LangGraph 的默认覆盖语义：
-节点返回的最新值直接替换旧值，节点必须自己带全量写入。
+`GAState`（`src/gacore/state.py`）继承官方
+`langchain.agents.middleware.AgentState`：`messages`（带 `add_messages` 归约器）
+和 `jump_to`（临时控制通道）由官方提供，其余 gacore 通道用 LangGraph 的默认
+覆盖语义：节点返回的最新值直接替换旧值，节点必须自己带全量写入。
 
-| 通道 | 类型 | 归约器 | 语义 |
+| 通道 | 来源 | 归约器 | 语义 |
 | :--- | :--- | :--- | :--- |
-| `messages` | `list[BaseMessage]` | `add_messages`（追加） | 全量对话历史。LLM 的 AIMessage、工具结果 ToolMessage、校验注入的 HumanMessage 都按序追加 |
-| `working` | `dict` | 覆盖 | 工作记忆。`update_working_checkpoint` 返回 `Command(update={"working": ...})` 写入 `key_info` / `related_sop` |
-| `current_turn` | `int` | 覆盖 | 当前轮数，agent 节点自增（`state.current_turn + 1`） |
-| `max_turns` | `int` | 覆盖 | 轮数上限，启动时由 `cfg.max_turns` 写入，agent 节点只读 |
-| `done_hooks` | `list[str]` | 覆盖 | 收尾提示队列。agent 节点弹出第一条作为 HumanMessage，再把剩余列表写回 |
-| `retry_count` | `int` | 覆盖 | 空回答的连续重试计数，agent 节点维护 |
-| `exit_reason` | `str \| None` | 覆盖 | 终止原因。取值 `CURRENT_TASK_DONE` / `EXITED` / `MAX_TURNS_EXCEEDED` / `AGENT_ERROR`。一经设置，条件边就路由到 END |
+| `messages` | 官方 AgentState | `add_messages`（追加） | 全量对话历史。LLM 的 AIMessage、工具结果 ToolMessage、校验注入的 HumanMessage 都按序追加 |
+| `jump_to` | 官方 AgentState | `EphemeralValue`（临时） | middleware 控制流通道。`"end"` 短路 / `"model"` 回环，每步后自动清空，不进输入输出 |
+| `working` | gacore | 覆盖 | 工作记忆。`update_working_checkpoint` 返回 `Command(update={"working": ...})` 写入 `key_info` / `related_sop` |
+| `current_turn` | gacore | 覆盖 | 当前轮数，`before_model` 自增（`state.current_turn + 1`），供周期提示与守卫用 |
+| `max_turns` | gacore | 覆盖 | 轮数上限，启动时由 `cfg.max_turns` 写入，`before_model` 只读 |
+| `done_hooks` | gacore | 覆盖 | 收尾提示队列。`after_model` 弹出第一条作为 HumanMessage，再把剩余列表写回 |
+| `retry_count` | gacore | 覆盖 | 空回答的连续重试计数，`after_model` 维护 |
+| `exit_reason` | gacore | 覆盖 | 终止原因。取值 `CURRENT_TASK_DONE` / `EXITED` / `MAX_TURNS_EXCEEDED` / `AGENT_ERROR`。一经设置，`before_model` 就短路到 END |
 
 关键观察：
 
 - `messages` 是唯一的累积通道，天然对应 GA 里"历史在 Session 对象"的职责。
-- `done_hooks` 没有归约器，所以 agent 节点必须写回完整剩余列表
+- `done_hooks` 没有归约器，所以 `after_model` 必须写回完整剩余列表
   （`"done_hooks": done_hooks[1:]`），这是覆盖语义的典型写法。
-- `exit_reason` 是整个图的"急停开关"：路由函数先查它，查到了就直接去 END，
-  不依赖消息内容。
+- `exit_reason` 是整个图的"急停开关"：`before_model` 先查它，查到了就
+  `jump_to="end"`，不依赖消息内容。
+- `jump_to` 是 `EphemeralValue`：middleware 写入后立即被条件边消费，不会残留
+  在终态里——`get_state` 看到的终态不含它，测试断言更干净。
 
 ---
 
@@ -86,9 +102,11 @@ GA 每轮只把**新的一轮消息**发给 LLM（新的 user prompt + 本轮的
 
 **gacore 的做法**：LangGraph 没有"Session"概念，状态必须自包含。
 所以 `state.messages` 持有**全量历史**，`add_messages` 负责追加；
-每轮提示词由 `context.build_turn_prompt` 现场重建：一个全新构造的
-`SystemMessage`（内含系统提示词 + 折叠后的历史摘要 + 周期提示），
-再加上 `state.messages` 原样返回给 LLM。
+每轮提示词由 `context.build_system_prompt` + `fold_history` 现场重建，
+`GAPromptMiddleware.wrap_model_call` 用 `ModelRequest.override(system_message=...)`
+把全新构造的 `SystemMessage`（内含系统提示词 + 折叠后的历史摘要 + 周期提示）
+注入模型请求——**这是官方 middleware API 替换原 `build_turn_prompt` 的地方**
+（直接赋值 `request.system_message` 已弃用，`override` 是 1.3.14 的非弃用姿势）。
 
 **为什么这个迁移是安全的**：`SystemMessage` 从不写入 `state.messages`，
 每轮都是"临时拼接、用完即弃"，所以不会被 `add_messages` 重复累积；
@@ -112,15 +130,16 @@ gacore 把 `StepOutcome` 的三元语义拆进两个地方：
 | GA `StepOutcome` 字段 | gacore 落点 |
 | :--- | :--- |
 | `should_exit = True` | `ask_user` 工具返回 `Command(update={"exit_reason": "EXITED", ...})` |
-| `next_prompt` 为空（任务完成） | agent 节点的正常回答分支置 `exit_reason = "CURRENT_TASK_DONE"` |
+| `next_prompt` 为空（任务完成） | `GATurnLogicMiddleware.after_model` 正常回答分支置 `exit_reason = "CURRENT_TASK_DONE"` |
 | `next_prompt` 非空（继续干活） | 由 LLM 自己生成下一段内容；提示注入走系统提示词 / HumanMessage 通道 |
 
-**为什么"何时算完成"的判定放在 agent 节点**：GA 里"任务完成"的信号来自工具
+**为什么"何时算完成"的判定放在 middleware**：GA 里"任务完成"的信号来自工具
 返回空 `next_prompt`；但模型不调工具、直接给纯文本回答时（GA 的 `no_tool`
 伪调用），GA 语义是 `next_prompts` 为空则查 `_done_hooks`，没有 hook 就退出。
-gacore 把这条"no_tool"路径的校验逻辑并进 agent 节点：正常回答 →
-`CURRENT_TASK_DONE`，空回答 → 重试（最多 3 次）后 `EXITED`。这样"何时算完成"
-的判定集中在一个可单测的节点里，也省掉了原先 final 节点的条件边。
+gacore 把这条"no_tool"路径的校验逻辑放进 `after_model` 钩子：正常回答 →
+`CURRENT_TASK_DONE`，空回答 → `jump_to="model"` 重试（最多 3 次）后 `EXITED`，
+done_hooks 非空 → 弹出续接。这样"何时算完成"的判定集中在一个可单测的
+middleware 类里，也省掉了原先 final 节点和手写路由函数。
 
 ### c. 为什么用预置 ToolNode + Command，而不是自定义工具节点
 
@@ -150,8 +169,8 @@ GA 的 `ask_user` 是同步等待用户输入；LangGraph 的等价物是 `inter
 - 恢复时用 `Command(resume=answer)` 继续，`interrupt()` 的返回值就是用户的回答
   （cli.py 的 `_run_turn` 循环处理）。
 - 回答落在 `{abort, exit, quit, stop, cancel}` 里时，`ask_user` 返回
-  `Command(update={"exit_reason": "EXITED", ...})`，agent 节点顶部短路返回 `{}`
-  （不再调 LLM），条件边据此直接去 END，整个图收尾。
+  `Command(update={"exit_reason": "EXITED", ...})`，`before_model` 钩子顶部
+  短路返回 `{"jump_to": "end"}`（不再调 LLM），图直接收尾。
 
 **langgraph 1.2.10 的版本特性**：单个中断在 `graph.invoke` 返回的 dict 里以
 `__interrupt__` 键出现，**不抛异常**；`cli.py` 同时兼容了旧行为（捕获
@@ -208,20 +227,20 @@ memory 目录），但 LangChain 的 `@tool` 会从函数签名生成 JSON schem
 | :--- | :--- | :--- | :--- |
 | 1 | :44-47 初始化 `messages=[system, user]` | `new_state` 造 `[HumanMessage(user_input)]`；系统提示词每轮现拼 | `[忠实]` 语义（system 不落历史，见 3a） |
 | 2 | :48 `turn=0; handler.max_turns=max_turns` | `state.py` 初始化 `current_turn=0, max_turns=cfg.max_turns` | `[忠实]` |
-| 3 | :50 `while turn < handler.max_turns` | agent 节点进入时 `if turn > max_turns → MAX_TURNS_EXCEEDED` | `[忠实]`（守卫提前到 LLM 调用之前，比 GA 更省一次调用） |
-| 4 | :51 `turn += 1` | agent 节点 `current_turn = state.current_turn + 1` | `[忠实]` |
-| 5 | :56 `if turn%10==0: client.last_tools=''` | 无对应（LangChain 每次 `bind_tools` 重建，无工具描述缓存） | `[简化]`（机制不存在，无需重置） |
-| 6 | :59 `client.chat(messages, tools=tools_schema)` | `llm.bind_tools(...).invoke(build_turn_prompt(state, cfg))` | `[忠实]`（llmcore → llm.py） |
-| 7 | :69 无 `tool_calls` → `no_tool` 伪调用 | agent 节点内联完成校验（空回答重试 / done_hooks / 收尾） | `[忠实]`（no_tool 分支并入 agent 节点） |
+| 3 | :50 `while turn < handler.max_turns` | `before_model` 进入时 `if turn > max_turns → MAX_TURNS_EXCEEDED` | `[忠实]`（守卫提前到 LLM 调用之前，比 GA 更省一次调用） |
+| 4 | :51 `turn += 1` | `before_model` `current_turn = state.current_turn + 1` | `[忠实]` |
+| 5 | :56 `if turn%10==0: client.last_tools=''` | 无对应（create_agent 每次重建绑定，无工具描述缓存） | `[简化]`（机制不存在，无需重置） |
+| 6 | :59 `client.chat(messages, tools=tools_schema)` | create_agent 内部 `bind_tools` + `GAPromptMiddleware` 注入系统提示词 | `[忠实]`（llmcore → llm.py → create_agent） |
+| 7 | :69 无 `tool_calls` → `no_tool` 伪调用 | `after_model` 内联完成校验（空回答重试 / done_hooks / 收尾） | `[忠实]`（no_tool 分支并入 middleware） |
 | 8 | :74-98 逐个 `dispatch` 工具 → `StepOutcome` | 预置 `ToolNode` 执行 `tool_calls`；控制信号经 `Command(update=...)` 回写 | `[忠实]` |
 | 9 | :90 `outcome.should_exit` → `EXITED` | `ask_user` 返回 `Command(update={"exit_reason": "EXITED", ...})` | `[忠实]` |
-| 10 | :92 `not outcome.next_prompt` → `CURRENT_TASK_DONE` | agent 节点正常回答 → `exit_reason="CURRENT_TASK_DONE"` | `[忠实]`（判定从工具结果移到 agent 节点，见 3b） |
+| 10 | :92 `not outcome.next_prompt` → `CURRENT_TASK_DONE` | `after_model` 正常回答 → `exit_reason="CURRENT_TASK_DONE"` | `[忠实]`（判定从工具结果移到 middleware，见 3b） |
 | 11 | :95-97 `outcome.data` → `tool_results`（带 `tool_use_id`） | `ToolMessage(content=..., tool_call_id=call_id)` | `[忠实]`（LangChain 原生配对） |
-| 12 | :99-101 `next_prompts` 为空且非 EXITED → 弹 `_done_hooks[0]` 续接 | agent 节点 done_hooks 分支：第一条 hook 转 HumanMessage 后继续循环 | `[忠实]`（`_done_hooks` 队列 → `done_hooks` 通道） |
-| 13 | :102 `turn_end_callback(...)` 返回下一条 prompt | `context.build_turn_prompt`（纯函数）组装下一轮提示 | `[简化]`（见下） |
+| 12 | :99-101 `next_prompts` 为空且非 EXITED → 弹 `_done_hooks[0]` 续接 | `after_model` done_hooks 分支：第一条 hook 转 HumanMessage 后 `jump_to="model"` 继续循环 | `[忠实]`（`_done_hooks` 队列 → `done_hooks` 通道） |
+| 13 | :102 `turn_end_callback(...)` 返回下一条 prompt | `context` 纯函数组装 + `GAPromptMiddleware` 注入 | `[简化]`（见下） |
 | 14 | :104 `messages = [新 user 消息]`，历史在 Session | `state.messages` 全量追加（`add_messages`） | `[简化]`（核心差异，见 3a） |
-| 15 | :105 exit 后再调一次 `turn_end_callback` | 无对应（agent 节点已含校验） | `[简化]` |
-| 16 | :107 `return exit_reason or MAX_TURNS_EXCEEDED` | `exit_reason` 通道 + agent 守卫兜底 | `[忠实]` |
+| 15 | :105 exit 后再调一次 `turn_end_callback` | 无对应（`after_model` 已含校验） | `[简化]` |
+| 16 | :107 `return exit_reason or MAX_TURNS_EXCEEDED` | `exit_reason` 通道 + `before_model` 守卫兜底 | `[忠实]` |
 
 ### turn_end_callback 的核对（ga.py:570）
 
@@ -236,18 +255,22 @@ GA 的 `turn_end_callback` 做四件事，gacore 在 `context.py` 里的对应�
 
 ### LLM 异常处理（gacore 新增）
 
-GA 没有显式处理 LLM 调用异常；gacore 的 agent 节点捕获后记 JSONL 错误日志，
-返回带 `[Agent error: ...]` 说明的 AIMessage，并以 `exit_reason="AGENT_ERROR"`
-干净退出（`nodes/agent.py`）。这是有意的偏差：学习项目优先可测试、
-可诊断的终态，而不是让图硬崩溃或无限重试。
+GA 没有显式处理 LLM 调用异常；gacore 用官方 `ModelRetryMiddleware`
+（`max_retries=0, on_failure=format_agent_error`）把 provider 异常转成
+`[Agent error: ...]` 说明的 AIMessage，`after_model` 识别该前缀后以
+`exit_reason="AGENT_ERROR"` 干净退出（`middleware.py`）。这是有意的偏差：
+学习项目优先可测试、可诊断的终态，而不是让图硬崩溃或无限重试。
+`max_retries=0` 保留 GA 的 fail-fast 语义，`on_failure` 只是借官方异常捕获
+通道做错误格式化——异常处理本身不再手写 try/except。
 
 ---
 
 ## 5. 简化与未移植项 (Simplifications)
 
 - **全量历史 vs 增量消息**：3a，最大的结构性差异，token 成本换状态自包含。
-- **LLM 异常**：GA 无处理，gacore 以 `AGENT_ERROR` 干净退出。
-- **空回答重试**：agent 节点内联实现（GA 只有空回答的 `_retry_or_exit` 规则；
+- **LLM 异常**：GA 无处理，gacore 用官方 `ModelRetryMiddleware` 以
+  `AGENT_ERROR` 干净退出。
+- **空回答重试**：`after_model` 内联实现（GA 只有空回答的 `_retry_or_exit` 规则；
   早期版本针对 provider `finish_reason` 的**截断续写检测已删除**——不同 provider
   的 `finish_reason` 行为不一致，判据不可靠，移除后空回答重试仍保留）。
 - **master 注入 / 干预通道**：GA 的 `_keyinfo` / `_intervene` 文件注入、plan 模式

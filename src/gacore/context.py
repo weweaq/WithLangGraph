@@ -18,7 +18,7 @@ from gacore.state import GAState
 _MAX_CONTENT_LEN: Final = 200
 _FOLD_LIMIT: Final = 30
 _TRUNCATION_MARKER: Final = "..."
-_EARLIER_HEADER: Final = "=== Earlier context ==="
+EARLIER_HEADER: Final = "=== Earlier context ==="
 
 _MEMORY_HINT: Final = "[Memory refresh: reload L1 insights and L2 facts into working memory]"
 _CHECKPOINT_HINT: Final = "[Checkpoint time: update working checkpoint]"
@@ -115,5 +115,5 @@ def build_turn_prompt(state: GAState, cfg: Config) -> list[BaseMessage]:
     prompt = build_system_prompt(state, cfg)
     folded = fold_history(messages)
     if folded:
-        prompt += f"\n\n{_EARLIER_HEADER}\n" + "\n".join(folded)
+        prompt += f"\n\n{EARLIER_HEADER}\n" + "\n".join(folded)
     return [SystemMessage(content=prompt), *messages]

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Annotated, get_args, get_origin, get_type_hints
+from typing import Annotated, Required, get_args, get_origin, get_type_hints
 
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
@@ -46,9 +46,14 @@ def test_new_state_seeds_all_channels(tmp_path: object) -> None:
 def test_messages_channel_is_annotated_with_add_messages_reducer() -> None:
     """Given the GAState schema, the messages channel must declare add_messages as its reducer."""
     hints = get_type_hints(GAState, include_extras=True)
+    hint = hints["messages"]
+    # GAState inherits AgentState, whose messages is declared Required[Annotated[..., add_messages]];
+    # unwrap the Required wrapper before checking the reducer annotation.
+    if get_origin(hint) is Required:
+        (hint,) = get_args(hint)
 
-    assert get_origin(hints["messages"]) is Annotated
-    assert get_args(hints["messages"])[1] is add_messages
+    assert get_origin(hint) is Annotated
+    assert get_args(hint)[1] is add_messages
 
 
 def test_working_channel_has_no_reducer() -> None:
