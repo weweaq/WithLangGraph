@@ -29,7 +29,7 @@ from prompt_toolkit import PromptSession
 
 from gacore.config import Config, load_dotenv
 from gacore.graph import DEFAULT_RECURSION_LIMIT, build_graph
-from gacore.logging import get_logger
+from gacore.jsonl_logger import get_logger
 from gacore.state import new_state
 
 __version__: Final = "0.1.0"

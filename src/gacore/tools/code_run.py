@@ -17,7 +17,7 @@ from typing import Final, Literal, TypedDict
 from langchain_core.tools import tool
 
 from gacore.config import Config
-from gacore.logging import get_logger
+from gacore.jsonl_logger import get_logger
 
 _MAX_OUTPUT_CHARS: Final = 20000
 _TRUNCATION_MARKER: Final = "\n...[output truncated]"
