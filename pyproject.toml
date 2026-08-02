@@ -16,6 +16,9 @@ dependencies = [
     "python-dotenv",
     "httpx",
     "prompt_toolkit",
+    "Pillow",
+    "rapidocr-onnxruntime",
+    "numpy",
 ]
 
 [project.optional-dependencies]

@@ -16,6 +16,8 @@ from .ask_user import ask_user
 from .code_run import code_run
 from .file_tools import file_patch, file_read, file_write
 from .memory_tools import start_long_term_update, update_working_checkpoint
+from .browser_history import browser_history
+from .ocr_tools import ocr_image, ocr_screen
 from .web_tools import web_execute_js, web_scan
 
 __all__ = ["TOOL_NAMES", "build_tool_list"]
@@ -27,9 +29,12 @@ TOOL_NAMES: tuple[str, ...] = (
     "file_write",
     "web_scan",
     "web_execute_js",
+    "browser_history",
     "update_working_checkpoint",
     "start_long_term_update",
     "ask_user",
+    "ocr_image",
+    "ocr_screen",
 )
 
 _TOOLS: tuple[BaseTool, ...] = (
@@ -39,9 +44,12 @@ _TOOLS: tuple[BaseTool, ...] = (
     file_write,
     web_scan,
     web_execute_js,
+    browser_history,
     update_working_checkpoint,
     start_long_term_update,
     ask_user,
+    ocr_image,
+    ocr_screen,
 )
 
 
