@@ -19,10 +19,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Final, final
 
 from gacore.config import Config, ConfigError
@@ -30,6 +31,7 @@ from gacore.config import Config, ConfigError
 _LOG_FILENAME: Final = "app.jsonl"
 _LOG_DIR_FORMAT: Final = "%Y-%m-%d"
 _LOG_TIMEZONE: Final = "Asia/Shanghai"
+_LOG_UTC_OFFSET: Final = timedelta(hours=8)
 
 # Keys whose values are replaced with "***" before write (case-insensitive match).
 _SECRET_KEYS: Final = frozenset({
@@ -85,6 +87,17 @@ class _JsonlFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False, default=str)
 
 
+class _ConsoleFormatter(logging.Formatter):
+    """Human-readable one-liner for terminal output; the file sink stays JSONL."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        ts = datetime.fromtimestamp(record.created, tz=timezone(_LOG_UTC_OFFSET)).strftime("%H:%M:%S")
+        module = record.__dict__.get("gacore_module", record.module)
+        fields = _mask_fields(record.__dict__.get("gacore_fields", {}))
+        suffix = f" {fields}" if fields else ""
+        return f"[{ts}] [{record.levelname:<7}] [{module}] {record.getMessage()}{suffix}"
+
+
 @final
 class Logger:
     """Module-scoped structured logger; all instances share the process's log file."""
@@ -96,6 +109,7 @@ class Logger:
         self._logger = logging.getLogger(f"gacore.{module}")
         if not self._logger.handlers:
             self._logger.addHandler(_get_sink())
+            self._logger.addHandler(_get_console_sink())
             self._logger.setLevel(logging.DEBUG)
             self._logger.propagate = False
 
@@ -132,6 +146,7 @@ class Logger:
 
 
 _sink: logging.Handler | None = None
+_console_sink: logging.Handler | None = None
 
 
 def _build_sink() -> logging.Handler:
@@ -155,6 +170,16 @@ def _get_sink() -> logging.Handler:
     if _sink is None:
         _sink = _build_sink()
     return _sink
+
+
+def _get_console_sink() -> logging.Handler:
+    """Return the process-wide console (stdout) handler, building it once on first use."""
+    global _console_sink
+    if _console_sink is None:
+        handler = logging.StreamHandler(sys.stdout)
+        handler.setFormatter(_ConsoleFormatter())
+        _console_sink = handler
+    return _console_sink
 
 
 def get_logger(module: str) -> Logger:
