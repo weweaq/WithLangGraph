@@ -2,15 +2,19 @@
 
 Mirrors GA's do_update_working_checkpoint / do_start_long_term_update: global_mem.txt holds
 L2 global facts, global_mem_insight.txt holds the L1 insight index. The tools are pure —
-they return dicts; the GAStatefulToolNode extracts them into graph state.
+update_working_checkpoint returns a Command that writes state.working; start_long_term_update
+returns a dict the standard ToolNode wraps into a ToolMessage.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
-from typing import Final
+from typing import Annotated, Final
 
-from langchain_core.tools import tool
+from langchain_core.messages import ToolMessage
+from langchain_core.tools import InjectedToolCallId, tool
+from langgraph.types import Command
 
 from gacore.config import Config
 
@@ -19,17 +23,34 @@ _INSIGHTS_FILE: Final = "global_mem_insight.txt"
 
 
 @tool
-def update_working_checkpoint(key_info: str, related_sop: str | None = None) -> dict:
+def update_working_checkpoint(
+    key_info: str,
+    related_sop: str | None = None,
+    tool_call_id: Annotated[str | None, InjectedToolCallId] = None,
+) -> Command:
     """Update the short-term working checkpoint with current task state.
 
-    Returns the key_info for the state node to apply into state.working; this tool is
-    pure and never mutates state itself.
+    Returns a Command whose update folds key_info (and related_sop) into state.working and
+    pairs a ToolMessage to the originating tool_call_id; no goto is used.
     """
-    return {
-        "key_info": key_info,
-        "related_sop": related_sop or "",
-        "result": "working key_info updated",
-    }
+    return Command(
+        update={
+            "working": {"key_info": key_info, "related_sop": related_sop or ""},
+            "messages": [
+                ToolMessage(
+                    content=json.dumps(
+                        {
+                            "key_info": key_info,
+                            "related_sop": related_sop or "",
+                            "result": "working key_info updated",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    tool_call_id=tool_call_id,
+                )
+            ],
+        }
+    )
 
 
 @tool

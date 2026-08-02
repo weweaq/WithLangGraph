@@ -1,32 +1,55 @@
-"""Tests for gacore.tools.memory_tools: working checkpoint and long-term memory persistence."""
+"""Tests for gacore.tools.memory_tools: working checkpoint and long-term memory persistence.
+
+update_working_checkpoint now returns a Command (refactor decision: tools drive state via
+Command instead of a custom stateful node), so the direct-invocation tests assert on
+Command.update["working"] and the paired ToolMessage. start_long_term_update still returns
+a plain dict that the standard ToolNode wraps.
+"""
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
+
+from langchain_core.messages import ToolMessage
+from langgraph.types import Command
 
 from gacore.config import Config
 from gacore.tools.memory_tools import start_long_term_update, update_working_checkpoint
 
 
-def test_update_working_checkpoint_returns_exact_dict() -> None:
-    """Given a key_info and a related SOP, When invoked, Then the exact dict is returned."""
-    result = update_working_checkpoint.invoke({"key_info": "user onboarding plan", "related_sop": "onboarding_sop"})
-    assert result == {
-        "key_info": "user onboarding plan",
-        "related_sop": "onboarding_sop",
-        "result": "working key_info updated",
-    }
+def _wc_tool_call(**args: object) -> Command:
+    """Invoke update_working_checkpoint as a full ToolCall so InjectedToolCallId is populated."""
+    return update_working_checkpoint.invoke(
+        {"name": "update_working_checkpoint", "args": args, "type": "tool_call", "id": "call_1"}
+    )
+
+
+def test_update_working_checkpoint_returns_command_with_working_update() -> None:
+    """Given a key_info and a related SOP, When invoked, Then a Command writes both into state.working."""
+    result = _wc_tool_call(key_info="user onboarding plan", related_sop="onboarding_sop")
+
+    assert isinstance(result, Command)
+    assert result.update["working"] == {"key_info": "user onboarding plan", "related_sop": "onboarding_sop"}
 
 
 def test_update_working_checkpoint_defaults_related_sop_to_empty_string() -> None:
-    """Given only a key_info, When invoked, Then related_sop defaults to an empty string."""
-    result = update_working_checkpoint.invoke({"key_info": "just a note"})
-    assert result == {
-        "key_info": "just a note",
-        "related_sop": "",
-        "result": "working key_info updated",
-    }
+    """Given only a key_info, When invoked, Then related_sop defaults to an empty string in working."""
+    result = _wc_tool_call(key_info="just a note")
+
+    assert result.update["working"] == {"key_info": "just a note", "related_sop": ""}
+
+
+def test_update_working_checkpoint_pairs_tool_message_with_json_payload() -> None:
+    """Given a key_info, When invoked, Then a ToolMessage with the JSON payload is paired to the call."""
+    result = _wc_tool_call(key_info="K", related_sop="S")
+
+    (msg,) = result.update["messages"]
+    assert isinstance(msg, ToolMessage)
+    assert msg.tool_call_id == "call_1"
+    payload = json.loads(msg.content)
+    assert payload == {"key_info": "K", "related_sop": "S", "result": "working key_info updated"}
 
 
 def test_start_long_term_update_writes_l1_insight_and_l2_fact_files(tmp_path: Path) -> None:
