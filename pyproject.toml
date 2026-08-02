@@ -23,12 +23,16 @@ dev = [
     "pytest",
     "ruff",
 ]
+qq = [
+    "qq-botpy",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 120
