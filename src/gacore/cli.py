@@ -2,22 +2,25 @@
 
 Port of GA's frontends/tui_v3.py. run_repl is the testable core: it drives one
 conversation turn at a time on a single thread (so MemorySaver keeps conversation
-history across turns), detects ask_user interrupts either as a returned
-``__interrupt__`` key or a raised GraphInterrupt, prompts the human, resumes with a
-``Command(resume=...)``, and reports the final ``exit_reason``. Input is injected via
-``input_func`` so tests never touch real stdin or the network.
+history across turns), streaming every node update to stdout so the user watches the
+agent call tools and then give the final answer. ask_user interrupts surface either as
+a streamed ``__interrupt__`` chunk or a raised GraphInterrupt; the REPL prompts the
+human once, resumes with a ``Command(resume=...)``, and reports the final
+``exit_reason``. Input is injected via ``input_func`` so tests never touch real stdin
+or the network.
 
 Run with ``python -m gacore`` (with PYTHONPATH=src or after installing the package).
 """
 
 from __future__ import annotations
 
+import json
 import sys
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Final
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import Runnable
 from langgraph.errors import GraphInterrupt
 from langgraph.graph.state import CompiledStateGraph
@@ -30,9 +33,16 @@ from gacore.logging import get_logger
 from gacore.state import new_state
 
 __version__: Final = "0.1.0"
-_QUIT_WORD: Final = "/quit"
 
 logger = get_logger("cli")
+
+_COMMANDS: Final[dict[str, str]] = {
+    "/help": "show this help",
+    "/working": "show the current working checkpoint",
+    "/memory": "show long-term memory files",
+    "/reset": "start a fresh conversation (clears history)",
+    "/quit": "exit gacore",
+}
 
 # Created lazily so importing gacore.cli works in non-console environments (tests, CI).
 _session: PromptSession | None = None
@@ -46,49 +56,88 @@ def _default_input(prompt: str) -> str:
     return _session.prompt(prompt)
 
 
-def _interrupt_payload(result: dict) -> dict | None:
-    """Extract the first interrupt's value dict, or None when the result is not an interrupt.
+def _interrupt_payload(chunk: dict) -> dict | None:
+    """Extract the first interrupt's value dict from a streamed chunk, or None.
 
-    Works on both langgraph surfaces: a result dict carrying ``__interrupt__`` and any
+    Works on both langgraph surfaces: a chunk carrying ``__interrupt__`` and any
     dict-shaped payload. ask_user interrupts carry ``{"question": ..., "options": ...}``.
     """
-    interrupts = result.get("__interrupt__")
+    interrupts = chunk.get("__interrupt__")
     if not isinstance(interrupts, (list, tuple)) or not interrupts:
         return None
     value = getattr(interrupts[0], "value", None)
     return value if isinstance(value, dict) else None
 
 
-def _invoke(graph: CompiledStateGraph, state: object, config: dict) -> dict:
-    """Invoke the graph, normalizing a raised GraphInterrupt into the dict form."""
+def _stream(graph: CompiledStateGraph, state: object, config: dict) -> Iterator[dict]:
+    """Stream node updates, normalizing a raised GraphInterrupt into an interrupt chunk."""
     try:
-        return graph.invoke(state, config)
+        yield from graph.stream(state, config, stream_mode="updates")
     except GraphInterrupt as exc:
         raw = exc.args[0] if exc.args else ()
         interrupts = tuple(raw) if isinstance(raw, (tuple, list)) else (raw,)
-        return {"__interrupt__": interrupts}
+        yield {"__interrupt__": interrupts}
 
 
-def _last_ai_reply(result: dict) -> str | None:
-    """Return the newest AIMessage content without tool_calls, or None."""
-    messages = result.get("messages")
+def _format_args(args: dict) -> str:
+    """Render tool-call args compactly for the streaming header line."""
+    parts: list[str] = []
+    for key, value in args.items():
+        text = str(value)
+        if len(text) > 40:
+            text = text[:37] + "..."
+        parts.append(f"{key}={text}")
+    return ", ".join(parts)
+
+
+def _render_tool_result(message: ToolMessage) -> None:
+    """Print one tool result line, keeping ask_user's answer compact."""
+    if message.name == "ask_user":
+        try:
+            payload = json.loads(message.content)
+            print(f"[tools] <- ask_user -> answer: {payload.get('answer')!r}")
+            return
+        except (TypeError, ValueError):
+            pass
+    content = str(message.content)
+    if len(content) > 200:
+        content = content[:197] + "..."
+    print(f"[tools] <- {content}")
+
+
+def _render_update(node_name: str, update: object) -> bool:
+    """Print one streamed node update; return True when it printed the final AI reply."""
+    if not isinstance(update, dict):
+        return False  # e.g. {'agent': None} short-circuit
+    messages = update.get("messages")
     if not isinstance(messages, list):
-        return None
-    for message in reversed(messages):
-        if isinstance(message, AIMessage) and not message.tool_calls and message.content:
-            return str(message.content)
+        return False
+    printed_reply = False
+    for message in messages:
+        if isinstance(message, AIMessage):
+            if message.tool_calls:
+                for call in message.tool_calls:
+                    name = call.get("name", "?")
+                    if name == "ask_user":
+                        # The interactive [ask_user] prompt follows; no need to echo args.
+                        print("[agent] -> ask_user")
+                    else:
+                        print(f"[agent] -> {name}({_format_args(call.get('args') or {})})")
+            elif message.content:
+                print(str(message.content))
+                printed_reply = True
+        elif isinstance(message, ToolMessage):
+            _render_tool_result(message)
+    return printed_reply
+
+
+def _update_exit_reason(update: object) -> str | None:
+    """Read exit_reason from a node update dict, if present."""
+    if isinstance(update, dict):
+        reason = update.get("exit_reason")
+        if isinstance(reason, str):
+            return reason
     return None
-
-
-def _print_result(result: dict) -> None:
-    """Print the final assistant reply, or the exit_reason when there is none."""
-    reply = _last_ai_reply(result)
-    if reply is not None:
-        print(reply)
-        return
-    reason = result.get("exit_reason")
-    if reason:
-        print(f"[{reason}]")
 
 
 def _run_turn(
@@ -98,26 +147,88 @@ def _run_turn(
     config: dict,
     input_func: Callable[[str], str],
 ) -> str | None:
-    """Run one user turn to completion, resolving any interrupts with the human."""
-    result = _invoke(graph, new_state(user_input, cfg), config)
+    """Run one user turn to completion, streaming node updates and resolving interrupts."""
+    state: object = new_state(user_input, cfg)
+    exit_reason: str | None = None
+    printed_reply = False
     while True:
-        payload = _interrupt_payload(result)
-        if payload is None:
+        interrupted = False
+        for chunk in _stream(graph, state, config):
+            if "__interrupt__" in chunk:
+                payload = _interrupt_payload(chunk)
+                if payload is None:
+                    break
+                question = str(payload.get("question") or "?")
+                options = payload.get("options")
+                if isinstance(options, list) and options:
+                    print(f"[ask_user] {question} (options: {', '.join(str(o) for o in options)})")
+                else:
+                    print(f"[ask_user] {question}")
+                try:
+                    answer = input_func("Your answer: ")
+                except EOFError:
+                    answer = "abort"
+                state = Command(resume=answer)
+                interrupted = True
+                break
+            for node_name, update in chunk.items():
+                if _render_update(node_name, update):
+                    printed_reply = True
+                reason = _update_exit_reason(update)
+                if reason is not None:
+                    exit_reason = reason
+        if not interrupted:
             break
-        question = str(payload.get("question") or "?")
-        options = payload.get("options")
-        if isinstance(options, list) and options:
-            print(f"[ask_user] {question} (options: {', '.join(str(o) for o in options)})")
-        else:
-            print(f"[ask_user] {question}")
+    if not printed_reply and exit_reason:
+        print(f"[{exit_reason}]")
+    return exit_reason
+
+
+def _print_memory(cfg: Config) -> None:
+    """Print the long-term memory files under cfg.memory_dir, newest first."""
+    if not cfg.memory_dir.is_dir():
+        print("[memory] (no memory files yet)")
+        return
+    files = sorted(cfg.memory_dir.glob("*.txt"), reverse=True)
+    if not files:
+        print("[memory] (no memory files yet)")
+        return
+    for path in files:
+        print(f"== {path.name} ==")
         try:
-            answer = input_func(f"Your answer ({question}): ")
-        except EOFError:
-            answer = "abort"
-        result = _invoke(graph, Command(resume=answer), config)
-    _print_result(result)
-    reason = result.get("exit_reason")
-    return reason if isinstance(reason, str) else None
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            print(f"  (unreadable: {e})")
+            continue
+        print(text if text else "  (empty)")
+
+
+def _handle_command(command: str, graph: CompiledStateGraph, cfg: Config, config: dict) -> bool:
+    """Handle a slash command; return True when the REPL should exit."""
+    if command == "/quit":
+        return True
+    if command == "/help":
+        for name, desc in _COMMANDS.items():
+            print(f"  {name:<9} {desc}")
+        return False
+    if command == "/working":
+        snapshot = graph.get_state(config)
+        values = snapshot.values or {}
+        working = values.get("working")
+        if working:
+            print(f"[working] {working}")
+        else:
+            print("[working] (none)")
+        return False
+    if command == "/memory":
+        _print_memory(cfg)
+        return False
+    if command == "/reset":
+        config["configurable"]["thread_id"] = uuid.uuid4().hex
+        print("Conversation reset.")
+        return False
+    print(f"Unknown command: {command} (try /help)")
+    return False
 
 
 def run_repl(
@@ -149,7 +260,7 @@ def run_repl(
         "recursion_limit": DEFAULT_RECURSION_LIMIT,
     }
     print(f"gacore v{__version__} - interactive agent")
-    print("Type /quit to exit")
+    print("Type /help for commands, /quit to exit")
     last_reason: str | None = None
     try:
         while True:
@@ -163,8 +274,10 @@ def run_repl(
             stripped = line.strip()
             if not stripped:
                 continue
-            if stripped.lower() == _QUIT_WORD:
-                break
+            if stripped.startswith("/"):
+                if _handle_command(stripped.lower(), graph, resolved_cfg, config):
+                    break
+                continue
             last_reason = _run_turn(graph, resolved_cfg, stripped, config, input_source)
             if last_reason == "EXITED":
                 break
