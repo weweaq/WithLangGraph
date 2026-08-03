@@ -7,6 +7,7 @@ code_run_header.py preamble prepended; powershell runs as a -Command one-liner.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import uuid
@@ -26,6 +27,22 @@ _WINDOWS: Final = os.name == "nt"
 
 logger = get_logger("tools.code_run")
 _default_cfg: Final = Config.default()
+
+
+def _resolve_powershell() -> str:
+    """Find the powershell executable, falling back to the well-known System32 path.
+
+    shutil.which("powershell") covers the normal case where WindowsPowerShell is on
+    PATH.  Some sandboxed environments (e.g. CI containers, restricted test runners)
+    strip System32 from PATH even though the binary exists; the fallback resolves
+    it via %SystemRoot% so the tool still works there.
+    """
+    found = shutil.which("powershell") or shutil.which("powershell.exe")
+    if found:
+        return found
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    candidate = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    return str(candidate)
 
 
 class CodeRunResult(TypedDict, total=False):
@@ -97,7 +114,7 @@ def code_run(
             script_path = _prepare_python_script(code, cfg)
             cmd: list[str] = [sys.executable, "-X", "utf8", "-u", str(script_path)]
         case "powershell":
-            cmd = ["powershell", "-NoProfile", "-Command", code]
+            cmd = [_resolve_powershell(), "-NoProfile", "-Command", code]
         case _:
             logger.warning("code_run rejected unsupported language", language=language)
             return CodeRunResult(

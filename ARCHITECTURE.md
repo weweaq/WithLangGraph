@@ -278,3 +278,125 @@ GA 没有显式处理 LLM 调用异常；gacore 用官方 `ModelRetryMiddleware`
 - **`client.last_tools` 重置**：GA 每 10 轮清空工具描述缓存以省 token，机制不存在，跳过。
 - **未移植模块**：reflect 自治模式、插件 hooks、IM 前端、L4 归档、
   Mixin 多模型切换、TMWebDriver 真实浏览器（见 README 范围说明）。
+
+---
+
+## 6. 三层记忆系统 (Three-Layer Memory)
+
+gacore 的记忆分为三层，职责不同，不可混用。设计灵感来自另一个 agent 的
+策略——每日笔记作为"原始日志"层，填补了工作记忆和长期记忆之间的断层。
+
+```
+工作记忆 (update_working_checkpoint)
+  ↓ 每轮可覆盖，只放当前任务的关键信息
+每日笔记 (read_daily / edit_daily / search_daily)
+  ↓ 按日期组织，记重要决策/教训/事实，不记闲聊
+长期记忆 (start_long_term_update)
+  ↓ 从每日笔记蒸馏精华，按主题组织，去重精炼
+```
+
+### 层级职责
+
+| 层 | 工具 | 存储 | 生命周期 | 记什么 |
+| :--- | :--- | :--- | :--- | :--- |
+| 工作记忆 | `update_working_checkpoint` | `state.working`（RAM） | 单轮 | 当前任务的关键信息 |
+| 每日笔记 | `edit_daily` / `read_daily` / `search_daily` | `memory/daily/{date}.md` | 跨会话、按天 | 重要决策、教训、关键事实、用户偏好 |
+| 长期记忆 | `start_long_term_update` | `memory/global_mem.txt` + `global_mem_insight.txt` | 永久 | 蒸馏精华：用户画像、长期目标、重要教训 |
+
+### 每日笔记的三个工具
+
+| 工具 | 作用 | 调用时机 |
+| :--- | :--- | :--- |
+| `read_daily(date)` | 按日期读取笔记全文 | 需要回顾某天发生了什么 |
+| `edit_daily(date, old_str, new_str)` | 精确字符串替换编辑 | 记录当天事件、教训、决策 |
+| `search_daily(query)` | 跨所有笔记关键词搜索 | 模糊查找历史记录 |
+
+`edit_daily` 是精确替换模式（非追加）：`old_str` 必须在文件中唯一匹配。
+新建笔记时 `old_str=""`，文件自动创建并带日期头。支持 `"today"` / `"yesterday"`
+日期快捷方式。
+
+### 会话启动时的上下文恢复
+
+`context.build_system_prompt` 每轮注入最近两天每日笔记的** bullet 标题行**
+（`load_recent_daily_summaries`），而非全文——控制 token 成本的同时恢复
+跨会话连续性。注入位置在系统规则之后、工作检查点之前：
+
+```
+[系统规则]
+=== Recent daily notes ===
+[2026-08-03]
+- 完成了每日笔记功能开发
+- 学到 edit_daily 要用精确替换而非追加
+
+[Working checkpoint]
+...
+```
+
+### 为什么用关键词搜索而非语义搜索
+
+`search_daily` 做的是大小写不敏感的关键词匹配，不是向量语义搜索。这是
+有意的简化：学习项目不需要引入 embedding 模型和向量数据库的依赖，
+关键词搜索已经能覆盖"上次聊 X 是什么时候"这类典型查询。
+
+---
+
+## 7. 定时任务调度器 (Scheduler)
+
+gacore 的定时任务是一个**单进程轮询调度器**（`scheduler.py`），能在指定时间
+触发 agent 执行自包含任务（如每日报告、周报），无需人工交互。
+
+### 设计取舍
+
+| 维度 | 选择 | 理由 |
+| :--- | :--- | :--- |
+| 调度模型 | 单进程 `time.sleep` 轮询 | 学习项目，不引入 Redis/APScheduler |
+| 调度格式 | `"HH:MM"`（每日）或 `"every N<m\|h\|d>"`（间隔） | 覆盖"每天发周报"场景，不需要完整 cron |
+| 会话模型 | 单轮 headless：`run_once` 跑完即结束 | 定时任务无人在场，不能 ask_user |
+| 状态持久化 | `memory/schedule_state.json` | 重启后不补跑漏掉的 job（防雷鸣群效应） |
+| 输出 | `logs/scheduled/{job}_{ts}.md` + 每日笔记 bullet | 文件可追溯，每日笔记自动记录 |
+
+### 核心组件
+
+```
+config/schedule.json          ← job 定义（name/schedule/prompt/enabled）
+memory/schedule_state.json    ← 运行时状态（last_run/run_count）
+logs/scheduled/               ← 每次 job 执行的完整输出
+
+scheduler.run_loop()
+  │
+  ├── load_jobs()         ← 每轮重新读 schedule.json（支持热更新）
+  ├── is_due(job, state)  ← 计算 next_run_time，判断是否到期
+  ├── run_job(job)         ← 构建独立 graph，run_once 执行
+  │    ├── _default_graph_runner → build_graph + run_once
+  │    ├── _write_output → logs/scheduled/{job}_{ts}.md
+  │    └── _write_daily_note → edit_daily("today", ...)
+  └── save_state()        ← 持久化 last_run，防止重复触发
+```
+
+### 会话隔离
+
+每个定时 job 是一个**全新的 agent 会话**：
+- 独立的 `thread_id`（`sched-{uuid}`），不与 REPL 共享 MemorySaver 状态
+- prompt 作为唯一的 user message，agent 跑完一轮就结束
+- agent 仍然能读写工作区文件、每日笔记、长期记忆——这些都是文件系统共享的
+- 但 agent **看不到** REPL 里的对话历史（对话历史隔离）
+
+这对应了用户分析中的"文件系统共享，对话历史隔离"模型。
+
+### 防雷鸣群效应
+
+重启时不会补跑漏掉的 job：`next_run_time` 计算"上次运行时间 + 间隔"，
+如果结果已过期，就向前步进到未来；对于每日 `"HH:MM"`，如果今天已运行过，
+`last_run` 会被设为今天，下一次触发就是明天。
+
+### 运行方式
+
+```bash
+# 启动调度器（前台运行，Ctrl-C 停止）
+python -m gacore.scheduler
+
+# 或通过环境变量
+GACORE_MEMORY_DIR=/path/to/memory python -m gacore.scheduler
+```
+
+`config/schedule.json` 支持热更新——调度器每轮重新读取，改了配置不用重启。

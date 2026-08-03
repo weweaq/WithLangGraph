@@ -2,6 +2,9 @@
 logs/
 memory/global_mem*.txt
 memory/ocr_history.jsonl
+memory/daily/*.md
+memory/schedule_state.json
+logs/scheduled/
 __pycache__/
 *.pyc
 .pytest_cache/

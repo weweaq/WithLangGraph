@@ -14,11 +14,13 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 from gacore.config import Config
 from gacore.state import GAState
+from gacore.tools.daily_notes import load_recent_daily_summaries
 
 _MAX_CONTENT_LEN: Final = 200
 _FOLD_LIMIT: Final = 30
 _TRUNCATION_MARKER: Final = "..."
 EARLIER_HEADER: Final = "=== Earlier context ==="
+DAILY_HEADER: Final = "=== Recent daily notes ==="
 
 _MEMORY_HINT: Final = "[Memory refresh: reload L1 insights and L2 facts into working memory]"
 _CHECKPOINT_HINT: Final = "[Checkpoint time: update working checkpoint]"
@@ -36,12 +38,15 @@ _SUMMARY_RE: Final = re.compile(r"<summary>(.*?)</summary>", re.DOTALL)
 
 
 def build_system_prompt(state: GAState, cfg: Config) -> str:
-    """Build the per-turn system prompt: L0 rules, working checkpoint, and periodic hints."""
+    """Build the per-turn system prompt: L0 rules, daily recap, working checkpoint, and periodic hints."""
     path = cfg.asset_dir / "sys_prompt.txt"
     if path.is_file():
         prompt = path.read_text(encoding="utf-8")
     else:
         prompt = _DEFAULT_BASE_PROMPT
+    daily = load_recent_daily_summaries(cfg)
+    if daily:
+        prompt += f"\n{DAILY_HEADER}\n{daily}"
     key_info = (state.get("working") or {}).get("key_info")
     if key_info:
         prompt += f"\n[Working checkpoint]\n{key_info}"
