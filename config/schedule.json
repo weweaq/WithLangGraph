@@ -2,8 +2,8 @@
   "jobs": [
     {
       "name": "daily-report",
-      "schedule": "21:00",
-      "prompt": "请生成今天的日报。回顾今天在每日笔记中记录的内容（用 search_daily 或 read_daily 工具），按以下格式总结：\n1. 今天完成了什么\n2. 遇到的问题和教训\n3. 明天的计划\n输出简洁的 markdown 格式。",
+      "schedule": "23:53",
+      "prompt": "请生成今天的日报。回顾今天在每日笔记中记录的内容（用 search_daily 或 read_daily 工具），同时用 bili_history 工具获取今天在bilibili的观看记录，综合分析后按以下格式总结：\n1. 今天完成了什么\n2. 今天观看了哪些视频（简要列出标题和链接）\n3. 遇到的问题和教训\n4. 明天的计划\n输出简洁的 markdown 格式。",
       "enabled": true,
       "max_turns": 15
     },
