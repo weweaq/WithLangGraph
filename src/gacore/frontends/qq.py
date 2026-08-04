@@ -279,6 +279,7 @@ class QQApp:
     def __init__(self, graph: CompiledStateGraph) -> None:
         self.graph = graph
         self.client: botpy.Client | None = None
+        self._running_tasks: dict[str, asyncio.Task] = {}  # user_id -> running agent task
 
     # --------------------------------------------------------------- sending
 
@@ -459,7 +460,10 @@ class QQApp:
                 is_group=is_group,
             )
         if op == "/stop":
-            # No running-task tracking in QQ frontend (stateless per turn); just inform.
+            task = self._running_tasks.get(user_id)
+            if task is not None and not task.done():
+                task.cancel()
+                return await self.send_text(chat_id, "⏹️ 正在停止任务...", msg_id=msg_id, is_group=is_group)
             return await self.send_text(chat_id, "⏹️ 当前无运行中的任务", msg_id=msg_id, is_group=is_group)
         await self.send_text(chat_id, "未知命令,输入 /help 查看", msg_id=msg_id, is_group=is_group)
 
@@ -500,70 +504,88 @@ class QQApp:
     ) -> None:
         """Stream graph updates: render tool calls, tool results, final answer; handle interrupts."""
         reply_parts: list[str] = []
+        current_task = asyncio.current_task()
+        if current_task is not None and user_id is not None:
+            # Cancel any previous running task for this user before registering the new one.
+            old = self._running_tasks.get(user_id)
+            if old is not None and not old.done():
+                old.cancel()
+            self._running_tasks[user_id] = current_task
         try:
-            await self.send_text(chat_id, "思考中...", msg_id=msg_id, is_group=is_group)
-            async for chunk in self.graph.astream(input_data, config, stream_mode="updates"):
-                # ask_user interrupt: store config, send question, wait for next message.
-                if "__interrupt__" in chunk:
-                    interrupts = chunk["__interrupt__"]
-                    if interrupts:
-                        value = getattr(interrupts[0], "value", None)
-                        if isinstance(value, dict) and "question" in value:
-                            if user_id is not None:
-                                _pending_interrupt[user_id] = config
-                            question = str(value.get("question") or "?")
-                            options = value.get("options")
-                            if isinstance(options, list) and options:
-                                await self.send_text(
-                                    chat_id, f"[ask_user] {question}\n(选项: {', '.join(str(o) for o in options)})",
-                                    is_group=is_group,
-                                )
-                            else:
-                                await self.send_text(chat_id, f"[ask_user] {question}", is_group=is_group)
-                            return
-                    continue
-
-                for update in chunk.values():
-                    if not isinstance(update, dict):
+            try:
+                await self.send_text(chat_id, "思考中...", msg_id=msg_id, is_group=is_group)
+                async for chunk in self.graph.astream(input_data, config, stream_mode="updates"):
+                    # ask_user interrupt: store config, send question, wait for next message.
+                    if "__interrupt__" in chunk:
+                        interrupts = chunk["__interrupt__"]
+                        if interrupts:
+                            value = getattr(interrupts[0], "value", None)
+                            if isinstance(value, dict) and "question" in value:
+                                if user_id is not None:
+                                    _pending_interrupt[user_id] = config
+                                question = str(value.get("question") or "?")
+                                options = value.get("options")
+                                if isinstance(options, list) and options:
+                                    await self.send_text(
+                                        chat_id, f"[ask_user] {question}\n(选项: {', '.join(str(o) for o in options)})",
+                                        is_group=is_group,
+                                    )
+                                else:
+                                    await self.send_text(chat_id, f"[ask_user] {question}", is_group=is_group)
+                                return
                         continue
-                    for message in update.get("messages", []):
-                        if isinstance(message, AIMessage):
-                            if message.tool_calls:
-                                for call in message.tool_calls:
-                                    name = call.get("name", "?")
-                                    if name == "ask_user":
-                                        await self.send_text(chat_id, "[agent] -> ask_user", is_group=is_group)
-                                    else:
-                                        args = call.get("args") or {}
-                                        await self.send_text(
-                                            chat_id, f"[agent] -> {name}({', '.join(f'{k}={v}' for k, v in args.items())})",
-                                            is_group=is_group,
-                                        )
-                            elif message.content:
-                                reply_parts.append(str(message.content))
-                        elif isinstance(message, ToolMessage):
-                            content = str(message.content)
-                            if len(content) > 200:
-                                content = content[:197] + "..."
-                            await self.send_text(chat_id, f"[tools] <- {content}", is_group=is_group)
 
-            # Stream finished: send the final answer (if not already sent via interrupt).
-            if reply_parts:
-                # Strip <summary>...</summary> blocks (GA protocol) instead of dropping
-                # the whole message — the model often puts the summary FIRST, followed
-                # by the real answer, so startswith("<summary>") would swallow the reply.
-                final_parts: list[str] = []
-                for part in reply_parts:
-                    cleaned = _SUMMARY_TAG_RE.sub("", part).strip()
-                    if cleaned:
-                        final_parts.append(cleaned)
-                final_text = "\n\n".join(final_parts)
-                if final_text.strip():
-                    await self.send_text(chat_id, final_text, is_group=is_group)
+                    for update in chunk.values():
+                        if not isinstance(update, dict):
+                            continue
+                        for message in update.get("messages", []):
+                            if isinstance(message, AIMessage):
+                                if message.tool_calls:
+                                    for call in message.tool_calls:
+                                        name = call.get("name", "?")
+                                        if name == "ask_user":
+                                            await self.send_text(chat_id, "[agent] -> ask_user", is_group=is_group)
+                                        else:
+                                            args = call.get("args") or {}
+                                            await self.send_text(
+                                                chat_id, f"[agent] -> {name}({', '.join(f'{k}={v}' for k, v in args.items())})",
+                                                is_group=is_group,
+                                            )
+                                elif message.content:
+                                    reply_parts.append(str(message.content))
+                            elif isinstance(message, ToolMessage):
+                                content = str(message.content)
+                                if len(content) > 200:
+                                    content = content[:197] + "..."
+                                await self.send_text(chat_id, f"[tools] <- {content}", is_group=is_group)
 
+                # Stream finished: send the final answer (if not already sent via interrupt).
+                if reply_parts:
+                    # Strip <summary>...</summary> blocks (GA protocol) instead of dropping
+                    # the whole message — the model often puts the summary FIRST, followed
+                    # by the real answer, so startswith("<summary>") would swallow the reply.
+                    final_parts: list[str] = []
+                    for part in reply_parts:
+                        cleaned = _SUMMARY_TAG_RE.sub("", part).strip()
+                        if cleaned:
+                            final_parts.append(cleaned)
+                    final_text = "\n\n".join(final_parts)
+                    if final_text.strip():
+                        await self.send_text(chat_id, final_text, is_group=is_group)
+
+            except asyncio.CancelledError:
+                logger.info(f"Agent task cancelled for user {user_id}")
+                await self.send_text(chat_id, "⏹️ 任务已停止", is_group=is_group)
+                raise
+
+        except asyncio.CancelledError:
+            raise
         except Exception:  # noqa: BLE001 — top-level stream crash guard
             logger.error("QQ agent stream error", stack_trace=traceback.format_exc())
             await self.send_text(chat_id, "❌ 运行出错,请稍后重试或输入 /new 重置", is_group=is_group)
+        finally:
+            if user_id is not None:
+                self._running_tasks.pop(user_id, None)
 
     # --------------------------------------------------------------- lifecycle
 
@@ -612,8 +634,18 @@ def _redirect_log() -> None:
     print(f"[QQ] allow list: {'public' if _is_public() else sorted(_ALLOWED)}")
 
 
+def _fix_encoding() -> None:
+    """Force stdout/stderr to UTF-8 so Chinese text renders correctly on Windows terminals."""
+    if sys.stdout.encoding.upper() != "UTF-8":
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if sys.stderr.encoding.upper() != "UTF-8":
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> None:
     """Entry point for ``python -m gacore.frontends.qq``."""
+    _fix_encoding()
+
     if not _APP_ID or not _APP_SECRET:
         print("[QQ] ERROR: please set QQ_APP_ID and QQ_APP_SECRET in .env")
         sys.exit(1)

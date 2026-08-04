@@ -8,6 +8,7 @@ stored in state.messages, so the leading SystemMessage is not duplicated by the 
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone, timedelta
 from typing import Final
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
@@ -15,6 +16,8 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from gacore.config import Config
 from gacore.state import GAState
 from gacore.tools.daily_notes import load_recent_daily_summaries
+
+_TZ = timezone(timedelta(hours=8))
 
 _MAX_CONTENT_LEN: Final = 200
 _FOLD_LIMIT: Final = 30
@@ -44,6 +47,8 @@ def build_system_prompt(state: GAState, cfg: Config) -> str:
         prompt = path.read_text(encoding="utf-8")
     else:
         prompt = _DEFAULT_BASE_PROMPT
+    now = datetime.now(_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    prompt += f"\n[Current time: {now}]"
     daily = load_recent_daily_summaries(cfg)
     if daily:
         prompt += f"\n{DAILY_HEADER}\n{daily}"
