@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Final
 
 import httpx
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
 
@@ -331,11 +331,11 @@ class QQApp:
                 logger.warning(f"unauthorized QQ user: {user_id}")
                 return
 
-            # --- Image messages: download + route to agent with OCR prompt ---
+            # --- Image messages: multi-image accumulation via interrupt/resume ---
             image_urls = _extract_image_urls(data)
             if image_urls:
                 asyncio.create_task(
-                    self._handle_image_message(chat_id, user_id, image_urls, content, msg_id=msg_id, is_group=is_group)
+                    self._handle_images_v2(chat_id, user_id, image_urls, content, msg_id=msg_id, is_group=is_group)
                 )
                 return
 
@@ -352,13 +352,28 @@ class QQApp:
                 await self._handle_command(chat_id, content, user_id=user_id, msg_id=msg_id, is_group=is_group)
                 return
 
-            # 2) If this user has a pending ask_user interrupt, resume the graph.
+            # 2) If a paused graph exists (wait_for_text interrupt), resume with this text.
+            thread_id = _user_threads.get(chat_id)
+            if thread_id:
+                config = {"configurable": {"thread_id": thread_id}}
+                try:
+                    state = self.graph.get_state(config)
+                    if state and state.next:
+                        await self._stream_agent(
+                            chat_id, Command(resume=content), config,
+                            msg_id=msg_id, is_group=is_group, user_id=user_id,
+                        )
+                        return
+                except Exception:
+                    pass
+
+            # 3) If this user has a pending ask_user interrupt, resume the graph.
             if user_id in _pending_interrupt:
                 config = _pending_interrupt.pop(user_id)
                 asyncio.create_task(self._resume_agent(chat_id, content, config, msg_id=msg_id, is_group=is_group, user_id=user_id))
                 return
 
-            # 3) Normal agent turn.
+            # 4) Normal agent turn.
             asyncio.create_task(self._run_agent(chat_id, content, user_id, msg_id=msg_id, is_group=is_group))
 
         except Exception:  # noqa: BLE001 — top-level message handler crash guard
@@ -522,6 +537,75 @@ class QQApp:
             _user_threads[user_id] = f"qq-{user_id}-{uuid.uuid4().hex[:8]}"
         return _user_threads[user_id]
 
+    async def _handle_images_v2(
+        self,
+        chat_id: str,
+        user_id: str,
+        image_urls: list[str],
+        content: str,
+        *,
+        msg_id: str | None,
+        is_group: bool,
+    ) -> None:
+        """Download images and route to either a paused graph (Command(update)) or a fresh one.
+
+        When a graph is already paused at wait_for_text, images are injected via
+        Command(update={"pending_images": [...], "messages": [...]}) so the
+        classify_message node picks up the new paths and wait_for_text re-interrupts.
+        When no graph is running, a fresh graph is started with [IMAGE:path] markers
+        in the HumanMessage — classify_message routes to wait_for_text if text is
+        absent, or directly to process if text accompanied the first image.
+        """
+        # Download images to temp/
+        os.makedirs("temp", exist_ok=True)
+        paths: list[str] = []
+        ts = int(time.time())
+        for i, url in enumerate(image_urls):
+            dest = os.path.abspath(f"temp/qq_img_{user_id}_{i}_{ts}.jpg")
+            if await _download_image(url, dest):
+                paths.append(dest)
+
+        if not paths:
+            return
+
+        config = {"configurable": {"thread_id": self._thread_for(user_id)}}
+
+        # Check for a paused graph (wait_for_text interrupt).
+        try:
+            state = self.graph.get_state(config)
+            if state and state.next:
+                # Inject images via Command(update); classify_message picks up new paths.
+                # Merge with existing pending_images so previous images are preserved.
+                existing_images: list[str] = (state.values or {}).get("pending_images") or []
+                all_images = existing_images + paths
+                parts = [f"[IMAGE:{p}]" for p in paths]
+                if content:
+                    parts.append(content)
+                update = {
+                    "pending_images": all_images,
+                    "messages": [HumanMessage(content="\n".join(parts))],
+                }
+                await self._stream_agent(
+                    chat_id, Command(update=update), config,
+                    msg_id=msg_id, is_group=is_group, user_id=user_id,
+                )
+                return
+        except Exception:
+            pass
+
+        # No paused graph — start a fresh one. OCR the images for the prompt.
+        ocr_texts: dict[str, str] = {}
+        for path in paths:
+            try:
+                result = await asyncio.to_thread(ocr_image.invoke, {"path": path})
+                ocr_texts[path] = str((result or {}).get("text") or "")
+            except Exception:
+                ocr_texts[path] = ""
+
+        prompt = _build_image_prompt(paths, ocr_texts, content)
+        _persist_ocr_history(paths, ocr_texts)
+        asyncio.create_task(self._run_agent(chat_id, prompt, user_id, msg_id=msg_id, is_group=is_group))
+
     async def _run_agent(
         self, chat_id: str, text: str, user_id: str, *, msg_id: str | None, is_group: bool
     ) -> None:
@@ -579,6 +663,14 @@ class QQApp:
                                     )
                                 else:
                                     await self.send_text(chat_id, f"[ask_user] {question}", is_group=is_group)
+                                return
+                            if isinstance(value, dict) and "waiting_for_text" in value:
+                                # wait_for_text interrupt: graph paused, waiting for user text
+                                count = value.get("pending_count", 0)
+                                await self.send_text(
+                                    chat_id, f"[image] 已收到 {count} 张图片，请发送文字说明...",
+                                    is_group=is_group,
+                                )
                                 return
                         continue
 

@@ -34,6 +34,7 @@ class GAState(AgentState[Any], total=False):
     done_hooks: list[str]
     retry_count: int
     exit_reason: str | None
+    pending_images: list[str]  # accumulated image paths for multi-image processing
 
 
 def new_state(user_input: str, cfg: Config) -> GAState:
@@ -46,4 +47,5 @@ def new_state(user_input: str, cfg: Config) -> GAState:
         done_hooks=[],
         retry_count=0,
         exit_reason=None,
+        pending_images=[],
     )
