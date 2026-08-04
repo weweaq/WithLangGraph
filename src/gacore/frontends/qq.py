@@ -345,15 +345,17 @@ class QQApp:
             logger.info(f"QQ message from {user_id} ({'group' if is_group else 'c2c'}): {content[:80]}")
             print(f"[QQ] {user_id} ({'group' if is_group else 'c2c'}): {content[:80]}")
 
-            # 1) If this user has a pending ask_user interrupt, resume the graph.
-            if user_id in _pending_interrupt:
-                config = _pending_interrupt.pop(user_id)
-                asyncio.create_task(self._resume_agent(chat_id, content, config, msg_id=msg_id, is_group=is_group))
+            # 1) Slash commands — check BEFORE interrupt so /stop works during ask_user.
+            if content.startswith("/"):
+                if content.strip() == "/stop":
+                    _pending_interrupt.pop(user_id, None)
+                await self._handle_command(chat_id, content, user_id=user_id, msg_id=msg_id, is_group=is_group)
                 return
 
-            # 2) Slash commands.
-            if content.startswith("/"):
-                await self._handle_command(chat_id, content, user_id=user_id, msg_id=msg_id, is_group=is_group)
+            # 2) If this user has a pending ask_user interrupt, resume the graph.
+            if user_id in _pending_interrupt:
+                config = _pending_interrupt.pop(user_id)
+                asyncio.create_task(self._resume_agent(chat_id, content, config, msg_id=msg_id, is_group=is_group, user_id=user_id))
                 return
 
             # 3) Normal agent turn.
@@ -364,55 +366,97 @@ class QQApp:
             print("[QQ] handle_message error")
             traceback.print_exc()
 
-    # --------------------------------------------------------------- image handling
+    # --------------------------------------------------------------- image batching
 
-    async def _handle_image_message(
-        self,
-        chat_id: str,
-        user_id: str,
-        image_urls: list[str],
-        user_text: str,
-        *,
-        msg_id: str | None,
-        is_group: bool,
-    ) -> None:
-        """Download images, OCR locally, embed recognized text into the prompt, route to agent."""
+    async def _process_image(self, user_id: str) -> None:
+        """Process image batches for one user until none remain.
+
+        The batch is kept in ``_pending_image`` while downloading/OCR-ing so text
+        arriving in that window merges into ``pending["text"]`` (same dict reference)
+        instead of spawning a competing task that would cancel this one. When the
+        user gave no text, the prompt tells the model to call ``wait_for_text``, which
+        pauses the graph (interrupt) until the user's follow-up text resumes it.
+        """
         try:
-            await self.send_text(chat_id, "识别中...", msg_id=msg_id, is_group=is_group)
-
-            os.makedirs("temp", exist_ok=True)
-            paths: list[str] = []
-            for i, url in enumerate(image_urls, start=1):
-                dest = os.path.abspath(f"temp/qq_img_{msg_id}_{i}.jpg")
-                if await _download_image(url, dest):
-                    paths.append(dest)
-
-            if not paths:
-                await self.send_text(chat_id, "图片处理失败，请重试", is_group=is_group)
-                return
-
-            # OCR locally first so the agent receives the recognized text directly in
-            # its prompt and can ANALYZE it, instead of being asked to call ocr_image
-            # itself (which would echo the raw tool result back to the user).
-            ocr_texts: dict[str, str] = {}
-            for path in paths:
+            while True:
+                pending = _pending_image.get(user_id)
+                if pending is None:
+                    return
+                chat_id = pending["chat_id"]
+                is_group = pending["is_group"]
                 try:
-                    result = await asyncio.to_thread(ocr_image.invoke, {"path": path})
-                    ocr_texts[path] = str((result or {}).get("text") or "")
-                except Exception:  # noqa: BLE001 — per-image OCR failure degrades to empty text
-                    logger.error("QQ image OCR failed", stack_trace=traceback.format_exc(), context={"path": path})
-                    ocr_texts[path] = ""
+                    await self.send_text(chat_id, "识别中...", msg_id=pending["msg_id"], is_group=is_group)
 
-            # Persist the OCR results so the agent can answer "what was in the image I
-            # sent earlier" — the history file path is surfaced in the prompt.
-            history_path = _persist_ocr_history(Config.default().memory_dir, paths, ocr_texts)
+                    os.makedirs("temp", exist_ok=True)
+                    paths: list[str] = []
+                    for i, url in enumerate(pending["urls"], start=1):
+                        dest = os.path.abspath(f"temp/qq_img_{user_id}_{i}_{int(time.time())}.jpg")
+                        if await _download_image(url, dest):
+                            paths.append(dest)
 
-            prompt = _build_image_prompt(paths, ocr_texts, user_text, history_path=history_path)
-            logger.info(f"QQ image OCR from {user_id}: {len(paths)} image(s)")
-            await self._run_agent(chat_id, prompt, user_id, msg_id=msg_id, is_group=is_group)
-        except Exception:  # noqa: BLE001 — silent degradation
-            logger.error("QQ image handling error", stack_trace=traceback.format_exc())
-            await self.send_text(chat_id, "图片处理失败，请重试", is_group=is_group)
+                    if not paths:
+                        _pending_image.pop(user_id, None)
+                        await self.send_text(chat_id, "图片处理失败，请重试", is_group=is_group)
+                        continue
+
+                    # OCR locally first so the agent receives the recognized text directly
+                    # in its prompt and can ANALYZE it, instead of being asked to call
+                    # ocr_image itself (which would echo the raw tool result back).
+                    ocr_texts: dict[str, str] = {}
+                    for path in paths:
+                        try:
+                            result = await asyncio.to_thread(ocr_image.invoke, {"path": path})
+                            ocr_texts[path] = str((result or {}).get("text") or "")
+                        except Exception:  # noqa: BLE001 — per-image OCR failure degrades to empty text
+                            logger.error("QQ image OCR failed", stack_trace=traceback.format_exc(), context={"path": path})
+                            ocr_texts[path] = ""
+
+                    # Take the batch (and any text merged in while we were working).
+                    final = _pending_image.pop(user_id, None) or pending
+                    user_text = final.get("text") or ""
+
+                    history_path = _persist_ocr_history(Config.default().memory_dir, paths, ocr_texts)
+                    prompt = _build_image_prompt(paths, ocr_texts, user_text, history_path=history_path)
+                    if not user_text:
+                        prompt += (
+                            "\n\n[用户只发送了图片，没有附带任何文字说明。你必须先调用 wait_for_text "
+                            "工具询问用户希望你对这张图片做什么（例如：描述图片内容、解释图中文字、分析问题），"
+                            "等待用户回复后再继续分析。]"
+                        )
+                    logger.info(f"QQ image OCR from {user_id}: {len(paths)} image(s)")
+                    await self._run_agent(chat_id, prompt, user_id, msg_id=final.get("msg_id"), is_group=is_group)
+                except Exception:  # noqa: BLE001 — silent degradation
+                    logger.error("QQ image handling error", stack_trace=traceback.format_exc())
+                    _pending_image.pop(user_id, None)
+                    await self.send_text(chat_id, "图片处理失败，请重试", is_group=is_group)
+        finally:
+            _image_processing.discard(user_id)
+
+    def _start_agent_turn(self, chat_id: str, text: str, user_id: str, *, msg_id: str | None, is_group: bool) -> None:
+        """Create the agent task for a plain text turn and register it for /stop."""
+        task = asyncio.create_task(self._run_agent(chat_id, text, user_id, msg_id=msg_id, is_group=is_group))
+        self._running_tasks[user_id] = task
+
+    async def _drain_queue(self, user_id: str) -> None:
+        """After a turn ends, start the next queued input for this user (FIFO)."""
+        if self._running_tasks.get(user_id) is not None and not self._running_tasks[user_id].done():
+            return
+        q = _queued_inputs.get(user_id)
+        if not q:
+            return
+        kind, payload = q.popleft()
+        if kind == "text":
+            chat_id, content, _uid, msg_id, is_group = payload
+            self._start_agent_turn(chat_id, content, user_id, msg_id=msg_id, is_group=is_group)
+
+    async def _auto_resume_image(self, user_id: str, chat_id: str, is_group: bool) -> None:
+        """Timeout safety net: a wait_for_text interrupt auto-resumes if the user stays silent."""
+        await asyncio.sleep(_IMAGE_WAIT_TIMEOUT)
+        config = _pending_interrupt.pop(user_id, None)
+        if config is not None:
+            await self._resume_agent(chat_id, "直接分析这张图片", config, msg_id=None, is_group=is_group)
+
+    # --------------------------------------------------------------- image handling
 
     # --------------------------------------------------------------- commands
 
@@ -449,6 +493,9 @@ class QQApp:
                     self.graph.checkpointer.delete_thread(old_thread)
                 except (KeyError, ValueError, LookupError):
                     pass
+            _pending_image.pop(user_id, None)
+            _image_processing.discard(user_id)
+            _queued_inputs.pop(user_id, None)
             return await self.send_text(chat_id, "✅ 已开启新对话", msg_id=msg_id, is_group=is_group)
         if op == "/status":
             thread_id = _user_threads.get(chat_id)
@@ -485,11 +532,11 @@ class QQApp:
         await self._stream_agent(chat_id, state, config, msg_id=msg_id, is_group=is_group, user_id=user_id)
 
     async def _resume_agent(
-        self, chat_id: str, answer: str, config: dict, *, msg_id: str | None, is_group: bool
+        self, chat_id: str, answer: str, config: dict, *, msg_id: str | None, is_group: bool, user_id: str
     ) -> None:
         """Resume a paused (ask_user) turn with the user's answer."""
         await self._stream_agent(
-            chat_id, Command(resume=answer), config, msg_id=msg_id, is_group=is_group, user_id=None
+            chat_id, Command(resume=answer), config, msg_id=msg_id, is_group=is_group, user_id=user_id
         )
 
     async def _stream_agent(
@@ -584,8 +631,9 @@ class QQApp:
             logger.error("QQ agent stream error", stack_trace=traceback.format_exc())
             await self.send_text(chat_id, "❌ 运行出错,请稍后重试或输入 /new 重置", is_group=is_group)
         finally:
-            if user_id is not None:
+            if user_id is not None and self._running_tasks.get(user_id) is current_task:
                 self._running_tasks.pop(user_id, None)
+                await self._drain_queue(user_id)
 
     # --------------------------------------------------------------- lifecycle
 

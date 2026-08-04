@@ -21,31 +21,49 @@ gacore 用 [LangGraph](https://langchain-ai.github.io/langgraph/) 重新实现�
   `GATurnLogicMiddleware`（exit_reason 短路、max_turns 守卫、空响应重试、
   done_hooks 续接、任务完成），通过官方 `hook_config`/`jump_to` 通道改变控制流，
   见 ARCHITECTURE.md 的拓扑图。
-- **10 个原子工具**：`code_run`、`file_read`、`file_patch`、`file_write`、
-   `web_scan`、`web_execute_js`、`browser_history`、`update_working_checkpoint`、
-   `start_long_term_update`、`ask_user`。其中 `browser_history` 读取 Edge 浏览历史
-   （SQLite），支持关键词 / 域名 / 时间范围过滤，返回 url、title、visit_count、
-   last_visit_time；其余 9 个与 GA 的工具集一一对应。
-- **工作记忆 / 长期记忆（L1 / L2）**：`update_working_checkpoint` 写入工作记忆
-  （每轮注入系统提示词），`start_long_term_update` 把内容蒸馏到
-  `memory/global_mem.txt`（L2 全局事实）与 `memory/global_mem_insight.txt`（L1 洞察索引）。
+
+- **16 个原子工具**：
+  - **代码与文件**：`code_run`、`file_read`、`file_patch`、`file_write`
+  - **Web**：`web_scan`（httpx 静态抓取）、`web_execute_js`（stub，恒返回不支持）
+  - **浏览器历史**：`browser_history`（Edge SQLite）、`bili_history`（B站观看历史，需 `bili` CLI 登录）
+  - **记忆**：`update_working_checkpoint`（工作记忆）、`start_long_term_update`（长期记忆）
+  - **每日笔记**：`read_daily`、`edit_daily`、`search_daily`（基于文件系统的每日笔记）
+  - **OCR**：`ocr_image`（本地图片 OCR）、`ocr_screen`（截图 OCR，基于 rapidocr-onnxruntime）
+  - **人机交互**：`ask_user`（中断暂停，等待用户回复）
+  其中 `browser_history` 读取 Edge 浏览历史（SQLite），支持关键词 / 域名 / 时间范围过滤；
+  `bili_history` 封装 `bili` CLI，获取 B站认证用户的观看历史；其余与 GA 工具集一一对应。
+
+- **三层记忆系统（L0 / L1 / L2）**：
+  - **L0 工作记忆**：`update_working_checkpoint` 写入 RAM 中的 `state.working`，每轮注入系统提示词
+  - **L1 每日笔记**：`read_daily` / `edit_daily` / `search_daily` 按日期组织，记忆重要决策、教训、用户偏好，跨会话持久化
+  - **L2 长期记忆**：`start_long_term_update` 从每日笔记蒸馏精华到 `memory/global_mem.txt`（全局事实）与 `memory/global_mem_insight.txt`（洞察索引）
+
+- **定时任务调度器**：`scheduler.py` 提供单进程轮询调度器，在指定时间触发 agent 执行自包含任务（如每日报告、周报），无需人工交互。支持 `"HH:MM"` 每日触发和 `"every N<m|h|d>"` 间隔触发；job 定义在 `config/schedule.json`，支持热更新。输出写入 `logs/scheduled/`。
+
 - **ask_user 人类介入中断**：`ask_user` 工具调用 `interrupt()` 暂停图执行，
   配合 MemorySaver 检查点和 `Command(resume=...)` 恢复。
+
 - **max_turns 守卫**：middleware 的 `before_model` 钩子在调用 LLM 前检查轮数，
   超过上限直接以 `MAX_TURNS_EXCEEDED` 终止，不会再消耗一次模型调用。
+
 - **done_hooks 续接**：收尾提示队列（GA 的 `_done_hooks`），任务主体完成后按序
   追加一轮 HumanMessage 继续执行（middleware `after_model` 经 `jump_to="model"`
   回环）。
+
 - **LLM 异常兜底**：官方 `ModelRetryMiddleware`（max_retries=0）把 provider 异常
   转成 `[Agent error: ...]` 消息，图以 `AGENT_ERROR` 干净退出，不崩溃。
+
 - **JSONL 结构化日志**：每天写入 `logs/YYYY-MM-DD/app.jsonl`，同一天的运行追加到同一文件，
    每条日志含 timestamp / level / module / message，错误日志附 error_type / stack_trace / context。
+
+- **QQ Bot 前端**：`src/gacore/frontends/qq.py` 提供 QQ 官方机器人接入，支持私聊与群 @ 消息，
+  会话按用户隔离，支持 `ask_user` 中断恢复。
 
 ---
 
 ## 环境要求 (Requirements)
 
-- **Python 3.12**（pyproject.toml 声明 `>=3.12,<3.14`，本机验证环境为 conda env `py12`）。
+- **Python 3.12**（pyproject.toml 声明 `>=3.12,<3.14`）。
 - 本机路径示例：
 
   ```
@@ -53,7 +71,8 @@ gacore 用 [LangGraph](https://langchain-ai.github.io/langgraph/) 重新实现�
   ```
 
 - 运行依赖：`langchain`、`langgraph`、`langgraph-checkpoint`、`langchain-core`、
-  `langchain-openai`、`langchain-anthropic`、`python-dotenv`、`httpx`、`prompt_toolkit`。
+  `langchain-openai`、`langchain-anthropic`、`python-dotenv`、`httpx`、`prompt_toolkit`、
+  `Pillow`、`rapidocr-onnxruntime`、`numpy`。
   本机锁定的关键版本：langchain 1.3.14、langgraph 1.2.10、langgraph-checkpoint 4.1.1、
   langchain-core 1.5.3。
 
@@ -61,18 +80,22 @@ gacore 用 [LangGraph](https://langchain-ai.github.io/langgraph/) 重新实现�
 
 ## 安装 (Install)
 
-在项目根目录（含 `pyproject.toml`）执行，依赖清单与 pyproject.toml 完全一致：
+在项目根目录（含 `pyproject.toml`）执行：
 
 ```powershell
-# 激活 conda 环境（或直接用完整 python 路径）
-conda activate py12
-pip install langchain langgraph langgraph-checkpoint langchain-core langchain-openai langchain-anthropic python-dotenv httpx prompt_toolkit
+pip install langchain langgraph langgraph-checkpoint langchain-core langchain-openai langchain-anthropic python-dotenv httpx prompt_toolkit Pillow rapidocr-onnxruntime numpy
 ```
 
 开发 / 测试额外依赖：
 
 ```powershell
 pip install pytest ruff
+```
+
+QQ Bot 前端额外依赖：
+
+```powershell
+pip install qq-botpy
 ```
 
 项目使用 src 布局，不安装为包也可运行，见下文"运行"。
@@ -106,6 +129,16 @@ Copy-Item .env.example .env
 协议，由 `ChatOpenAI` 驱动，默认 base URL 为 `https://api.deepseek.com/v1`、默认模型为
 `deepseek-v4-pro`（可选 `deepseek-v4-flash`）。
 
+### QQ Bot 配置
+
+| 变量 | 说明 |
+| :--- | :--- |
+| `QQ_APP_ID` | QQ 开放平台 App ID |
+| `QQ_APP_SECRET` | QQ 开放平台 App Secret |
+| `QQ_ALLOWED_USERS` | 白名单，`*` 或逗号分隔的 openid |
+| `QQ_ADMIN_USERS` | 可触发 `/reboot` 的用户，`*` 或逗号分隔的 openid |
+| `QQ_LOG_FILE` | QQ Bot 日志文件路径，默认 `logs/qq.log` |
+
 另有环境变量可覆盖目录（不写进 .env 也行）：`GACORE_ASSET_DIR`、`GACORE_MEMORY_DIR`、
 `GACORE_LOGS_DIR`、`GACORE_TEMP_DIR`，相对路径以项目根为基准。测试用
 `GACORE_MEMORY_DIR` 指向临时目录，避免污染真实 `memory/`。
@@ -114,7 +147,7 @@ Copy-Item .env.example .env
 
 ## 运行 (Run)
 
-交互式 CLI（REPL）：
+### 交互式 CLI（REPL）
 
 ```powershell
 $env:PYTHONPATH = "src"
@@ -150,22 +183,40 @@ python -m gacore
 
   退出码为 1。
 
+### QQ Bot 前端
+
+```powershell
+$env:PYTHONPATH = "src"
+python -m gacore.frontends.qq
+```
+
+每个 QQ 用户独立 `thread_id`，会话历史隔离；支持 `ask_user` 中断恢复——暂停时向用户发送问题，
+下一条消息自动恢复执行。
+
+### 定时任务调度器
+
+```powershell
+python -m gacore.scheduler
+```
+
+前台运行，`Ctrl-C` 停止。job 定义在 `config/schedule.json`，支持热更新——无需重启。
+
 ---
 
 ## 测试 (Testing)
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m pytest tests -q      # 当前 168 个用例全部通过
+python -m pytest tests -q      # 当前 228 个用例全部通过
 python -m ruff check src tests # lint 干净
 ```
 
-168 个测试覆盖：状态初始化、middleware（before_model 短路 / max_turns 守卫、
+228 个测试覆盖：状态初始化、middleware（before_model 短路 / max_turns 守卫、
 after_model 空响应重试 / done_hooks 续接 / 完成 / AGENT_ERROR）单测与图集成、
 LLM 工厂（openai / anthropic / deepseek 分支与缺失 Key 报错）、工具注册表、
-code_run / file / memory / web / browser_history 五组工具、ask_user 中断与恢复
-（含 langgraph 两种中断表象）、端到端多轮循环与 done_hooks 续接、流式 REPL
-输出与斜杠命令。
+code_run / file / memory / web / browser_history / bili_history / daily_notes / ocr 工具、
+ask_user 中断与恢复（含 langgraph 两种中断表象）、端到端多轮循环与 done_hooks 续接、
+流式 REPL 输出与斜杠命令、定时任务调度器、QQ Bot 前端。
 
 ---
 
@@ -177,12 +228,13 @@ code_run / file / memory / web / browser_history 五组工具、ask_user 中断�
 | `agent_loop.py`（工具分发、`StepOutcome`） | 预置 `ToolNode` + `Command(update=...)` | 工具执行；控制信号（`exit_reason` / `working`）由工具直接经 Command 回写 |
 | `agent_loop.py`（`no_tool` 分支、`_done_hooks`） | `middleware.py`（`GATurnLogicMiddleware`） | 最终答案校验 + done_hooks 续接（after_model 钩子） |
 | `ga.py`（`turn_end_callback` :570、`_get_anchor_prompt`、`get_global_memory` :602） | `context.py` | 每轮提示词组装（系统提示词 + 折叠历史 + 周期提示） |
-| `ga.py`（`do_code_run` / `do_file_*` / `do_ask_user` 等） | `tools/*.py` | 10 个原子工具（含 `browser_history`，GA 无对应） |
+| `ga.py`（`do_code_run` / `do_file_*` / `do_ask_user` 等） | `tools/*.py` | 16 个原子工具（含 browser_history、bili_history、daily_notes、ocr，GA 无对应） |
 | `llmcore.py`（`client.chat` / Session） | `llm.py` | LLM 工厂，openai / anthropic / deepseek 三选一 |
 | `mykey.py` / `NativeToolClient` | `llm.py`（环境变量驱动） | 配置方式替换 |
 | `frontends/tui_v3.py` | `cli.py` | 交互前端（REPL） |
-| `memory/global_mem*.txt` | `memory/` + `tools/memory_tools.py` | L1 / L2 长期记忆 |
-| （无 GA 对应） | `state.py` / `logging.py` | `GAState` 状态通道 + JSONL 日志 |
+| `frontends/qqapp.py` | `frontends/qq.py` | QQ Bot 前端 |
+| `memory/global_mem*.txt` | `memory/` + `tools/memory_tools.py` + `tools/daily_notes.py` | L0/L1/L2 三层记忆 |
+| （无 GA 对应） | `state.py` / `jsonl_logger.py` / `scheduler.py` | `GAState` 状态通道 + JSONL 日志 + 定时任务调度器 |
 
 忠实移植的语义与刻意简化的差异，逐条记录在 ARCHITECTURE.md 第 4、5 节。
 
@@ -197,10 +249,18 @@ code_run / file / memory / web / browser_history 五组工具、ask_user 中断�
   恒返回"不支持"错误字典（见 `tools/web_tools.py`）。
 - **reflect 自治模式**：`reflect/goal_mode.py` 等自驱、时间预算型执行未移植。
 - **插件机制**：GA 的 `plugins/hooks.py` hook 链未移植。
-- **IM 前端**：Telegram / Discord / 微信 / 飞书等 Bot 前端未移植，只有终端 REPL。
-- **L4 会话归档**：长程任务归档记忆未移植（L1/L2 已覆盖）。
+- **IM 前端**：Telegram / Discord / 微信 / 飞书等 Bot 前端未移植，仅保留终端 REPL
+  和 QQ Bot（`frontends/qq.py`）。
+- **L4 会话归档**：长程任务归档记忆未移植（L0/L1/L2 三层已覆盖）。
 - **Mixin 多模型故障切换**：GA `NativeToolClient` 的多模型兜底切换未移植，
   gacore 是单一 `LLM_PROVIDER` 的选择逻辑（`llm.py`）。
+
+### gacore 特有（GA 无对应）
+
+- **三层记忆系统**（ARCHITECTURE.md 第 6 节）：在 GA 的 L1/L2 基础上增加了基于文件系统的每日笔记层，填平工作记忆与长期记忆之间的断层。
+- **定时任务调度器**（ARCHITECTURE.md 第 7 节）：单进程轮询调度，支持热更新，用于无人值守的周期性任务。
+- **本地 OCR 工具**：`ocr_image` / `ocr_screen` 基于 rapidocr-onnxruntime，无需外部 API。
+- **B站观看历史**：`bili_history` 工具封装 `bili` CLI。
 
 ---
 
@@ -208,22 +268,72 @@ code_run / file / memory / web / browser_history 五组工具、ask_user 中断�
 
 ```
 WithLangGraph/
-├── pyproject.toml            # 依赖与工具配置（ruff line-length=120）
-├── .env.example              # 配置模板，复制为 .env 使用
+├── pyproject.toml             # 依赖与工具配置（ruff line-length=120）
+├── uv.lock                    # uv 依赖锁文件
+├── .env.example               # 配置模板，复制为 .env 使用
+├── start_all.bat              # 一键启动脚本（REPL + 调度器 + QQ Bot）
+├── TODO.md                    # 用户交代的待办事项
+├── config/
+│   ├── schedule.json          # 定时任务定义
+│   └── assets/
+│       ├── sys_prompt.txt     # L0 系统规则
+│       └── code_run_header.py # code_run 沙箱头
+├── docs/superpowers/specs/    # 超能力规格文档
+├── memory/
+│   ├── global_mem.txt         # L2 全局事实
+│   ├── global_mem_insight.txt # L2 洞察索引
+│   ├── ocr_history.jsonl      # OCR 历史
+│   └── daily/                 # L1 每日笔记（YYYY-MM-DD.md）
+├── logs/
+│   ├── YYYY-MM-DD/app.jsonl  # JSONL 结构化日志
+│   └── scheduled/             # 定时任务输出
+├── temp/                      # 运行时临时文件
 ├── src/gacore/
-│   ├── __main__.py           # python -m gacore 入口
-│   ├── cli.py                # 交互 REPL（流式回放 + 斜杠命令 + ask_user 中断处理）
-│   ├── graph.py              # create_agent 组装（middleware 链）、编译、run_once
-│   ├── middleware.py         # GAPromptMiddleware / GATurnLogicMiddleware（GA 回合控制）
-│   ├── state.py              # GAState（继承官方 AgentState）+ 初始化
-│   ├── context.py            # 每轮提示词组装（纯函数）
-│   ├── llm.py                # LLM 工厂
-│   ├── config.py             # 配置解析（目录 / max_turns）
-│   ├── logging.py            # JSONL 日志
-│   ├── tools/                # 10 个工具（含 browser_history）
-│   └── memory/               # 记忆模块（预留）
-├── config/assets/            # sys_prompt.txt（L0 规则）、code_run_header.py
-├── memory/                   # L1 / L2 记忆文件（运行时生成）
-├── logs/                     # JSONL 日志（运行时生成）
-└── tests/                    # 168 个测试
+│   ├── __main__.py            # python -m gacore 入口
+│   ├── cli.py                 # 交互 REPL（流式回放 + 斜杠命令 + ask_user 中断处理）
+│   ├── graph.py               # create_agent 组装（middleware 链）、编译、run_once
+│   ├── middleware.py          # GAPromptMiddleware / GATurnLogicMiddleware（GA 回合控制）
+│   ├── state.py               # GAState（继承官方 AgentState）+ 初始化
+│   ├── context.py             # 每轮提示词组装（纯函数）
+│   ├── llm.py                 # LLM 工厂
+│   ├── config.py              # 配置解析（目录 / max_turns）
+│   ├── jsonl_logger.py        # JSONL 结构化日志
+│   ├── scheduler.py           # 定时任务调度器
+│   ├── frontends/
+│   │   ├── qq.py              # QQ Bot 前端
+│   │   └── qq.bat             # QQ Bot 启动脚本
+│   ├── tools/                 # 16 个工具
+│   │   ├── __init__.py        # 工具注册表（TOOL_NAMES + build_tool_list）
+│   │   ├── ask_user.py        # 人类介入中断
+│   │   ├── bili_history.py    # B站观看历史
+│   │   ├── browser_history.py # Edge 浏览历史
+│   │   ├── code_run.py        # 代码执行（沙箱）
+│   │   ├── daily_notes.py     # 每日笔记（read_daily/edit_daily/search_daily）
+│   │   ├── file_tools.py      # 文件读写（file_read/file_patch/file_write）
+│   │   ├── memory_tools.py    # 长期记忆（update_working_checkpoint/start_long_term_update）
+│   │   ├── ocr_tools.py       # 本地 OCR（ocr_image/ocr_screen）
+│   │   └── web_tools.py       # Web 工具（web_scan/web_execute_js）
+│   └── memory/
+│       └── __init__.py
+└── tests/                     # 228 个测试
+    ├── conftest.py
+    ├── test_cli.py
+    ├── test_context.py
+    ├── test_e2e.py
+    ├── test_graph_loop.py
+    ├── test_interrupt.py
+    ├── test_llm.py
+    ├── test_middleware.py
+    ├── test_nodes_tools.py
+    ├── test_qq.py
+    ├── test_registry.py
+    ├── test_scheduler.py
+    ├── test_state.py
+    ├── test_tools_bili_history.py
+    ├── test_tools_browser_history.py
+    ├── test_tools_code_run.py
+    ├── test_tools_daily_notes.py
+    ├── test_tools_file.py
+    ├── test_tools_memory.py
+    └── test_tools_web.py
 ```
