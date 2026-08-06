@@ -33,7 +33,7 @@ from langchain.agents.middleware import (
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from gacore.config import Config
-from gacore.context import EARLIER_HEADER, build_system_prompt, fold_history
+from gacore.context import build_system_prompt
 from gacore.state import GAState
 
 _EMPTY_PROMPT: Final = "[Empty response. Please respond or call a tool.]"
@@ -42,12 +42,15 @@ _AGENT_ERROR_PREFIX: Final = "[Agent error:"
 
 
 class GAPromptMiddleware(AgentMiddleware[GAState, None, Any]):
-    """Rebuild the per-turn system prompt (rules + working checkpoint + hints + folding).
+    """Rebuild the per-turn system prompt (rules + working checkpoint + hints).
 
     GA never stores the system prompt in state.messages: it is rebuilt fresh on every
-    model call, with the folded earlier context embedded in the system message. This
-    middleware applies that same behavior at the model-request level, which keeps the
-    ``messages`` channel clean (no duplicated leading SystemMessage).
+    model call. This middleware applies that behavior at the model-request level, which
+    keeps the ``messages`` channel clean (no duplicated leading SystemMessage).
+
+    Note: the full ``state.messages`` is passed to the LLM by create_agent; we do NOT
+    fold history into the system prompt — that would cause every message to appear
+    twice, triggering duplicate replies from the model.
     """
 
     def __init__(self, cfg: Config) -> None:
@@ -69,12 +72,15 @@ class GAPromptMiddleware(AgentMiddleware[GAState, None, Any]):
         return await handler(req)
 
     def _inject_prompt(self, request: ModelRequest[None]) -> ModelRequest[None]:
-        """Build the per-turn system message and return an overridden request."""
+        """Build the per-turn system message and return an overridden request.
+
+        Note: fold_history is intentionally not called here. create_agent already
+        passes the full state.messages to the LLM; folding them into the system
+        prompt as well would cause every message to appear twice, triggering
+        duplicate replies from the model.
+        """
         state = request.state
         prompt = build_system_prompt(state, self.cfg)
-        folded = fold_history(state.get("messages") or [])
-        if folded:
-            prompt += f"\n\n{EARLIER_HEADER}\n" + "\n".join(folded)
         return request.override(system_message=SystemMessage(content=prompt))
 
 
