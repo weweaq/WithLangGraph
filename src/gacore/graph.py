@@ -143,6 +143,25 @@ def route_after_wait(state: GAState) -> str:
     return "process"
 
 
+def cleanup_images(state: GAState) -> dict:
+    """Strip [IMAGE:path] markers from all HumanMessages and clear pending_images.
+
+    Called after the core agent completes a turn. Removing markers before the state
+    is checkpointed prevents old [IMAGE:path] tags from leaking into future turns
+    and causing the model to "accumulate" references to past images.
+    """
+    messages = state.get("messages") or []
+    cleaned: list = []
+    for msg in messages:
+        if isinstance(msg, HumanMessage) and isinstance(msg.content, str):
+            new_content = _text_without_markers(msg.content)
+            if new_content:
+                cleaned.append(HumanMessage(content=new_content, id=msg.id))
+        else:
+            cleaned.append(msg)
+    return {"messages": cleaned, "pending_images": []}
+
+
 # --------------------------------------------------------------------------- graph assembly
 
 
@@ -186,7 +205,7 @@ def build_graph(
                                   └─ (images, no text →) ─→ wait_for_text
                                                                │
                                           Command(update) ────┘  (more images)
-                                          Command(resume) ─────→ process
+                                          Command(resume) ─────→ process → cleanup_images → END
 
     The ``process`` node wraps the core create_agent subgraph with the same middleware
     chain (GAPromptMiddleware → GATurnLogicMiddleware → ModelRetryMiddleware).
@@ -207,6 +226,7 @@ def build_graph(
     workflow.add_node("classify_message", classify_message)
     workflow.add_node("wait_for_text", wait_for_text)
     workflow.add_node("process", core_agent)
+    workflow.add_node("cleanup_images", cleanup_images)
 
     workflow.add_edge(START, "classify_message")
     workflow.add_conditional_edges(
@@ -219,7 +239,8 @@ def build_graph(
         route_after_wait,
         {"process": "process"},
     )
-    workflow.add_edge("process", END)
+    workflow.add_edge("process", "cleanup_images")
+    workflow.add_edge("cleanup_images", END)
 
     return workflow.compile(checkpointer=resolved_checkpointer)
 
