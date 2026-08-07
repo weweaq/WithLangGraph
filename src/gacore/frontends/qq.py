@@ -84,6 +84,9 @@ _HTTP_TIMEOUT: Final = 30  # botpy default (5s) is too short for slow TLS handsh
 _processed_ids: deque[str] = deque(maxlen=2000)          # dedupe by message id
 _pending_interrupt: dict[str, dict] = {}                 # user_id -> graph config awaiting resume
 _user_threads: dict[str, str] = {}                       # user_id -> thread_id
+_queued_inputs: dict[str, deque] = {}                    # user_id -> FIFO queue of pending inputs
+_pending_image: dict[str, dict] = {}                     # user_id -> pending image batch info
+_image_processing: set[str] = set()                      # user_ids currently being processed
 _graph: CompiledStateGraph | None = None
 _instance_sock: socket.socket | None = None              # single-instance port, released by /reboot
 
