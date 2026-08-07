@@ -1,4 +1,5 @@
 .env
+notes.txt
 logs/
 memory/global_mem*.txt
 memory/ocr_history.jsonl
