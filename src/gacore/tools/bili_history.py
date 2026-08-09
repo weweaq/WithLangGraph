@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Final, TypedDict
 
 from langchain_core.tools import tool
@@ -44,6 +45,7 @@ class BiliHistoryEntry(TypedDict):
     title: str
     author: str
     viewed_at: str  # ISO 8601 本地时间
+    duration_seconds: int | None  # 视频总时长（秒），仅 include_duration=True 时有值
 
 
 class BiliHistoryResult(TypedDict):
@@ -92,8 +94,29 @@ def _load_json(stdout: str) -> dict | None:
         return None
 
 
+def _fetch_one_duration(bili: str, bvid: str) -> int | None:
+    """Fetch the duration_seconds for a single video via ``bili video --json``.
+
+    Returns None when the CLI call fails (timeout, bad json, missing field, etc.).
+    """
+    try:
+        proc = _run_cli([bili, "video", bvid, "--json"])
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    data = _load_json(proc.stdout)
+    if data is None:
+        return None
+    video = (data.get("data") or {}).get("video")
+    if not isinstance(video, dict):
+        return None
+    ds = video.get("duration_seconds")
+    return int(ds) if isinstance(ds, (int, float)) else None
+
+
 @tool
-def bili_history(limit: int = 30, page: int = 1) -> BiliHistoryResult | BiliHistoryError:
+def bili_history(limit: int = 30, page: int = 1, include_duration: bool = False) -> BiliHistoryResult | BiliHistoryError:
     """获取当前登录 Bilibili 账号的观看历史记录（最近看过的视频列表）。
 
     需要本机已通过 `bili login` 扫码登录过 Bilibili（登录态持久保存在本地）。
@@ -103,10 +126,12 @@ def bili_history(limit: int = 30, page: int = 1) -> BiliHistoryResult | BiliHist
     Args:
         limit: 返回条数，1-100，默认 30。
         page: 页码，默认 1。
+        include_duration: 是否并发拉取每条视频的时长（duration_seconds，秒）。
+            开启后每条视频调用 ``bili video`` 补充时长，用于判断长视频观看信号。
 
     Returns:
-        成功: {"entries": [{"bvid","title","author","viewed_at"}...], "total": n,
-               "page": p, "account": "账号名", "uid": "uid"}
+        成功: {"entries": [{"bvid","title","author","viewed_at","duration_seconds"}...],
+               "total": n, "page": p, "account": "账号名", "uid": "uid"}
         失败: {"error": "错误标签", "message": "说明", "detail": 详细或 null}
     """
     if limit < _MIN_LIMIT or limit > _MAX_LIMIT:
@@ -196,6 +221,21 @@ def bili_history(limit: int = 30, page: int = 1) -> BiliHistoryResult | BiliHist
     ]
     total = int(d.get("count") or len(entries))
     got_page = int(d.get("page") or page)
+
+    # 并发拉取每条视频的时长
+    if include_duration and entries:
+        bvids = [e["bvid"] for e in entries if e["bvid"]]
+        durations: dict[str, int | None] = {}
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {pool.submit(_fetch_one_duration, bili, bv): bv for bv in bvids}
+            for future in as_completed(futures):
+                bv = futures[future]
+                try:
+                    durations[bv] = future.result()
+                except Exception:
+                    durations[bv] = None
+        for entry in entries:
+            entry["duration_seconds"] = durations.get(entry["bvid"])
 
     logger.info("bili_history success", total=total, page=got_page, account=account, uid=uid)
     return BiliHistoryResult(entries=entries, total=total, page=got_page, account=account, uid=uid)
