@@ -18,7 +18,7 @@ import shutil
 import sqlite3
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final, Literal, TypedDict
 
@@ -70,7 +70,7 @@ class BrowserHistoryError(TypedDict):
 def _webkit_to_iso(webkit_micros: int) -> str:
     """Convert a WebKit timestamp (microseconds since 1600-01-01) to ISO 8601 UTC string."""
     unix_seconds = webkit_micros / _WEBKIT_MICROS_PER_SEC - _WEBKIT_EPOCH_OFFSET
-    dt = datetime.fromtimestamp(unix_seconds, tz=timezone.utc)
+    dt = datetime.fromtimestamp(unix_seconds, tz=UTC)
     return dt.isoformat()
 
 

@@ -23,10 +23,10 @@ import json
 import re
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
-from typing import Any, Callable, Final
+from typing import Final
 
 from gacore.config import Config, load_dotenv
 from gacore.jsonl_logger import get_logger
@@ -359,7 +359,7 @@ def run_loop(
             if not is_due(job, state, now):
                 continue
             logger.info("Job due, firing", job=job.name, schedule=job.schedule, now=now.isoformat(timespec="seconds"))
-            result = run_job(job, resolved_cfg, graph_runner=graph_runner)
+            run_job(job, resolved_cfg, graph_runner=graph_runner)
             states[job.name] = JobState(
                 last_run=now.isoformat(timespec="seconds"),
                 run_count=state.run_count + 1,
@@ -381,7 +381,6 @@ def main() -> None:
         run_loop(cfg=cfg)
     except KeyboardInterrupt:
         logger.info("Scheduler stopped by user")
-        print("\nScheduler stopped.")
 
 
 __all__ = (
@@ -391,9 +390,9 @@ __all__ = (
     "is_due",
     "load_jobs",
     "load_state",
-    "save_state",
+    "main",
     "next_run_time",
     "run_job",
     "run_loop",
-    "main",
+    "save_state",
 )

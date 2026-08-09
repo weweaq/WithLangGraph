@@ -93,6 +93,32 @@ def test_streaming_prints_tool_activity(
     assert "wrote it" in out
 
 
+def test_streaming_renders_each_message_once(
+    tmp_cfg: Config,
+    message_llm: Callable[[list[BaseMessage]], FakeMessagesListChatModel],
+    capsys,
+) -> None:
+    """Regression: the wrapper graph (compiled subgraph + full-list cleanup node) streams
+    full-state updates, so each message used to render twice per turn — and the previous
+    turn's reply replayed inside the next turn. Each message must render exactly once."""
+    responses = [
+        _tool_call("file_write", {"path": str(tmp_cfg.temp_dir / "h.txt"), "content": "hi"}, "call_1"),
+        AIMessage(content="wrote it"),
+        AIMessage(content="second reply"),
+    ]
+    llm = message_llm(responses)
+    fake_input = _FakeInput("write a file", "again")
+
+    run_repl(cfg=tmp_cfg, llm=llm, input_func=fake_input)
+
+    out = capsys.readouterr().out
+    # each message appears exactly once across both turns, despite full-state chunks
+    assert out.count("wrote it") == 1
+    assert out.count("second reply") == 1
+    assert out.count("[agent] -> file_write(") == 1
+    assert out.count("[tools] <-") == 1
+
+
 def test_interrupt_prompts_human_and_resumes(
     tmp_cfg: Config,
     message_llm: Callable[[list[BaseMessage]], FakeMessagesListChatModel],

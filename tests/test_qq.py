@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from langchain_core.messages import AIMessage
 
 # Ensure `src` is importable and fake botpy BEFORE importing the module under test.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -32,6 +33,8 @@ sys.modules["botpy.message"] = _fake_message
 
 from gacore.frontends import qq
 from gacore.frontends.qq import QQApp, _processed_ids, _split_text
+from gacore.graph import build_graph
+from gacore.state import new_state
 
 
 def test_split_text_short_unchanged():
@@ -222,3 +225,42 @@ async def test_reboot_execs_new_process():
     assert "正在重启" in first_call_text
     sock.close.assert_called_once()
     execv.assert_called_once_with(sys.executable, [sys.executable, qq.__file__])
+
+
+@pytest.mark.asyncio
+async def test_stream_agent_renders_each_message_once(
+    tmp_cfg, message_llm, monkeypatch
+) -> None:
+    """Regression: the wrapper graph (compiled subgraph + full-list cleanup node) streams
+    full-state updates, so each message used to be sent twice per turn — and previous
+    turns' replies replayed inside later turns. Each message must be sent exactly once."""
+    qq._rendered_msg_ids.clear()
+
+    responses = [
+        AIMessage(
+            content="",
+            tool_calls=[
+                {"name": "file_write", "args": {"path": "h.txt", "content": "hi"}, "id": "call_1", "type": "tool_call"}
+            ],
+        ),
+        AIMessage(content="wrote it"),
+        AIMessage(content="second reply"),
+    ]
+    llm = message_llm(responses)
+    graph = build_graph(llm=llm, cfg=tmp_cfg)
+    app = QQApp(graph)
+    app.send_text = AsyncMock()
+
+    config = {"configurable": {"thread_id": "qq-dedupe-test"}}
+    await app._stream_agent(
+        "chat-1", new_state("write a file", tmp_cfg), config, msg_id=None, is_group=False, user_id="user-1"
+    )
+    await app._stream_agent(
+        "chat-1", new_state("again", tmp_cfg), config, msg_id=None, is_group=False, user_id="user-1"
+    )
+
+    texts = [call.args[1] for call in app.send_text.call_args_list if len(call.args) > 1]
+    assert sum(1 for t in texts if "[agent] -> file_write(" in t) == 1
+    assert sum(1 for t in texts if t.startswith("[tools] <-")) == 1
+    assert sum(1 for t in texts if "wrote it" in t) == 1   # not duplicated, not replayed in turn 2
+    assert sum(1 for t in texts if "second reply" in t) == 1

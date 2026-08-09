@@ -79,6 +79,7 @@ def _run_cli(args: list[str]) -> subprocess.CompletedProcess[str]:
         errors="replace",
         timeout=_TIMEOUT_SECONDS,
         env=_ENV,
+        check=False,  # callers inspect returncode / JSON payload
     )
 
 

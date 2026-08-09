@@ -9,11 +9,8 @@ due jobs, running them, persisting state, and writing outputs + daily notes.
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
-
-import pytest
 
 from gacore.config import Config
 from gacore.scheduler import (
@@ -29,7 +26,6 @@ from gacore.scheduler import (
     save_state,
 )
 
-
 # ---------- next_run_time: daily HH:MM ----------
 
 
@@ -38,29 +34,29 @@ class TestNextRunDaily:
 
     def test_never_run_and_slot_passed_returns_today_slot(self) -> None:
         """Given 14:00 schedule and now=15:00, When never run, Then next_run is today 14:00 (already due)."""
-        now = datetime(2026, 8, 3, 15, 0, 0)
+        now = datetime(2026, 8, 3, 15, 0, 0, tzinfo=UTC)
         nxt = next_run_time("14:00", last_run=None, now=now)
-        assert nxt == datetime(2026, 8, 3, 14, 0, 0)
+        assert nxt == datetime(2026, 8, 3, 14, 0, 0, tzinfo=UTC)
 
     def test_never_run_and_slot_not_yet_returns_today_slot(self) -> None:
         """Given 14:00 schedule and now=10:00, When never run, Then next_run is today 14:00."""
-        now = datetime(2026, 8, 3, 10, 0, 0)
+        now = datetime(2026, 8, 3, 10, 0, 0, tzinfo=UTC)
         nxt = next_run_time("14:00", last_run=None, now=now)
-        assert nxt == datetime(2026, 8, 3, 14, 0, 0)
+        assert nxt == datetime(2026, 8, 3, 14, 0, 0, tzinfo=UTC)
 
     def test_already_ran_today_returns_tomorrow(self) -> None:
         """Given 14:00 schedule, last_run=today 14:05, When now=15:00, Then next_run is tomorrow 14:00."""
-        now = datetime(2026, 8, 3, 15, 0, 0)
-        last_run = datetime(2026, 8, 3, 14, 5, 0).isoformat()
+        now = datetime(2026, 8, 3, 15, 0, 0, tzinfo=UTC)
+        last_run = datetime(2026, 8, 3, 14, 5, 0, tzinfo=UTC).isoformat()
         nxt = next_run_time("14:00", last_run=last_run, now=now)
-        assert nxt == datetime(2026, 8, 4, 14, 0, 0)
+        assert nxt == datetime(2026, 8, 4, 14, 0, 0, tzinfo=UTC)
 
     def test_ran_yesterday_and_slot_passed_returns_today_slot(self) -> None:
         """Given 14:00 schedule, last_run=yesterday, When now=15:00 today, Then next_run is today 14:00."""
-        now = datetime(2026, 8, 3, 15, 0, 0)
-        last_run = datetime(2026, 8, 2, 14, 0, 0).isoformat()
+        now = datetime(2026, 8, 3, 15, 0, 0, tzinfo=UTC)
+        last_run = datetime(2026, 8, 2, 14, 0, 0, tzinfo=UTC).isoformat()
         nxt = next_run_time("14:00", last_run=last_run, now=now)
-        assert nxt == datetime(2026, 8, 3, 14, 0, 0)
+        assert nxt == datetime(2026, 8, 3, 14, 0, 0, tzinfo=UTC)
 
 
 # ---------- next_run_time: interval ----------
@@ -71,30 +67,30 @@ class TestNextRunInterval:
 
     def test_every_30m_never_run_returns_now_plus_30m(self) -> None:
         """Given every 30m and never run, Then next_run is now + 30m."""
-        now = datetime(2026, 8, 3, 12, 0, 0)
+        now = datetime(2026, 8, 3, 12, 0, 0, tzinfo=UTC)
         nxt = next_run_time("every 30m", last_run=None, now=now)
-        assert nxt == datetime(2026, 8, 3, 12, 30, 0)
+        assert nxt == datetime(2026, 8, 3, 12, 30, 0, tzinfo=UTC)
 
     def test_every_6h_with_last_run_returns_last_plus_6h(self) -> None:
         """Given every 6h, last_run=06:00, When now=10:00, Then next_run is 12:00."""
-        now = datetime(2026, 8, 3, 10, 0, 0)
-        last_run = datetime(2026, 8, 3, 6, 0, 0).isoformat()
+        now = datetime(2026, 8, 3, 10, 0, 0, tzinfo=UTC)
+        last_run = datetime(2026, 8, 3, 6, 0, 0, tzinfo=UTC).isoformat()
         nxt = next_run_time("every 6h", last_run=last_run, now=now)
-        assert nxt == datetime(2026, 8, 3, 12, 0, 0)
+        assert nxt == datetime(2026, 8, 3, 12, 0, 0, tzinfo=UTC)
 
     def test_every_2d_walks_forward_when_overdue(self) -> None:
         """Given every 2d, last_run=3 days ago, When now, Then next_run walks forward to future."""
-        now = datetime(2026, 8, 5, 12, 0, 0)
-        last_run = datetime(2026, 8, 2, 12, 0, 0).isoformat()
+        now = datetime(2026, 8, 5, 12, 0, 0, tzinfo=UTC)
+        last_run = datetime(2026, 8, 2, 12, 0, 0, tzinfo=UTC).isoformat()
         nxt = next_run_time("every 2d", last_run=last_run, now=now)
         # last + 2d = Aug 4 (past), + 2d again = Aug 6 (future)
-        assert nxt == datetime(2026, 8, 6, 12, 0, 0)
+        assert nxt == datetime(2026, 8, 6, 12, 0, 0, tzinfo=UTC)
 
     def test_every_1h_case_insensitive(self) -> None:
         """Given 'every 1H' uppercase, When parsed, Then it works."""
-        now = datetime(2026, 8, 3, 12, 0, 0)
+        now = datetime(2026, 8, 3, 12, 0, 0, tzinfo=UTC)
         nxt = next_run_time("every 1H", last_run=None, now=now)
-        assert nxt == datetime(2026, 8, 3, 13, 0, 0)
+        assert nxt == datetime(2026, 8, 3, 13, 0, 0, tzinfo=UTC)
 
 
 # ---------- next_run_time: invalid ----------
@@ -102,7 +98,7 @@ class TestNextRunInterval:
 
 def test_next_run_time_returns_none_for_garbage() -> None:
     """Given an unparseable schedule, When next_run_time, Then None is returned."""
-    now = datetime(2026, 8, 3, 12, 0, 0)
+    now = datetime(2026, 8, 3, 12, 0, 0, tzinfo=UTC)
     assert next_run_time("not-a-schedule", last_run=None, now=now) is None
     # "25:00" matches the HH:MM regex but hour=25 is out of range → None
     assert next_run_time("25:00", last_run=None, now=now) is None
@@ -119,28 +115,28 @@ class TestIsDue:
         """Given 09:00 schedule, now=10:00, never run, Then is_due is True."""
         job = Job(name="test", schedule="09:00", prompt="hi")
         state = JobState()
-        now = datetime(2026, 8, 3, 10, 0, 0)
+        now = datetime(2026, 8, 3, 10, 0, 0, tzinfo=UTC)
         assert is_due(job, state, now) is True
 
     def test_not_due_when_slot_not_reached(self) -> None:
         """Given 09:00 schedule, now=08:00, never run, Then is_due is False."""
         job = Job(name="test", schedule="09:00", prompt="hi")
         state = JobState()
-        now = datetime(2026, 8, 3, 8, 0, 0)
+        now = datetime(2026, 8, 3, 8, 0, 0, tzinfo=UTC)
         assert is_due(job, state, now) is False
 
     def test_not_due_when_already_ran_today(self) -> None:
         """Given 09:00 schedule, ran at 09:05 today, now=10:00, Then is_due is False."""
         job = Job(name="test", schedule="09:00", prompt="hi")
-        state = JobState(last_run=datetime(2026, 8, 3, 9, 5, 0).isoformat())
-        now = datetime(2026, 8, 3, 10, 0, 0)
+        state = JobState(last_run=datetime(2026, 8, 3, 9, 5, 0, tzinfo=UTC).isoformat())
+        now = datetime(2026, 8, 3, 10, 0, 0, tzinfo=UTC)
         assert is_due(job, state, now) is False
 
     def test_not_due_for_invalid_schedule(self) -> None:
         """Given garbage schedule, Then is_due is always False."""
         job = Job(name="test", schedule="garbage", prompt="hi")
         state = JobState()
-        now = datetime(2026, 8, 3, 10, 0, 0)
+        now = datetime(2026, 8, 3, 10, 0, 0, tzinfo=UTC)
         assert is_due(job, state, now) is False
 
 
@@ -308,7 +304,7 @@ class TestRunLoop:
             encoding="utf-8",
         )
         # Use a fixed clock at 12:00 so 00:01 is definitely due
-        clock = lambda: datetime(2026, 8, 3, 12, 0, 0)
+        clock = lambda: datetime(2026, 8, 3, 12, 0, 0, tzinfo=UTC)
 
         fired: list[str] = []
 
@@ -342,7 +338,7 @@ class TestRunLoop:
             }),
             encoding="utf-8",
         )
-        clock = lambda: datetime(2026, 8, 3, 8, 0, 0)  # before 23:59
+        clock = lambda: datetime(2026, 8, 3, 8, 0, 0, tzinfo=UTC)  # before 23:59
 
         jobs_run = run_loop(cfg=cfg, graph_runner=lambda *a: None, max_iterations=1, clock=clock)
         assert jobs_run == 0
@@ -360,7 +356,7 @@ class TestRunLoop:
             }),
             encoding="utf-8",
         )
-        clock = lambda: datetime(2026, 8, 3, 12, 0, 0)
+        clock = lambda: datetime(2026, 8, 3, 12, 0, 0, tzinfo=UTC)
 
         fired: list[str] = []
 
@@ -378,6 +374,6 @@ class TestRunLoop:
     def test_run_loop_handles_no_schedule_file(self, tmp_path: Path) -> None:
         """Given no schedule.json, When run_loop runs, Then zero jobs run and no crash."""
         cfg = Config.for_tests(tmp_path)
-        clock = lambda: datetime(2026, 8, 3, 12, 0, 0)
+        clock = lambda: datetime(2026, 8, 3, 12, 0, 0, tzinfo=UTC)
         jobs_run = run_loop(cfg=cfg, graph_runner=lambda *a: None, max_iterations=1, clock=clock)
         assert jobs_run == 0

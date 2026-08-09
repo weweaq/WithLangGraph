@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
-from typing import Self
-
-import pytest
-
 import sys
 import types
+from pathlib import Path
+
+import pydantic
+import pytest
 
 import gacore.tools.browser_history as bh_mod
 
@@ -18,13 +17,10 @@ if not isinstance(bh_mod, types.ModuleType):
     bh_mod = sys.modules["gacore.tools.browser_history"]
 
 from gacore.tools.browser_history import (
-    BrowserHistoryError,
-    BrowserHistoryResult,
     _days_to_webkit,
     _webkit_to_iso,
     browser_history,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers: in-memory SQLite DB that mimics the Edge urls table
@@ -123,7 +119,7 @@ def test_invalid_limit_too_large_returns_error() -> None:
 
 def test_unsupported_browser_raises_validation_error() -> None:
     """Pydantic rejects 'chrome' before the function body runs (Literal['edge'])."""
-    with pytest.raises(Exception):  # pydantic ValidationError
+    with pytest.raises(pydantic.ValidationError):
         browser_history.invoke({"browser": "chrome"})
 
 

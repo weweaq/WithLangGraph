@@ -104,22 +104,31 @@ def _format_args(args: dict) -> str:
 
 
 def _render_tool_result(message: ToolMessage) -> None:
-    """Print one tool result line, keeping ask_user's answer compact."""
+    """Log one tool result line (process info), keeping ask_user's answer compact."""
     if message.name == "ask_user":
         try:
             payload = json.loads(message.content)
-            print(f"[tools] <- ask_user -> answer: {payload.get('answer')!r}")
+            logger.info(f"[tools] <- ask_user -> answer: {payload.get('answer')!r}")
             return
         except (TypeError, ValueError):
             pass
     content = str(message.content)
     if len(content) > 200:
         content = content[:197] + "..."
-    print(f"[tools] <- {content}")
+    logger.info(f"[tools] <- {content}")
 
 
-def _render_update(node_name: str, update: object) -> bool:
-    """Print one streamed node update; return True when it printed the final AI reply."""
+def _render_update(node_name: str, update: object, printed_ids: set[str]) -> bool:
+    """Render one streamed node update; skip messages already rendered (by id).
+
+    The wrapper graph nests the compiled create_agent subgraph as the ``process`` node,
+    and ``cleanup_images`` returns the full message list, so ``stream_mode="updates"``
+    emits the same messages in multiple chunks (and previous turns' messages inside
+    later turns' full-state chunks). Tracking rendered message ids makes the renderer
+    idempotent: each message is shown exactly once. Process lines (tool calls/results)
+    go through the structured logger; only the final AI reply is printed to the user.
+    Returns True when it printed the final AI reply.
+    """
     if not isinstance(update, dict):
         return False  # e.g. {'agent': None} short-circuit
     messages = update.get("messages")
@@ -127,20 +136,25 @@ def _render_update(node_name: str, update: object) -> bool:
         return False
     printed_reply = False
     for message in messages:
+        mid = getattr(message, "id", None)
+        if mid is not None and mid in printed_ids:
+            continue  # already rendered by an earlier chunk (or an earlier turn)
         if isinstance(message, AIMessage):
             if message.tool_calls:
                 for call in message.tool_calls:
                     name = call.get("name", "?")
                     if name == "ask_user":
                         # The interactive [ask_user] prompt follows; no need to echo args.
-                        print("[agent] -> ask_user")
+                        logger.info("[agent] -> ask_user")
                     else:
-                        print(f"[agent] -> {name}({_format_args(call.get('args') or {})})")
+                        logger.info(f"[agent] -> {name}({_format_args(call.get('args') or {})})")
             elif message.content:
                 print(str(message.content))
                 printed_reply = True
         elif isinstance(message, ToolMessage):
             _render_tool_result(message)
+        if mid is not None:
+            printed_ids.add(mid)
     return printed_reply
 
 
@@ -159,6 +173,7 @@ def _run_turn(
     user_input: str,
     config: dict,
     input_func: Callable[[str], str],
+    printed_ids: set[str],
 ) -> str | None:
     """Run one user turn to completion, streaming node updates and resolving interrupts."""
     state: object = new_state(user_input, cfg)
@@ -185,7 +200,7 @@ def _run_turn(
                 interrupted = True
                 break
             for node_name, update in chunk.items():
-                if _render_update(node_name, update):
+                if _render_update(node_name, update, printed_ids):
                     printed_reply = True
                 reason = _update_exit_reason(update)
                 if reason is not None:
@@ -193,7 +208,7 @@ def _run_turn(
         if not interrupted:
             break
     if not printed_reply and exit_reason:
-        print(f"[{exit_reason}]")
+        logger.info(f"[{exit_reason}]")
     return exit_reason
 
 
@@ -265,6 +280,10 @@ def run_repl(
     """
     resolved_cfg = cfg or Config.default()
     graph = build_graph(llm=llm, cfg=resolved_cfg)
+    png = graph.get_graph().draw_png()
+    with open("agent_graph.png", "wb") as f:
+        f.write(png)
+    print("图已保存到 agent_graph.png，可用图片查看器打开")
     input_source = input_func or _default_input
     # One thread per REPL session: MemorySaver keeps conversation history across turns.
     thread_id = uuid.uuid4().hex
@@ -272,6 +291,9 @@ def run_repl(
         "configurable": {"thread_id": thread_id},
         "recursion_limit": DEFAULT_RECURSION_LIMIT,
     }
+    # Rendered message ids for the whole session: full-state stream chunks repeat
+    # messages (including previous turns'), so dedupe by id keeps each on screen once.
+    printed_ids: set[str] = set()
     print(f"gacore v{__version__} - interactive agent")
     print("Type /help for commands, /quit to exit")
     last_reason: str | None = None
@@ -291,7 +313,7 @@ def run_repl(
                 if _handle_command(stripped.lower(), graph, resolved_cfg, config):
                     break
                 continue
-            last_reason = _run_turn(graph, resolved_cfg, stripped, config, input_source)
+            last_reason = _run_turn(graph, resolved_cfg, stripped, config, input_source, printed_ids)
             if last_reason == "EXITED":
                 break
     except KeyboardInterrupt:

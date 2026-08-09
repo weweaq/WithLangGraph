@@ -17,7 +17,6 @@ from gacore.tools.daily_notes import (
     search_daily,
 )
 
-
 # ---------- edit_daily: creation ----------
 
 

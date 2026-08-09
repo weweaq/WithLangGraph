@@ -98,6 +98,24 @@ class _ConsoleFormatter(logging.Formatter):
         return f"[{ts}] [{record.levelname:<7}] [{module}] {record.getMessage()}{suffix}"
 
 
+class _ConsoleSink(logging.StreamHandler):
+    """Console handler that resolves sys.stdout at emit time.
+
+    logging.StreamHandler binds its stream once at construction; pytest's capsys swaps
+    sys.stdout per test, so a fixed reference would bypass capture and leak test output
+    to the real terminal. Resolving on every emit keeps console logging observable under
+    capsys while behaving identically in production.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+            sys.stdout.write(message + self.terminator)
+            sys.stdout.flush()
+        except Exception:  # noqa: BLE001 - logging must never raise
+            self.handleError(record)
+
+
 @final
 class Logger:
     """Module-scoped structured logger; all instances share the process's log file."""
@@ -176,9 +194,9 @@ def _get_console_sink() -> logging.Handler:
     """Return the process-wide console (stdout) handler, building it once on first use."""
     global _console_sink
     if _console_sink is None:
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(_ConsoleFormatter())
-        _console_sink = handler
+        sink = _ConsoleSink()
+        sink.setFormatter(_ConsoleFormatter())
+        _console_sink = sink
     return _console_sink
 
 

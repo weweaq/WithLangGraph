@@ -58,7 +58,7 @@ try:
     import botpy
     from botpy.message import C2CMessage, GroupMessage
 except Exception:  # noqa: BLE001
-    print("Please install qq-botpy to use QQ frontend: pip install qq-botpy")
+    logger.error("Please install qq-botpy to use QQ frontend: pip install qq-botpy")
     sys.exit(1)
 
 # --------------------------------------------------------------------------- config
@@ -78,6 +78,7 @@ _SPLIT_LIMIT: Final = 4500  # QQ markdown message length safety margin
 _RECONNECT_INITIAL: Final = 5
 _RECONNECT_MAX: Final = 300
 _HTTP_TIMEOUT: Final = 30  # botpy default (5s) is too short for slow TLS handshakes
+_IMAGE_WAIT_TIMEOUT: Final = 300  # seconds the wait_for_text interrupt auto-resumes after
 
 # --------------------------------------------------------------------------- state
 
@@ -87,6 +88,7 @@ _user_threads: dict[str, str] = {}                       # user_id -> thread_id
 _queued_inputs: dict[str, deque] = {}                    # user_id -> FIFO queue of pending inputs
 _pending_image: dict[str, dict] = {}                     # user_id -> pending image batch info
 _image_processing: set[str] = set()                      # user_ids currently being processed
+_rendered_msg_ids: dict[str, set[str]] = {}              # user_id -> rendered message ids (stream dedupe)
 _graph: CompiledStateGraph | None = None
 _instance_sock: socket.socket | None = None              # single-instance port, released by /reboot
 
@@ -133,14 +135,19 @@ def _extract_image_urls(data) -> list[str]:
     return urls
 
 
+def _write_bytes(dest: str, content: bytes) -> None:
+    """Write downloaded bytes to dest; runs in a worker thread to avoid blocking the loop."""
+    with open(dest, "wb") as f:
+        f.write(content)
+
+
 async def _download_image(url: str, dest: str) -> bool:
     """Download an image URL to dest. Returns True on success."""
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(url)
             resp.raise_for_status()
-            with open(dest, "wb") as f:
-                f.write(resp.content)
+        await asyncio.to_thread(_write_bytes, dest, resp.content)
         return True
     except Exception:  # noqa: BLE001 — silent degradation
         logger.warning(f"QQ image download failed: {url}")
@@ -259,7 +266,6 @@ def _make_bot_class(app: QQApp):
         async def on_ready(self) -> None:
             name = getattr(getattr(self, "robot", None), "name", "QQBot")
             logger.info(f"QQ bot ready: {name}")
-            print(f"[QQ] bot ready: {name}")
 
         async def on_c2c_message_create(self, message: C2CMessage) -> None:
             await app.on_message(message, is_group=False)
@@ -346,7 +352,6 @@ class QQApp:
                 return
 
             logger.info(f"QQ message from {user_id} ({'group' if is_group else 'c2c'}): {content[:80]}")
-            print(f"[QQ] {user_id} ({'group' if is_group else 'c2c'}): {content[:80]}")
 
             # 1) Slash commands — check BEFORE interrupt so /stop works during ask_user.
             if content.startswith("/"):
@@ -367,8 +372,8 @@ class QQApp:
                             msg_id=msg_id, is_group=is_group, user_id=user_id,
                         )
                         return
-                except Exception:
-                    pass
+                except Exception:  # noqa: BLE001 — get_state 失败视为无暂停图
+                    logger.debug("get_state failed, assuming no paused graph", user_id=user_id)
 
             # 3) If this user has a pending ask_user interrupt, resume the graph.
             if user_id in _pending_interrupt:
@@ -381,7 +386,6 @@ class QQApp:
 
         except Exception:  # noqa: BLE001 — top-level message handler crash guard
             logger.error("QQ on_message error", stack_trace=traceback.format_exc())
-            print("[QQ] handle_message error")
             traceback.print_exc()
 
     # --------------------------------------------------------------- image batching
@@ -593,8 +597,8 @@ class QQApp:
                     msg_id=msg_id, is_group=is_group, user_id=user_id,
                 )
                 return
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001 — 暂停图检查失败，降级为新会话
+            logger.debug("paused graph check failed, starting fresh", user_id=user_id)
 
         # No paused graph — start a fresh one. OCR the images for the prompt.
         ocr_texts: dict[str, str] = {}
@@ -602,11 +606,11 @@ class QQApp:
             try:
                 result = await asyncio.to_thread(ocr_image.invoke, {"path": path})
                 ocr_texts[path] = str((result or {}).get("text") or "")
-            except Exception:
+            except Exception:  # noqa: BLE001 — 单图 OCR 失败降级为空文本
                 ocr_texts[path] = ""
 
         prompt = _build_image_prompt(paths, ocr_texts, content)
-        _persist_ocr_history(paths, ocr_texts)
+        _persist_ocr_history(Config.default().memory_dir, paths, ocr_texts)
         asyncio.create_task(self._run_agent(chat_id, prompt, user_id, msg_id=msg_id, is_group=is_group))
 
     async def _run_agent(
@@ -636,8 +640,16 @@ class QQApp:
         is_group: bool,
         user_id: str | None,
     ) -> None:
-        """Stream graph updates: render tool calls, tool results, final answer; handle interrupts."""
+        """Stream graph updates: render tool calls, tool results, final answer; handle interrupts.
+
+        The wrapper graph nests the compiled create_agent subgraph as the ``process`` node
+        and ``cleanup_images`` returns the full message list, so ``stream_mode="updates"``
+        emits the same messages in multiple chunks (and previous turns' messages inside
+        later turns' full-state chunks). Tracking rendered message ids per user keeps each
+        message sent exactly once.
+        """
         reply_parts: list[str] = []
+        rendered: set[str] = _rendered_msg_ids.setdefault(user_id, set()) if user_id is not None else set()
         current_task = asyncio.current_task()
         if current_task is not None and user_id is not None:
             # Cancel any previous running task for this user before registering the new one.
@@ -681,6 +693,9 @@ class QQApp:
                         if not isinstance(update, dict):
                             continue
                         for message in update.get("messages", []):
+                            mid = getattr(message, "id", None)
+                            if mid is not None and mid in rendered:
+                                continue  # already sent by an earlier chunk (or an earlier turn)
                             if isinstance(message, AIMessage):
                                 if message.tool_calls:
                                     for call in message.tool_calls:
@@ -700,6 +715,8 @@ class QQApp:
                                 if len(content) > 200:
                                     content = content[:197] + "..."
                                 await self.send_text(chat_id, f"[tools] <- {content}", is_group=is_group)
+                            if mid is not None:
+                                rendered.add(mid)
 
                 # Stream finished: send the final answer (if not already sent via interrupt).
                 if reply_parts:
@@ -739,14 +756,13 @@ class QQApp:
         while True:
             started_at = time.monotonic()
             try:
-                print(f"[QQ] bot starting... {time.strftime('%m-%d %H:%M')}")
+                logger.info(f"QQ bot starting... {time.strftime('%m-%d %H:%M')}")
                 await self.client.start(appid=_APP_ID, secret=_APP_SECRET)
             except Exception as e:  # noqa: BLE001 — top-level reconnect guard
                 logger.error(f"QQ bot error: {e}")
-                print(f"[QQ] bot error: {e}")
             if time.monotonic() - started_at >= 60:
                 delay = _RECONNECT_INITIAL
-            print(f"[QQ] reconnect in {delay}s...")
+            logger.warning(f"QQ reconnect in {delay}s...")
             await asyncio.sleep(delay)
             delay = min(delay * 2, _RECONNECT_MAX)
 
@@ -760,7 +776,7 @@ def _ensure_single_instance(port: int = 19528) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.bind(("127.0.0.1", port))
     except OSError:
-        print("[QQ] Another instance is already running, skipping...")
+        logger.warning("Another instance is already running, skipping...")
         sys.exit(1)
     _instance_sock = sock
 
@@ -773,8 +789,8 @@ def _redirect_log() -> None:
     os.makedirs(log_dir, exist_ok=True)
     logf = open(_LOG_FILE, "a", encoding="utf-8", buffering=1)  # noqa: SIM115 — intentional lifetime redirect
     sys.stdout = sys.stderr = logf
-    print(f"[QQ] process starting at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"[QQ] allow list: {'public' if _is_public() else sorted(_ALLOWED)}")
+    logger.info(f"QQ process starting at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"QQ allow list: {'public' if _is_public() else sorted(_ALLOWED)}")
 
 
 def _fix_encoding() -> None:
@@ -790,7 +806,7 @@ def main() -> None:
     _fix_encoding()
 
     if not _APP_ID or not _APP_SECRET:
-        print("[QQ] ERROR: please set QQ_APP_ID and QQ_APP_SECRET in .env")
+        logger.error("Please set QQ_APP_ID and QQ_APP_SECRET in .env")
         sys.exit(1)
 
     _ensure_single_instance()

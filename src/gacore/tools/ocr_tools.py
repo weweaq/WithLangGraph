@@ -107,6 +107,6 @@ def ocr_screen(x1: int, y1: int, x2: int, y2: int) -> dict[str, Any]:
     img = ImageGrab.grab(bbox=(x1, y1, x2, y2))
     import tempfile
 
-    tmp = tempfile.NamedTemporaryFile(suffix=".jpg", delete=False)
-    img.save(tmp.name, "JPEG")
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        img.save(tmp.name, "JPEG")
     return _ocr_rapid(tmp.name)
