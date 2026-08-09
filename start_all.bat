@@ -1,11 +1,14 @@
 @echo off
-echo Starting gacore services...
+echo Starting gacore (QQ Bot + Scheduler)...
 
-REM QQ Bot window
-start "gacore-QQ" cmd /c "cd /d D:\AAAmyprj\github\myrepos\WithLangGraph\src\gacore\frontends && qq.bat"
+REM Kill any leftover gacore instance
+powershell -NoProfile -Command "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | Where-Object { $_.CommandLine -like '*WithLangGraph*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
 
-REM Scheduler window
-start "gacore-Scheduler" cmd /c "set PYTHONPATH=D:\AAAmyprj\github\myrepos\WithLangGraph\src && D:\softwares\miniconda\envs\py12\python.exe -m gacore.scheduler"
+set PYTHONPATH=D:\AAAmyPrj\github\myrepos\WithLangGraph\src
+D:\softwares\miniconda\envs\py12\python.exe D:\AAAmyPrj\github\myrepos\WithLangGraph\start.py
 
-echo QQ Bot and Scheduler launched in separate windows.
-pause
+if errorlevel 1 (
+    echo.
+    echo [start_all] gacore exited with code %errorlevel%. See message above.
+    pause
+)
