@@ -45,7 +45,7 @@ class BiliHistoryEntry(TypedDict):
     title: str
     author: str
     viewed_at: str  # ISO 8601 本地时间
-    duration_seconds: int | None  # 视频总时长（秒），仅 include_duration=True 时有值
+    video_duration_seconds: int | None  # 视频本身的总时长（秒），非用户观看时长，仅 include_duration=True 时有值
 
 
 class BiliHistoryResult(TypedDict):
@@ -95,7 +95,7 @@ def _load_json(stdout: str) -> dict | None:
 
 
 def _fetch_one_duration(bili: str, bvid: str) -> int | None:
-    """Fetch the duration_seconds for a single video via ``bili video --json``.
+    """Fetch the video_duration_seconds for a single video via ``bili video --json``.
 
     Returns None when the CLI call fails (timeout, bad json, missing field, etc.).
     """
@@ -126,11 +126,12 @@ def bili_history(limit: int = 30, page: int = 1, include_duration: bool = False)
     Args:
         limit: 返回条数，1-100，默认 30。
         page: 页码，默认 1。
-        include_duration: 是否并发拉取每条视频的时长（duration_seconds，秒）。
-            开启后每条视频调用 ``bili video`` 补充时长，用于判断长视频观看信号。
+        include_duration: 是否并发拉取每条视频的本身总时长（video_duration_seconds，秒），
+            非用户实际观看时长。开启后每条视频调用 ``bili video`` 补充时长，
+            用于判断长视频兴趣信号（视频本身 >20min 说明用户对该话题有兴趣）。
 
     Returns:
-        成功: {"entries": [{"bvid","title","author","viewed_at","duration_seconds"}...],
+        成功: {"entries": [{"bvid","title","author","viewed_at","video_duration_seconds"}...],
                "total": n, "page": p, "account": "账号名", "uid": "uid"}
         失败: {"error": "错误标签", "message": "说明", "detail": 详细或 null}
     """
@@ -235,7 +236,7 @@ def bili_history(limit: int = 30, page: int = 1, include_duration: bool = False)
                 except Exception:
                     durations[bv] = None
         for entry in entries:
-            entry["duration_seconds"] = durations.get(entry["bvid"])
+            entry["video_duration_seconds"] = durations.get(entry["bvid"])
 
     logger.info("bili_history success", total=total, page=got_page, account=account, uid=uid)
     return BiliHistoryResult(entries=entries, total=total, page=got_page, account=account, uid=uid)
