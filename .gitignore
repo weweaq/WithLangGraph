@@ -1,5 +1,7 @@
 .env
 notes.txt
+h.txt
+agent_graph.png
 logs/
 memory/global_mem*.txt
 memory/ocr_history.jsonl
