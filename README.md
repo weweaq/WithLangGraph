@@ -22,16 +22,19 @@ gacore 用 [LangGraph](https://langchain-ai.github.io/langgraph/) 重新实现�
   done_hooks 续接、任务完成），通过官方 `hook_config`/`jump_to` 通道改变控制流，
   见 ARCHITECTURE.md 的拓扑图。
 
-- **16 个原子工具**：
+- **24 个原子工具**：
   - **代码与文件**：`code_run`、`file_read`、`file_patch`、`file_write`
   - **Web**：`web_scan`（httpx 静态抓取）、`web_execute_js`（stub，恒返回不支持）
   - **浏览器历史**：`browser_history`（Edge SQLite）、`bili_history`（B站观看历史，需 `bili` CLI 登录）
   - **记忆**：`update_working_checkpoint`（工作记忆）、`start_long_term_update`（长期记忆）
   - **每日笔记**：`read_daily`、`edit_daily`、`search_daily`（基于文件系统的每日笔记）
+  - **邮件**：`send_email`（SMTP 发信，支持 HTML 正文与内联图片，配置走 SMTP_* 环境变量）
+  - **网易云音乐**：`ncm_me`、`ncm_search_song`、`ncm_song`、`ncm_lyric`、`ncm_playlist_list`、`ncm_playlist_detail`、`ncm_login`（扫码登录）
   - **OCR**：`ocr_image`（本地图片 OCR）、`ocr_screen`（截图 OCR，基于 rapidocr-onnxruntime）
   - **人机交互**：`ask_user`（中断暂停，等待用户回复）
   其中 `browser_history` 读取 Edge 浏览历史（SQLite），支持关键词 / 域名 / 时间范围过滤；
-  `bili_history` 封装 `bili` CLI，获取 B站认证用户的观看历史；其余与 GA 工具集一一对应。
+  `bili_history` 封装 `bili` CLI，获取 B站认证用户的观看历史；
+  `send_email` 移植自 py-wei 的 SMTP 发送器，其余与 GA 工具集一一对应。
 
 - **三层记忆系统（L0 / L1 / L2）**：
   - **L0 工作记忆**：`update_working_checkpoint` 写入 RAM 中的 `state.working`，每轮注入系统提示词
@@ -124,6 +127,13 @@ Copy-Item .env.example .env
 | `DEEPSEEK_BASE_URL` | DeepSeek 网关地址，留空用 `https://api.deepseek.com/v1` | `https://api.deepseek.com/v1` |
 | `DEEPSEEK_MODEL` | DeepSeek 模型名 | `deepseek-v4-pro` |
 | `DEFAULT_MAX_TURNS` | 单次任务默认最大轮数 | `40` |
+| `SMTP_USER` | 发件账号（QQ/163 填 SMTP 授权码而非登录密码），`send_email` 工具用 | `xxx@qq.com` |
+| `SMTP_PASSWORD` | 发件密码 / 授权码 | |
+| `SMTP_TO` | 默认收件人，`send_email` 未传 `to` 时的兜底 | |
+| `SMTP_HOST` | SMTP 服务器，留空按发件域名自动检测（qq/gmail/outlook/163） | `smtp.qq.com` |
+| `SMTP_PORT` | SMTP 端口，留空自动推断（SSL 465 / STARTTLS 587） | `465` |
+| `SMTP_SSL` | 是否启用 SSL（`1`/`true`/`yes`），留空按端口推断 | |
+| `SMTP_TIMEOUT` | SMTP 连接超时（秒） | `10` |
 
 `deepseek` 与 GA 的配置一致（`configure_mykey.py` 中 `type: native_oai`）：走 OpenAI 兼容
 协议，由 `ChatOpenAI` 驱动，默认 base URL 为 `https://api.deepseek.com/v1`、默认模型为
@@ -207,14 +217,14 @@ python -m gacore.scheduler
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m pytest tests -q      # 当前 228 个用例全部通过
+python -m pytest tests -q      # 当前 278 个用例全部通过
 python -m ruff check src tests # lint 干净
 ```
 
-228 个测试覆盖：状态初始化、middleware（before_model 短路 / max_turns 守卫、
+278 个测试覆盖：状态初始化、middleware（before_model 短路 / max_turns 守卫、
 after_model 空响应重试 / done_hooks 续接 / 完成 / AGENT_ERROR）单测与图集成、
 LLM 工厂（openai / anthropic / deepseek 分支与缺失 Key 报错）、工具注册表、
-code_run / file / memory / web / browser_history / bili_history / daily_notes / ocr 工具、
+code_run / file / memory / web / browser_history / bili_history / daily_notes / ocr / email / ncm 工具、
 ask_user 中断与恢复（含 langgraph 两种中断表象）、端到端多轮循环与 done_hooks 续接、
 流式 REPL 输出与斜杠命令、定时任务调度器、QQ Bot 前端。
 
@@ -228,7 +238,7 @@ ask_user 中断与恢复（含 langgraph 两种中断表象）、端到端多轮
 | `agent_loop.py`（工具分发、`StepOutcome`） | 预置 `ToolNode` + `Command(update=...)` | 工具执行；控制信号（`exit_reason` / `working`）由工具直接经 Command 回写 |
 | `agent_loop.py`（`no_tool` 分支、`_done_hooks`） | `middleware.py`（`GATurnLogicMiddleware`） | 最终答案校验 + done_hooks 续接（after_model 钩子） |
 | `ga.py`（`turn_end_callback` :570、`_get_anchor_prompt`、`get_global_memory` :602） | `context.py` | 每轮提示词组装（系统提示词 + 折叠历史 + 周期提示） |
-| `ga.py`（`do_code_run` / `do_file_*` / `do_ask_user` 等） | `tools/*.py` | 16 个原子工具（含 browser_history、bili_history、daily_notes、ocr，GA 无对应） |
+| `ga.py`（`do_code_run` / `do_file_*` / `do_ask_user` 等） | `tools/*.py` | 24 个原子工具（含 browser_history、bili_history、daily_notes、ocr、send_email、ncm_*，GA 无对应） |
 | `llmcore.py`（`client.chat` / Session） | `llm.py` | LLM 工厂，openai / anthropic / deepseek 三选一 |
 | `mykey.py` / `NativeToolClient` | `llm.py`（环境变量驱动） | 配置方式替换 |
 | `frontends/tui_v3.py` | `cli.py` | 交互前端（REPL） |
@@ -302,20 +312,22 @@ WithLangGraph/
 │   ├── frontends/
 │   │   ├── qq.py              # QQ Bot 前端
 │   │   └── qq.bat             # QQ Bot 启动脚本
-│   ├── tools/                 # 16 个工具
+│   ├── tools/                 # 24 个工具
 │   │   ├── __init__.py        # 工具注册表（TOOL_NAMES + build_tool_list）
 │   │   ├── ask_user.py        # 人类介入中断
 │   │   ├── bili_history.py    # B站观看历史
 │   │   ├── browser_history.py # Edge 浏览历史
 │   │   ├── code_run.py        # 代码执行（沙箱）
 │   │   ├── daily_notes.py     # 每日笔记（read_daily/edit_daily/search_daily）
+│   │   ├── email_tools.py     # 邮件（send_email，SMTP + HTML 内联图片）
 │   │   ├── file_tools.py      # 文件读写（file_read/file_patch/file_write）
 │   │   ├── memory_tools.py    # 长期记忆（update_working_checkpoint/start_long_term_update）
+│   │   ├── ncm_tools.py       # 网易云音乐（ncm_me/ncm_search_song/ncm_song/ncm_lyric/歌单/ncm_login）
 │   │   ├── ocr_tools.py       # 本地 OCR（ocr_image/ocr_screen）
 │   │   └── web_tools.py       # Web 工具（web_scan/web_execute_js）
 │   └── memory/
 │       └── __init__.py
-└── tests/                     # 228 个测试
+└── tests/                     # 278 个测试
     ├── conftest.py
     ├── test_cli.py
     ├── test_context.py
@@ -333,7 +345,9 @@ WithLangGraph/
     ├── test_tools_browser_history.py
     ├── test_tools_code_run.py
     ├── test_tools_daily_notes.py
+    ├── test_tools_email.py
     ├── test_tools_file.py
     ├── test_tools_memory.py
+    ├── test_tools_ncm.py
     └── test_tools_web.py
 ```

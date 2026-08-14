@@ -17,8 +17,18 @@ from .bili_history import bili_history
 from .browser_history import browser_history
 from .code_run import code_run
 from .daily_notes import edit_daily, read_daily, search_daily
+from .email_tools import send_email
 from .file_tools import file_patch, file_read, file_write
 from .memory_tools import start_long_term_update, update_working_checkpoint
+from .ncm_tools import (
+    ncm_login,
+    ncm_lyric,
+    ncm_me,
+    ncm_playlist_detail,
+    ncm_playlist_list,
+    ncm_search_song,
+    ncm_song,
+)
 from .ocr_tools import ocr_image, ocr_screen
 from .web_tools import web_execute_js, web_scan
 
@@ -33,6 +43,13 @@ TOOL_NAMES: tuple[str, ...] = (
     "web_execute_js",
     "browser_history",
     "bili_history",
+    "ncm_me",
+    "ncm_login",
+    "ncm_search_song",
+    "ncm_song",
+    "ncm_lyric",
+    "ncm_playlist_list",
+    "ncm_playlist_detail",
     "update_working_checkpoint",
     "start_long_term_update",
     "read_daily",
@@ -41,6 +58,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "ask_user",
     "ocr_image",
     "ocr_screen",
+    "send_email",
 )
 
 _TOOLS: tuple[BaseTool, ...] = (
@@ -52,6 +70,13 @@ _TOOLS: tuple[BaseTool, ...] = (
     web_execute_js,
     browser_history,
     bili_history,
+    ncm_me,
+    ncm_login,
+    ncm_search_song,
+    ncm_song,
+    ncm_lyric,
+    ncm_playlist_list,
+    ncm_playlist_detail,
     update_working_checkpoint,
     start_long_term_update,
     read_daily,
@@ -60,6 +85,7 @@ _TOOLS: tuple[BaseTool, ...] = (
     ask_user,
     ocr_image,
     ocr_screen,
+    send_email,
 )
 
 
