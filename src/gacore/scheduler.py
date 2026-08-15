@@ -12,6 +12,8 @@ Design choices for simplicity (per the user's "简单做就可以"):
     (interval). Not a full cron parser — covers the "daily report" use case.
   - Each job runs in its own thread_id so MemorySaver state never collides with the REPL.
   - Output goes to logs/scheduled/{job}_{timestamp}.md and edit_daily("today", ...).
+  - deliver_to routes the finished reply to a channel: "file" (default; write output +
+    daily note) or "email" (also send via send_email). Unknown channels fall back to file.
   - Missed jobs are NOT backfilled: on restart, a job whose scheduled time already passed
     today simply waits for the next occurrence (last_run is updated to "today" to prevent
     a catch-up storm). This mirrors the "thundering herd" mitigation from the user's notes.
@@ -19,11 +21,13 @@ Design choices for simplicity (per the user's "简单做就可以"):
 
 from __future__ import annotations
 
+import html
 import json
+import os
 import re
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Final
@@ -47,7 +51,10 @@ class Job:
 
     schedule is either "HH:MM" (daily) or "every N<d|h|m>" (interval).
     prompt is the self-contained instruction fed to the agent as the sole user message.
-    deliver_to is reserved for future channel routing (feishu/wechat); unused for now.
+    deliver_to routes the finished reply to a channel: "file" (default) writes the output
+    file + daily note, "email" additionally sends it via send_email; unknown values fall
+    back to "file". email_to is the optional explicit recipient for the email channel —
+    when empty the SMTP_TO / SMTP_USER env vars are used in that order.
     """
 
     name: str
@@ -55,6 +62,7 @@ class Job:
     prompt: str
     enabled: bool = True
     deliver_to: str = "file"
+    email_to: str = ""
     max_turns: int = 20
 
 
@@ -101,6 +109,7 @@ def load_jobs(cfg: Config) -> list[Job]:
                     prompt=item["prompt"],
                     enabled=item.get("enabled", True),
                     deliver_to=item.get("deliver_to", "file"),
+                    email_to=item.get("email_to", ""),
                     max_turns=item.get("max_turns", 20),
                 )
             )
@@ -228,6 +237,7 @@ def run_job(
     duration = time.monotonic() - start
     output_path = _write_output(cfg, job, reply, error)
     _write_daily_note(cfg, job, reply, error)
+    _deliver(job, cfg, reply, error)
 
     logger.info(
         "Job finished",
@@ -323,6 +333,74 @@ def _write_daily_note(cfg: Config, job: Job, reply: str, error: str | None) -> N
             if lines:
                 anchor = lines[-1]
                 edit_daily.func(date=today, old_str=anchor, new_str=anchor + "\n" + bullet, _cfg=cfg)
+
+
+def _resolve_email_recipient(job: Job, env: Mapping[str, str]) -> str:
+    """Pick the email recipient: job.email_to, then SMTP_TO, then SMTP_USER (send to self)."""
+    if job.email_to.strip():
+        return job.email_to.strip()
+    for key in ("SMTP_TO", "SMTP_USER"):
+        value = env.get(key, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _email_body_html(reply: str, error: str | None) -> str:
+    """Render the job reply as a minimal HTML email (escaped, pre-wrapped, error banner on top)."""
+    status = f"<p style='color:#b00'><b>FAILED:</b> {html.escape(error)}</p>" if error else ""
+    content = html.escape(reply or "(empty reply)")
+    return (
+        "<!DOCTYPE html><html><body>"
+        f"{status}<pre style='font-family:ui-monospace,Consolas,monospace;white-space:pre-wrap;'>{content}</pre>"
+        "</body></html>"
+    )
+
+
+def _deliver_email(job: Job, cfg: Config, reply: str, error: str | None, env: Mapping[str, str] | None = None) -> None:
+    """Deliver the job's reply via send_email; never raises, logs the outcome.
+
+    Recipient resolution and SMTP configuration follow send_email's rules (SMTP_* env
+    vars); the only difference is the recipient defaults to SMTP_USER (send to self)
+    when neither job.email_to nor SMTP_TO is set. A missing SMTP_USER / SMTP_PASSWORD
+    is silently skipped with a warning — email is a best-effort channel, never fatal.
+    """
+    from gacore.tools.email_tools import send_email
+
+    resolved_env = dict(os.environ) if env is None else dict(env)
+    recipient = _resolve_email_recipient(job, resolved_env)
+    if not recipient:
+        logger.warning(
+            "deliver_email skipped: no recipient (job.email_to / SMTP_TO / SMTP_USER all empty)",
+            job=job.name,
+        )
+        return
+
+    today = datetime.now(UTC).astimezone().date().isoformat()
+    prefix = "[gacore][FAILED]" if error else "[gacore]"
+    subject = f"{prefix} {job.name} · {today}"
+    result = send_email.func(
+        to=recipient,
+        subject=subject,
+        body=_email_body_html(reply, error),
+        _env=resolved_env,
+    )
+    if isinstance(result, dict) and result.get("status") == "sent":
+        logger.info("deliver_email sent", job=job.name, to=recipient, subject=subject)
+    else:
+        logger.warning("deliver_email failed", job=job.name, to=recipient, result=result)
+
+
+def _deliver(job: Job, cfg: Config, reply: str, error: str | None) -> None:
+    """Route the finished job's reply to its configured channel (deliver_to)."""
+    if job.deliver_to == "email":
+        _deliver_email(job, cfg, reply, error)
+    elif job.deliver_to != "file":
+        logger.warning(
+            "deliver_to unsupported, falling back to file",
+            job=job.name,
+            deliver_to=job.deliver_to,
+        )
 
 
 def run_loop(

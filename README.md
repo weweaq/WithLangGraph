@@ -41,7 +41,7 @@ gacore 用 [LangGraph](https://langchain-ai.github.io/langgraph/) 重新实现�
   - **L1 每日笔记**：`read_daily` / `edit_daily` / `search_daily` 按日期组织，记忆重要决策、教训、用户偏好，跨会话持久化
   - **L2 长期记忆**：`start_long_term_update` 从每日笔记蒸馏精华到 `memory/global_mem.txt`（全局事实）与 `memory/global_mem_insight.txt`（洞察索引）
 
-- **定时任务调度器**：`scheduler.py` 提供单进程轮询调度器，在指定时间触发 agent 执行自包含任务（如每日报告、周报），无需人工交互。支持 `"HH:MM"` 每日触发和 `"every N<m|h|d>"` 间隔触发；job 定义在 `config/schedule.json`，支持热更新。输出写入 `logs/scheduled/`。
+- **定时任务调度器**：`scheduler.py` 提供单进程轮询调度器，在指定时间触发 agent 执行自包含任务（如每日报告、周报），无需人工交互。支持 `"HH:MM"` 每日触发和 `"every N<m|h|d>"` 间隔触发；job 定义在 `config/schedule.json`，支持热更新。输出写入 `logs/scheduled/`。每个 job 的 `deliver_to` 决定结果投递通道：`"file"`（默认，写输出文件 + 每日笔记）或 `"email"`（额外通过 `send_email` 发送，收件人按 `email_to` → `SMTP_TO` → `SMTP_USER` 依次取）。
 
 - **ask_user 人类介入中断**：`ask_user` 工具调用 `interrupt()` 暂停图执行，
   配合 MemorySaver 检查点和 `Command(resume=...)` 恢复。

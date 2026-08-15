@@ -1,4 +1,5 @@
 .env
+.codegraph/
 notes.txt
 h.txt
 agent_graph.png

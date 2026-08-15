@@ -12,11 +12,15 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
 from gacore.config import Config
 from gacore.scheduler import (
     Job,
     JobState,
     ScheduleResult,
+    _deliver_email,
+    _resolve_email_recipient,
     is_due,
     load_jobs,
     load_state,
@@ -377,3 +381,192 @@ class TestRunLoop:
         clock = lambda: datetime(2026, 8, 3, 12, 0, 0, tzinfo=UTC)
         jobs_run = run_loop(cfg=cfg, graph_runner=lambda *a: None, max_iterations=1, clock=clock)
         assert jobs_run == 0
+
+
+# ---------- deliver_to: email channel ----------
+
+
+def _fake_send_sync(captured: dict[str, str]) -> object:
+    """Return a _send_sync stand-in that records subject/to/body and reports success."""
+
+    def fake(subject: str, to_addr: str, body: str, settings: object, image_paths: list[str] | None = None) -> dict[str, object]:
+        captured["subject"] = subject
+        captured["to"] = to_addr
+        captured["body"] = body
+        return {"status": "sent", "to": to_addr, "subject": subject, "image_count": 0}
+
+    return fake
+
+
+class TestResolveEmailRecipient:
+    """_resolve_email_recipient picks job.email_to > SMTP_TO > SMTP_USER."""
+
+    def test_job_email_to_wins_over_env(self) -> None:
+        """Given job.email_to set, When resolving, Then it wins over SMTP_TO / SMTP_USER."""
+        job = Job(name="daily", schedule="09:00", prompt="hi", deliver_to="email", email_to="boss@example.com")
+        env = {"SMTP_TO": "default@example.com", "SMTP_USER": "me@qq.com"}
+        assert _resolve_email_recipient(job, env) == "boss@example.com"
+
+    def test_smtp_to_fallback(self) -> None:
+        """Given no email_to but SMTP_TO set, When resolving, Then SMTP_TO is used."""
+        job = Job(name="daily", schedule="09:00", prompt="hi", deliver_to="email")
+        env = {"SMTP_TO": "default@example.com", "SMTP_USER": "me@qq.com"}
+        assert _resolve_email_recipient(job, env) == "default@example.com"
+
+    def test_smtp_user_fallback(self) -> None:
+        """Given neither email_to nor SMTP_TO, When resolving, Then SMTP_USER (self) is used."""
+        job = Job(name="daily", schedule="09:00", prompt="hi", deliver_to="email")
+        env = {"SMTP_USER": "me@qq.com"}
+        assert _resolve_email_recipient(job, env) == "me@qq.com"
+
+    def test_no_recipient_returns_empty(self) -> None:
+        """Given no email_to / SMTP_TO / SMTP_USER, When resolving, Then empty string."""
+        job = Job(name="daily", schedule="09:00", prompt="hi", deliver_to="email")
+        assert _resolve_email_recipient(job, {}) == ""
+
+
+class TestDeliverEmail:
+    """_deliver_email builds subject/body and hands off to send_email (via _send_sync)."""
+
+    def test_sends_to_job_email_to(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, str] = {}
+        monkeypatch.setattr("gacore.tools.email_tools._send_sync", _fake_send_sync(captured))
+        cfg = Config.for_tests(tmp_path)
+        job = Job(name="daily-report", schedule="09:00", prompt="hi", deliver_to="email", email_to="boss@example.com")
+        env = {"SMTP_USER": "me@qq.com", "SMTP_PASSWORD": "pw", "SMTP_TO": "default@example.com"}
+
+        _deliver_email(job, cfg, "## 今日归档\n- 工作 8h", None, env=env)
+
+        assert captured["to"] == "boss@example.com"
+        assert "daily-report" in captured["subject"]
+        assert "今日归档" in captured["body"]
+
+    def test_sends_to_smtp_to_fallback(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, str] = {}
+        monkeypatch.setattr("gacore.tools.email_tools._send_sync", _fake_send_sync(captured))
+        cfg = Config.for_tests(tmp_path)
+        job = Job(name="daily-report", schedule="09:00", prompt="hi", deliver_to="email")
+        env = {"SMTP_USER": "me@qq.com", "SMTP_PASSWORD": "pw", "SMTP_TO": "default@example.com"}
+
+        _deliver_email(job, cfg, "reply", None, env=env)
+
+        assert captured["to"] == "default@example.com"
+
+    def test_failed_job_subject_marks_failed_and_includes_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, str] = {}
+        monkeypatch.setattr("gacore.tools.email_tools._send_sync", _fake_send_sync(captured))
+        cfg = Config.for_tests(tmp_path)
+        job = Job(name="daily-report", schedule="09:00", prompt="hi", deliver_to="email")
+        env = {"SMTP_USER": "me@qq.com", "SMTP_PASSWORD": "pw"}
+
+        _deliver_email(job, cfg, "", "LLM exploded", env=env)
+
+        assert "[FAILED]" in captured["subject"]
+        assert "LLM exploded" in captured["body"]
+
+    def test_skips_when_smtp_not_configured(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, str] = {}
+        monkeypatch.setattr("gacore.tools.email_tools._send_sync", _fake_send_sync(captured))
+        cfg = Config.for_tests(tmp_path)
+        job = Job(name="daily-report", schedule="09:00", prompt="hi", deliver_to="email")
+        env = {"SMTP_USER": "me@qq.com"}  # no SMTP_PASSWORD → send_email refuses
+
+        _deliver_email(job, cfg, "reply", None, env=env)
+
+        assert captured == {}
+
+    def test_skips_when_no_recipient(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, str] = {}
+        monkeypatch.setattr("gacore.tools.email_tools._send_sync", _fake_send_sync(captured))
+        cfg = Config.for_tests(tmp_path)
+        job = Job(name="daily-report", schedule="09:00", prompt="hi", deliver_to="email")
+
+        _deliver_email(job, cfg, "reply", None, env={})
+
+        assert captured == {}
+
+    def test_smtp_failure_does_not_raise(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        def failing_send_sync(subject: str, to_addr: str, body: str, settings: object, image_paths: list[str] | None = None) -> dict[str, str]:
+            return {"error": "smtp_failed", "message": "boom", "to": to_addr}
+
+        monkeypatch.setattr("gacore.tools.email_tools._send_sync", failing_send_sync)
+        cfg = Config.for_tests(tmp_path)
+        job = Job(name="daily-report", schedule="09:00", prompt="hi", deliver_to="email")
+        env = {"SMTP_USER": "me@qq.com", "SMTP_PASSWORD": "pw"}
+
+        _deliver_email(job, cfg, "reply", None, env=env)  # must not raise
+
+
+class TestDeliverRouting:
+    """run_job wires deliver_to through _deliver to the right channel."""
+
+    def test_run_job_email_channel_calls_deliver_email(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[tuple[object, str, str | None]] = []
+        monkeypatch.setattr(
+            "gacore.scheduler._deliver_email",
+            lambda job, cfg, reply, error: calls.append((job, reply, error)),
+        )
+        cfg = Config.for_tests(tmp_path)
+        job = Job(name="daily-report", schedule="09:00", prompt="hi", deliver_to="email")
+
+        run_job(job, cfg, graph_runner=lambda p, c, m: "CURRENT_TASK_DONE")
+
+        assert len(calls) == 1
+        assert calls[0][0].deliver_to == "email"
+        assert "test reply" in calls[0][1]
+
+    def test_run_job_default_file_channel_does_not_deliver_email(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[object] = []
+        monkeypatch.setattr("gacore.scheduler._deliver_email", lambda *a, **k: calls.append(a))
+        cfg = Config.for_tests(tmp_path)
+        job = Job(name="plain", schedule="09:00", prompt="hi")  # deliver_to defaults to "file"
+
+        run_job(job, cfg, graph_runner=lambda p, c, m: "CURRENT_TASK_DONE")
+
+        assert calls == []
+
+    def test_unsupported_channel_falls_back_to_file(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[object] = []
+        monkeypatch.setattr("gacore.scheduler._deliver_email", lambda *a, **k: calls.append(a))
+        cfg = Config.for_tests(tmp_path)
+        job = Job(name="odd", schedule="09:00", prompt="hi", deliver_to="feishu")
+
+        run_job(job, cfg, graph_runner=lambda p, c, m: "CURRENT_TASK_DONE")
+
+        assert calls == []  # falls back to file, no email attempted, no crash
+
+
+class TestLoadJobsEmail:
+    """load_jobs parses deliver_to and email_to from schedule.json."""
+
+    def test_loads_deliver_to_and_email_to(self, tmp_path: Path) -> None:
+        cfg = Config.for_tests(tmp_path)
+        schedule = cfg.asset_dir.parent / "schedule.json"
+        schedule.parent.mkdir(parents=True, exist_ok=True)
+        schedule.write_text(
+            json.dumps({
+                "jobs": [
+                    {"name": "job1", "schedule": "09:00", "prompt": "t", "deliver_to": "email", "email_to": "a@b.com"},
+                ]
+            }),
+            encoding="utf-8",
+        )
+
+        jobs = load_jobs(cfg)
+
+        assert jobs[0].deliver_to == "email"
+        assert jobs[0].email_to == "a@b.com"
+
+    def test_defaults_deliver_to_file_and_empty_email_to(self, tmp_path: Path) -> None:
+        cfg = Config.for_tests(tmp_path)
+        schedule = cfg.asset_dir.parent / "schedule.json"
+        schedule.parent.mkdir(parents=True, exist_ok=True)
+        schedule.write_text(
+            json.dumps({"jobs": [{"name": "job1", "schedule": "09:00", "prompt": "t"}]}),
+            encoding="utf-8",
+        )
+
+        jobs = load_jobs(cfg)
+
+        assert jobs[0].deliver_to == "file"
+        assert jobs[0].email_to == ""
