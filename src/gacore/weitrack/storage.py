@@ -30,7 +30,7 @@ CREATE INDEX IF NOT EXISTS idx_events_device_ts ON events(device_id, ts);
 
 class Storage:
     def __init__(self, db_path: Path | str) -> None:
-        self._conn = sqlite3.connect(str(db_path))
+        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
 
