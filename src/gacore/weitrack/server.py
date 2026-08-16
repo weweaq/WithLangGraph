@@ -21,11 +21,15 @@ def create_app(storage: Storage) -> FastAPI:
         received_at = int(time.time() * 1000)
         storage.upsert_device(req.device_id, req.client_ts)
 
-        if not storage.register_batch(req.batch_id, req.device_id, received_at):
+        inserted = storage.ingest_batch(
+            req.batch_id,
+            req.device_id,
+            received_at,
+            [(ev.ts, ev.type, ev.data) for ev in req.events],
+        )
+        if not inserted:
             return {"status": "ok", "inserted": 0, "deduplicated": True}
 
-        for ev in req.events:
-            storage.insert_event(req.device_id, ev.ts, ev.type, ev.data, received_at)
         return {"status": "ok", "inserted": len(req.events), "deduplicated": False}
 
     return app
