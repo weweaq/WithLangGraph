@@ -19,6 +19,8 @@ dependencies = [
     "Pillow",
     "rapidocr-onnxruntime",
     "numpy",
+    "fastapi",
+    "uvicorn",
 ]
 
 [project.optional-dependencies]
