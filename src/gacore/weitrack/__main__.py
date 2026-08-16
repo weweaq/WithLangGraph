@@ -9,15 +9,26 @@ import uvicorn
 from gacore.weitrack.server import create_app
 from gacore.weitrack.storage import Storage
 
+# 项目根目录：src/gacore/weitrack/__main__.py -> 项目根
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="weiTrack ingest server")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
-    parser.add_argument("--db", default="wei_track.db", help="SQLite 文件路径")
+    # 默认落到项目 data/ 目录，持久安全，不随启动目录变化
+    parser.add_argument(
+        "--db",
+        default=str(_PROJECT_ROOT / "data" / "weitrack.db"),
+        help="SQLite 文件路径",
+    )
     args = parser.parse_args()
 
-    storage = Storage(Path(args.db))
+    db_path = Path(args.db)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    storage = Storage(db_path)
     app = create_app(storage)
     uvicorn.run(app, host=args.host, port=args.port)
 

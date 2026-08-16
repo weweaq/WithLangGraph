@@ -18,3 +18,4 @@ temp/
 .idea/
 *.egg-info/
 uv.lock
+data/
