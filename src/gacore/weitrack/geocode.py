@@ -24,14 +24,18 @@ AMAP_URL = "https://restapi.amap.com/v3/geocode/regeo"
 def _amap_key() -> str:
     key = os.environ.get("AMAP_KEY", "")
     if not key:
-        # 尝试从 .env 读取（简单解析，不引第三方库）
+        # 尝试从 .env 读取：直接按字节找 AMAP_KEY=（ASCII 前缀不受文件编码影响）
         env_path = Path(__file__).resolve().parents[3] / ".env"
         if env_path.exists():
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if line.startswith("AMAP_KEY="):
-                    key = line.split("=", 1)[1].strip().strip('"').strip("'")
-                    break
+            raw = env_path.read_bytes()
+            marker = b"AMAP_KEY="
+            idx = raw.find(marker)
+            if idx >= 0:
+                rest = raw[idx + len(marker):]
+                end = rest.find(b"\n")
+                if end >= 0:
+                    rest = rest[:end]
+                key = rest.decode("utf-8", errors="ignore").strip().strip('"').strip("'")
     if not key:
         raise SystemExit("[geocode] 未配置 AMAP_KEY（.env 中设置，或环境变量）")
     return key
