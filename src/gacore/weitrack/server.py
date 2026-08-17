@@ -1,10 +1,13 @@
-"""FastAPI 应用：POST /ingest 接收上报，GET /health 健康检查。"""
+"""FastAPI 应用：POST /ingest 接收上报，GET /health 健康检查，GET /dashboard 仪表盘。"""
 from __future__ import annotations
 
+import sqlite3
 import time
 
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 
+from gacore.weitrack.dashboard import DB_PATH, render_dashboard_html
 from gacore.weitrack.schemas import IngestRequest
 from gacore.weitrack.storage import Storage
 
@@ -15,6 +18,14 @@ def create_app(storage: Storage) -> FastAPI:
     @app.get("/health")
     def health() -> dict:
         return {"status": "ok"}
+
+    @app.get("/dashboard", response_class=HTMLResponse)
+    def dashboard(day: str | None = None) -> str:
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            return render_dashboard_html(conn, day)
+        finally:
+            conn.close()
 
     @app.post("/ingest")
     def ingest(req: IngestRequest) -> dict:
