@@ -170,7 +170,8 @@ def build_sessions(events: list[tuple[int, str, int, dict]]) -> list[tuple]:
                 app = p.get("app", pkg)
                 fg_ms = p.get("foreground_ms", 0) or 0
                 end_ms = p.get("endMs", ts)
-                if fg_ms <= 0:
+                # 丢弃 ≤30 秒碎片会话（实测大量 0-5 秒的系统/切换噪音）
+                if fg_ms < 30_000:
                     continue
                 activity = p.get("activity", "")
                 # 同 app 连续 → 合并（end 取 max，时长累加）
