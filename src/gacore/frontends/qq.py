@@ -769,16 +769,70 @@ class QQApp:
 
 # --------------------------------------------------------------------------- entry
 
+_BIND_RETRIES: Final = 10
+_BIND_RETRY_DELAY: Final = 0.3
+
+
 def _ensure_single_instance(port: int = 19528) -> None:
-    """Prevent two QQ frontends from running simultaneously."""
+    """Run as the sole instance: kill any stale instance, then bind the lock port.
+
+    Binds 127.0.0.1:{port}. When binding fails, older instances of this project
+    (python processes whose command line mentions start.py / WithLangGraph) are
+    terminated so the newest code always wins; the bind is then retried. A process
+    that is not one of ours is never killed — the launcher exits with a clear
+    message instead.
+    """
     global _instance_sock
+
+    for attempt in range(_BIND_RETRIES):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            if attempt == 0:
+                killed = _kill_stale_instances(exclude_pid=os.getpid())
+                if not killed:
+                    logger.warning(
+                        f"Port {port} is held by a non-project process; refusing to kill it. "
+                        "Please stop it manually first."
+                    )
+                    sys.exit(1)
+            time.sleep(_BIND_RETRY_DELAY)
+            continue
+        _instance_sock = sock
+        return
+
+    logger.warning(f"Could not acquire instance port {port} after {_BIND_RETRIES} tries; giving up.")
+    sys.exit(1)
+
+
+def _kill_stale_instances(exclude_pid: int) -> int:
+    """Terminate older instances of this project; return how many were killed.
+
+    A process counts as ours when its command line (lower-cased) contains
+    "start.py" or "withlanggraph" — this covers `python start.py` and
+    `python -m gacore.frontends.qq` runs from this repo, while leaving unrelated
+    python services (e.g. gacore.weitrack launched from another repo) untouched.
+    """
+    killed = 0
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.bind(("127.0.0.1", port))
-    except OSError:
-        logger.warning("Another instance is already running, skipping...")
-        sys.exit(1)
-    _instance_sock = sock
+        import psutil  # noqa: PLC0415
+
+        for proc in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                if proc.info["pid"] == exclude_pid:
+                    continue
+                cmd = " ".join(proc.info["cmdline"] or []).lower()
+                if "start.py" in cmd or "withlanggraph" in cmd:
+                    logger.warning(f"Killing stale instance (pid={proc.info['pid']})")
+                    proc.terminate()
+                    killed += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:  # noqa: BLE001 — psutil missing/broken: fall through
+        pass
+    return killed
 
 
 def _redirect_log() -> None:
