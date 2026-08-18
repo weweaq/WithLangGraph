@@ -20,7 +20,7 @@ from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parents[3] / "data" / "weitrack.db"
 
-# 与客户端 UsageRepository.SYSTEM_PACKAGES 对齐 + 实测新增噪音
+# 与客户端 UsageRepository.SYSTEM_PACKAGES 对齐 + 实测新增噪音（42 个去重后）
 SYSTEM_PACKAGES = {
     "android",
     "com.android.systemui",
@@ -64,7 +64,6 @@ SYSTEM_PACKAGES = {
     "com.coloros.familyguard",
     "com.heytap.browser",
     "com.heytap.market",
-    "com.heytap.quicksearchbox",
     "com.heytap.quicksearchbox",
 }
 # 自家 App 不进使用统计
