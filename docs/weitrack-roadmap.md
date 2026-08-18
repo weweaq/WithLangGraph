@@ -385,7 +385,30 @@ top_notification_apps, sleep_start_ms, sleep_end_ms, silent_hours, place_distrib
 - **待验证**：重新打包安装后，次日确认 audio_env 全天在线（预期 ~1400 条/天）
 
 ### 待办（按优先级）
-- [ ] P4 AI 数字生活日报（LLM 读 daily_stats）
+- [x] ~~P4 AI 数字生活日报~~ → **已融合进 daily-report**（见下"8-19 记录"）
 - [ ] screen_content ts 脏数据修复（客户端 AccessibilityEvent timeStamp=0 兜底，R7）
 - [ ] location 采集量偏低排查（8-18 仅 3 条，疑似 OPPO 后台限频）
 - [ ] 音频看门狗修复后次日数据验证
+
+---
+
+## 2026-08-19：weiTrack → daily-report 融合（外挂式）
+
+### 已完成
+- ✅ **新建 `weitrack_stats` 工具**（`src/gacore/tools/weitrack_tools.py`）：
+  - 外挂式：只读 `data/weitrack.db` 事实表，自动触发 ETL（幂等），返回结构化画像（屏幕时长/App 排行/通知/睡眠信号/场景）
+  - 注册仅 3 行（`tools/__init__.py` import + TOOL_NAMES + _TOOLS），零侵入其他模块
+- ✅ **daily-report prompt 追加 weiTrack 信号节**（`config/schedule.json`，scheduler.py 零改动）：
+  - 步骤 4：`weitrack_stats(day=today)` 获取手机使用画像
+  - 新增「weiTrack 信号解读」节：屏幕/睡眠/场景与归档交叉成"自我观察"，没干货不强写
+- ✅ **测试**：`tests/test_tools_weitrack.py` 6 用例（正常/无数据/DB缺失/ETL失败/DB损坏/注册检查），全 mock
+- ✅ **全量回归**：315 passed（原 293 + weitrack 相关 22），ruff clean
+
+### 设计原则（高内聚/低耦合）
+- 工具模块独立：不 import scheduler/graph/其他 tools，只依赖 DB + ETL CLI
+- prompt 只加"一个信号源"，agent 决定如何解读——日报结构不变
+- `WEITRACK_ROOT` 环境变量可覆盖仓库根（测试隔离用）
+
+### 待办更新
+- [x] P4 AI 日报 → 已通过 weitrack_stats 融合进现有 daily-report（不另起炉灶）
+- [ ] 验证：23:50 日报实际跑起来后，确认邮件正文含 weiTrack 信号节
