@@ -95,6 +95,16 @@
    - 修：定位坏行（`Get-NetTCPConnection` 找不到就按进程找），坏行转 UTF-8
 9. **PowerShell 管道/工具输出被 ANSI 吞或只显示一行**
    - 重定向到临时文件再读；GBK 内容用 python 按 `gbk` 解码读取
+10. **`2>/dev/null` 是 bash 语法，PowerShell 直接报错**（`无法找到路径 D:\dev\null`）
+    - 用 `2>$null`；git 输出过滤用 `2>&1` + `Select-String`
+11. **write/edit 工具写文件一律 UTF-8 无 BOM**，会覆盖/丢弃已加的 BOM
+    - 需要 BOM 的场景（ps1 中文）→ 别依赖 BOM，脚本直接纯 ASCII（见第 0 节）
+12. **Start-Job 测试后子进程会残留**（Stop-Job 只停主 job）
+    - 测试完按 cmdline 杀子进程（`Get-CimInstance` + `Stop-Process`）+ 清端口
+13. **fastapi TestClient 的 deprecation warning 会让 PowerShell 报 exit code 1**，但测试实际 PASS
+    - 别被 `[stderr]` + exit 1 误导，看断言结果（`assert PASS` 才算数）
+14. **服务/后台进程必须用正确的解释器**（本项目双环境：weitrack 用 `.venv` 有 uvicorn，gacore 用 py12）
+    - 启动前先确认目标进程的依赖装在哪个环境（`python -c "import uvicorn"`）
 
 ## 常用命令速查
 
