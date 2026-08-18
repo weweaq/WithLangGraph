@@ -9,16 +9,25 @@
 - **客户端=采集**：weiCheckApp 只负责采集 + 上报，**不做客户端分析**。
 - **服务端=加工分析**：本仓库（WithLangGraph）负责 `/ingest` 接收、ETL 清洗建表、report 分析、geocode 逆编码、dashboard 展示。分析能力逐步建设。
 
-## 铁律：改完必更路书
+## 铁律：
+
+### 改完必更路书
 
 **`docs/weitrack-roadmap.md` 是本项目的数据链路路书（指南 + 工作日志）。**
 
 **每次改动代码（客户端或服务端，哪怕一行）后，必须：**
+
 1. 在路书「执行记录」节追加一条记录：改了什么、为什么改、验证结果
 2. 更新「待办」清单：完成项打 ✅，新增项追加
 3. 数据相关的验证结论（实测数字、问题诊断）也要记录
 
 **违反此规则 = 工作不完整，不允许直接收尾。**
+
+###  生成md文档规则：
+
+- 结合代码讲细节，不要泛泛而谈
+
+- 多画图讲数据流程，使用mermaid
 
 ## 提交流程（沿用既有军规）
 
@@ -30,6 +39,7 @@
 ## 实测踩坑记录（低级错误警示，避免重犯）
 
 ### 1. 音频采集线程静默卡死（2026-08-18）
+
 - **现象**：audio_env/audio_clip 数据在某时刻集体停止，全天只剩 34 分钟数据，且**无任何日志**
 - **根因**：`AudioRecord.read()` 在系统回收麦克风（打电话/语音）后永久阻塞不返回，采集线程空转
 - **错误**：外层 `try-catch(Exception)` 把异常全吞掉，线程死了看不见
@@ -40,18 +50,45 @@
   - **数据突然变少 = 先查采集器存活**，用时间分布（按小时分组）定位停止时刻，别只看总量
 
 ### 2. 服务端 events 表字段名（2026-08-17）
+
 - events 表存的是 `payload` 列（不是 `data`），写 SQL 分析时用错字段会 `no such column`
 - 查询前先 `PRAGMA table_info(events)` 或看 `storage.py` 的 `_SCHEMA`
 
 ### 3. Windows 环境编码（2026-08-17）
+
 - `.env` 可能是 GBK 编码，Python `read_text(encoding="utf-8")` 会崩
 - 读配置用**字节查找**（`find(b"KEY=")`）避免编码问题
 - PowerShell 传中文给 Python 会乱码：用 `python -X utf8` + 写脚本文件而非内联
 
 ### 4. ETL 全量重建会丢人工数据（2026-08-18）
+
 - places 表被 `DELETE + INSERT` 重建后，手工标好的「家/公司」标签全丢
 - **教训**：用户人工确认的数据必须持久化到独立配置（`data/place_labels.json`），ETL 重跑后自动恢复
 - 通用原则：**ETL 能全量重建的是"可计算数据"，"人工/外部数据"要单独存**
+
+### 5. Windows 命令行 / 脚本避坑（2026-08-18 汇总）
+
+> 以下坑都是实踩过、反复出现的，**每次写命令/脚本前先扫一眼**。
+
+1. **PowerShell 5.1 不支持 `&&` 连接符**（报 `标记"&&"不是此版本中的有效语句分隔符`）
+   - 用 `;` 或换行分隔；要拿到命令退出码再判断，用 `$LASTEXITCODE`
+2. **`.bat` 必须 CRLF 换行 + GBK 编码**（中文系统代码页 936）
+   - 写成 LF/UTF-8 时 cmd 解析直接报 `The system cannot find the path specified`
+   - 用 write_file 写 bat 后务必转换：`(Get-Content x.bat) -join "`r`n" | Set-Content x.bat -Encoding Default`
+3. **cmd 下 `\"` 转义无效**（引号问题绕不开时）
+   - 改用 `powershell -EncodedCommand`：先算 Base64 of UTF-16LE，彻底规避引号地狱
+4. **`timeout /t N` 在非交互/重定向时报 `Input redirection is not supported`**
+   - 改用 `ping -n N 127.0.0.1 >nul` 当延时器
+5. **后台常驻进程不要前台拉起**（会被超时杀掉）
+   - 用 `Start-Process -WindowStyle Hidden` + `cmd /c` 包装（子进程内先 `set PYTHONPATH=src`）+ 输出重定向落盘
+6. **只 bind 未 listen 的 socket，psutil.net_connections / netstat 都查不到**
+   - 查端口占用改用 `Get-NetTCPConnection`；单实例互斥杀旧实例改用**按进程 cmdline 匹配**（如含 `start.py`），避开同名端口服务
+7. **git commit 中文 message**（PowerShell 下 `-m "中文(括号)"` 必乱码）
+   - `python -c` 写 UTF-8 临时文件到 `.git/` 下 + `git commit -F`（相对路径）；`-F` 用长绝对路径会挂起
+8. **`.env` 混入 GBK 中文行** → `load_dotenv()` 抛 `UnicodeDecodeError`，进程重启即全挂
+   - 修：定位坏行（`Get-NetTCPConnection` 找不到就按进程找），坏行转 UTF-8
+9. **PowerShell 管道/工具输出被 ANSI 吞或只显示一行**
+   - 重定向到临时文件再读；GBK 内容用 python 按 `gbk` 解码读取
 
 ## 常用命令速查
 
