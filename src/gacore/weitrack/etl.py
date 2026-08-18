@@ -111,6 +111,7 @@ CREATE TABLE IF NOT EXISTS places (
   first_seen INTEGER,
   last_seen INTEGER,
   visit_count INTEGER NOT NULL DEFAULT 0,
+  is_primary INTEGER NOT NULL DEFAULT 0,
   UNIQUE(device_id, grid_key)
 );
 CREATE INDEX IF NOT EXISTS idx_places_device ON places(device_id);
@@ -264,17 +265,39 @@ def build_places(events) -> list[tuple]:
     return rows
 
 
+def purge_dirty(db_path: Path) -> None:
+    """删除 events 表中的异常数据：ts 脏数据 + payload 非 JSON。幂等，可重复执行。"""
+    conn = sqlite3.connect(db_path)
+    c1 = conn.execute("DELETE FROM events WHERE ts < 1000000000000")
+    # payload 非 JSON 的（防御）
+    rows = conn.execute("SELECT id, payload FROM events").fetchall()
+    bad_ids = []
+    for eid, raw in rows:
+        try:
+            json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            bad_ids.append(eid)
+    if bad_ids:
+        conn.executemany("DELETE FROM events WHERE id=?", [(i,) for i in bad_ids])
+    conn.commit()
+    print(f"[purge] 删除 ts 脏数据 {c1.rowcount} 条, 非 JSON payload {len(bad_ids)} 条")
+    conn.close()
+
+
 def run(db_path: Path = DB_PATH, device_id: str | None = None) -> None:
     conn = sqlite3.connect(db_path)
     conn.executescript(_SCHEMA)
+    # 迁移：旧 places 表补 is_primary 列
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(places)")}
+    if "is_primary" not in cols:
+        conn.execute("ALTER TABLE places ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0")
 
     events = load_events(conn)
     print(f"[etl] 事件总数(清洗后): {len(events)}")
 
-    # 重置表（全量重建，简单可靠）
+    # 重置表（全量重建，简单可靠）；places 用 upsert 保留已标注标签（家/公司）
     conn.execute("DELETE FROM sessions")
     conn.execute("DELETE FROM daily_stats")
-    conn.execute("DELETE FROM places")
 
     sessions = build_sessions(events)
     conn.executemany(
@@ -293,23 +316,50 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None) -> None:
     )
     print(f"[etl] daily_stats: {len(daily)}")
 
+    # places：保留已标注 label（家/公司/未知），只更新统计；新点以"未知"插入
     places = build_places(events)
-    conn.executemany(
-        "INSERT INTO places(device_id, grid_key, lat, lon, label, first_seen, last_seen, visit_count) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        places,
-    )
+    for p in places:
+        conn.execute(
+            """
+            INSERT INTO places(device_id, grid_key, lat, lon, label, first_seen, last_seen, visit_count)
+            VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(device_id, grid_key) DO UPDATE SET
+              lat=excluded.lat, lon=excluded.lon,
+              first_seen=MIN(places.first_seen, excluded.first_seen),
+              last_seen=MAX(places.last_seen, excluded.last_seen),
+              visit_count=places.visit_count + excluded.visit_count
+            """,
+            p,
+        )
     print(f"[etl] places: {len(places)}")
 
+    # 自动标记 top2 主常驻点（按访问次数），不覆盖已确认的家/公司标签
+    top2 = conn.execute(
+        "SELECT id, grid_key, label FROM places ORDER BY visit_count DESC LIMIT 2"
+    ).fetchall()
+    for tid, _, tlabel in top2:
+        # 仅当该点尚未被人工确认（label 仍为未知）时才提示，主标记始终置位
+        conn.execute("UPDATE places SET is_primary=1 WHERE id=?", (tid,))
     conn.commit()
     conn.close()
+    # 恢复持久化的家/公司标签（data/place_labels.json）
+    try:
+        from gacore.weitrack.label_places import apply_labels
+        n = apply_labels(db_path)
+        if n:
+            print(f"[etl] 恢复持久化地点标签: {n} 个")
+    except ImportError:
+        pass
     print("[etl] 完成")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="weiTrack ETL")
     parser.add_argument("--db", type=Path, default=DB_PATH)
+    parser.add_argument("--purge", action="store_true", help="先清理异常事件再重建事实表")
     args = parser.parse_args()
+    if args.purge:
+        purge_dirty(args.db)
     run(args.db)
 
 
