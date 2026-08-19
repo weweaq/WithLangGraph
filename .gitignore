@@ -19,3 +19,7 @@ temp/
 *.egg-info/
 uv.lock
 data/
+
+# 设计/巡检文档不入库（本地工作文档）
+docs/sre/
+docs/superpowers/
