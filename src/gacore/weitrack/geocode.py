@@ -327,12 +327,15 @@ def reverse_geocode(lat: float, lon: float, key: str) -> dict | None:
 
 
 def around_search(lat: float, lon: float, key: str, radius: int = 500) -> dict | None:
-    """周边搜索兜底：regeo 无 POI 时按坐标检索最近 POI 补行为语义。"""
+    """周边搜索兜底：regeo 无 POI 时按坐标检索最近 POI 补行为语义。
+
+    extensions=all 的 POI 才带商圈字段 business_area（下划线）；base 仅 businessArea（驼峰）且常为空。
+    """
     params = urllib.parse.urlencode({
         "location": f"{lon},{lat}",
         "key": key,
         "radius": str(radius),
-        "extensions": "base",
+        "extensions": "all",
     })
     try:
         with urllib.request.urlopen(f"{AROUND_URL}?{params}", timeout=10) as resp:
@@ -346,7 +349,8 @@ def around_search(lat: float, lon: float, key: str, radius: int = 500) -> dict |
     if not pois:
         return None
     p = pois[0]
-    return {"poi": p.get("name", ""), "poi_type": p.get("type", "")}
+    ba = next((_p.get("business_area") or _p.get("businessArea") or "" for _p in pois), "")
+    return {"poi": p.get("name", ""), "poi_type": p.get("type", ""), "business_area": ba}
 
 
 def infer_label(info: dict | None) -> str:
@@ -450,6 +454,39 @@ def refresh_behavior(db_path: Path = DB_PATH) -> int:
     return n
 
 
+def enrich_business_area(db_path: Path = DB_PATH) -> int:
+    """P2-1 商圈补充：对已编码、business_area 为空且非住宅/楼宇/办公的活动类常驻点，
+    用 around 周边搜索补 business_area（不覆盖已有值）。低频增量，仅首次需配额。
+    """
+    key = _amap_key()
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT id, lat, lon, poi, behavior FROM places "
+        "WHERE geocoded_at IS NOT NULL AND (business_area IS NULL OR business_area='') "
+        "AND behavior IS NOT NULL AND behavior != '' "
+        "AND behavior NOT IN ('住宅/楼宇', '办公')"
+    ).fetchall()
+    if not rows:
+        print("[geocode] 无待补商圈的消费/活动点")
+        conn.close()
+        return 0
+    print(f"[geocode] 待补商圈点: {len(rows)} 个")
+    n = 0
+    for r in rows:
+        ba = ""
+        around = around_search(r["lat"], r["lon"], key, radius=800)
+        if around and around.get("business_area"):
+            ba = around["business_area"]
+        conn.execute("UPDATE places SET business_area=? WHERE id=?", (ba or None, r["id"]))
+        if ba:
+            n += 1
+    conn.commit()
+    conn.close()
+    print(f"[geocode] 商圈补充完成: {n} 个点获得商圈名")
+    return n
+
+
 def run(db_path: Path = DB_PATH, label: str | None = None, force_all: bool = False) -> None:
     key = _amap_key()  # 提前校验 key，避免走到一半才发现缺配置
     n = incremental_encode(db_path, force_all=force_all)
@@ -471,10 +508,16 @@ def main() -> None:
                         help="给已编码常驻点强制统一标标签（如 家/公司），不传则不覆盖 label")
     parser.add_argument("--rebehavior", action="store_true",
                         help="仅刷新已编码点的 behavior（不调 API），基于 poi_type 中文大类重算")
+    parser.add_argument("--enrich-business", action="store_true",
+                        help="P2-1：对消费/活动类常驻点用周边搜索补商圈(business_area)")
     args = parser.parse_args()
     if args.rebehavior:
         n = refresh_behavior(args.db)
         print(f"[geocode] 刷新 behavior 完成: {n} 条")
+        return
+    if args.enrich_business:
+        n = enrich_business_area(args.db)
+        print(f"[geocode] 商圈补充完成: {n} 条")
         return
     run(args.db, args.label, args.all)
 
