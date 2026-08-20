@@ -13,12 +13,19 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import sqlite3
+import time
 from collections import defaultdict
 from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parents[3] / "data" / "weitrack.db"
+
+# 同设备重装前后 device_id 别名映射（data/device_aliases.json）：别名 → 主设备。
+# app 端已改为基于 ANDROID_ID 的稳定标识，但历史数据里重装前的旧 device_id 仍存在，
+# ETL 每次运行先把别名数据归并到主设备，避免同一台手机被劈成两半。
+DEVICE_ALIASES_PATH = Path(__file__).resolve().parents[3] / "data" / "device_aliases.json"
 
 # 与客户端 UsageRepository.SYSTEM_PACKAGES 对齐 + 实测新增噪音（42 个去重后）
 SYSTEM_PACKAGES = {
@@ -111,9 +118,63 @@ CREATE TABLE IF NOT EXISTS places (
   last_seen INTEGER,
   visit_count INTEGER NOT NULL DEFAULT 0,
   is_primary INTEGER NOT NULL DEFAULT 0,
+  -- L2 语义落库字段（geocode 增量编码写入）
+  address TEXT,
+  poi TEXT,
+  district TEXT,
+  township TEXT,
+  business_area TEXT,
+  poi_type TEXT,
+  -- P1-2 POI 三级语义（高德 type 拆"大类;中类;细类"）+ 名称硬信号 + 无POI兜底描述
+  poi_l1 TEXT,
+  poi_l2 TEXT,
+  poi_l3 TEXT,
+  poi_signal TEXT,
+  poi_fallback TEXT,
+  matched_level TEXT,
+  behavior TEXT,
+  geocoded_at INTEGER,
+  -- L1 家/公司置信度候选（未确认前 label 保持中性表述，候选单独存）
+  candidate_label TEXT,
+  confidence_home REAL DEFAULT 0,
+  confidence_work REAL DEFAULT 0,
   UNIQUE(device_id, grid_key)
 );
 CREATE INDEX IF NOT EXISTS idx_places_device ON places(device_id);
+
+-- P1-3 新地点/异常事件（打破规律的点，作画像叙事节点）
+CREATE TABLE IF NOT EXISTS anomalies (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  day TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  grid_key TEXT,
+  poi TEXT,
+  detail TEXT,
+  ts INTEGER,
+  UNIQUE(day, kind, grid_key)
+);
+CREATE INDEX IF NOT EXISTS idx_anomalies_day ON anomalies(day);
+
+CREATE TABLE IF NOT EXISTS stays (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id TEXT NOT NULL,
+  start_ts INTEGER NOT NULL,
+  end_ts INTEGER NOT NULL,
+  duration_ms INTEGER NOT NULL,
+  center_lat REAL NOT NULL,
+  center_lon REAL NOT NULL,
+  min_lat REAL NOT NULL,
+  min_lon REAL NOT NULL,
+  max_lat REAL NOT NULL,
+  max_lon REAL NOT NULL,
+  n_points INTEGER NOT NULL DEFAULT 0,
+  radius_m REAL NOT NULL DEFAULT 0,
+  grid_key TEXT,
+  day TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_stays_device ON stays(device_id);
+CREATE INDEX IF NOT EXISTS idx_stays_day ON stays(day);
 """
 
 
@@ -242,10 +303,170 @@ def build_daily_stats(events, sessions) -> list[tuple]:
     return rows
 
 
+# ---------------------------------------------------------------------------
+# L1 停驻点检测（stays）
+# ---------------------------------------------------------------------------
+
+_EARTH_R = 6371000.0
+
+
+def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """两点球面距离（米）。"""
+    import math
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * _EARTH_R * math.asin(math.sqrt(a))
+
+
+def _median_center(points: list[tuple[float, float]]) -> tuple[float, float]:
+    """中位数中心（对 GPS 抖动比均值更鲁棒）。points: [(lat, lon)]。"""
+    n = len(points)
+    lats = sorted(p[0] for p in points)
+    lons = sorted(p[1] for p in points)
+
+    def med(a: list) -> float:
+        m = n // 2
+        return a[m] if n % 2 else (a[m - 1] + a[m]) / 2.0
+
+    return med(lats), med(lons)
+
+
+# 停驻检测阈值（可配分档）：家/公司用大圈，密集商圈用小圈。
+STAY_LARGE_RADIUS_M = 120.0   # 大圈：家/公司/大空间（方案 100m+，略放宽抗抖动）
+STAY_SMALL_RADIUS_M = 60.0    # 小圈：密集商圈参考值（作为停留覆盖半径的分档标记）
+STAY_MIN_DURATION_MS = 10 * 60 * 1000   # 停留最短时长：连续 10 分钟
+STAY_MERGE_GAP_MS = 5 * 60 * 1000       # 边界合并：相邻停留间隔 < 5 分钟视为同一段
+STAY_MERGE_RADIUS_M = 150.0             # 边界合并：相邻段中心距 < 150m 才合并（防通勤过渡段误并入）
+STAY_MAX_JUMP_M = 500.0                 # GPS 漂移尖刺：相对上一点突跳 > 500m
+STAY_MAX_SPEED_MPS = 40.0               # 漂移尖刺：瞬时速度 > 40m/s（144km/h）
+
+
+def build_stays(
+    events,
+    large_radius_m: float = STAY_LARGE_RADIUS_M,
+    small_radius_m: float = STAY_SMALL_RADIUS_M,
+    min_stay_ms: int = STAY_MIN_DURATION_MS,
+    merge_gap_ms: int = STAY_MERGE_GAP_MS,
+    merge_radius_m: float = STAY_MERGE_RADIUS_M,
+    max_jump_m: float = STAY_MAX_JUMP_M,
+    max_speed_mps: float = STAY_MAX_SPEED_MPS,
+) -> list[tuple]:
+    """L1 停驻点检测：滑动窗口 + 中位数中心。
+
+    - 连续停留：新点与当前停留锚点（前 3 点中位数，固定不漂移）距离 <= 大圈半径 → 归入停留。
+    - 漂移剔除：瞬时速度 > max_speed 且突跳 > max_jump 的 GPS 飞点直接丢弃；
+      远离锚点但仅 1 点的"尖刺弹回"先挂起，下一点回到锚点则判为尖刺丢弃。
+    - 边界合并：相邻两段停留 间隔 < merge_gap_ms 且 中心距 < merge_radius_m → 合并为同一段
+      （双条件：移动中采样间隔通常 <5min，仅按时间合并且会把通勤过渡段误并入停留段）。
+    - 阈值分档：检测统一用大圈（家/公司不劈碎）；停留的实际覆盖半径 <= 小圈
+      则记为小圈（商圈/密集区），供画像区分空间粒度。阈值均可配置。
+    - 输出元组：(device_id, start_ts, end_ts, duration_ms, center_lat, center_lon,
+      min_lat, min_lon, max_lat, max_lon, n_points, radius_m, grid_key, day)
+    """
+    # 按设备分组、按时间排序
+    by_device: dict[str, list[tuple[int, float, float]]] = defaultdict(list)
+    for device_id, ts, type_, p in events:
+        if type_ != "location":
+            continue
+        lat = p.get("lat")
+        lon = p.get("lon")
+        if lat is None or lon is None:
+            continue
+        by_device[device_id].append((ts, lat, lon))
+    for evs in by_device.values():
+        evs.sort(key=lambda e: e[0])
+
+    stays: list[tuple] = []
+    for device_id, evs in by_device.items():
+        if not evs:
+            continue
+        # ---- 粗停留段检测（固定锚点，防中位数中心随点加入漂移导致半径膨胀）----
+        raw_segs: list[list[tuple[int, float, float]]] = []
+        cur: list[tuple[int, float, float]] = [evs[0]]
+        anchor = (evs[0][1], evs[0][2])  # 锚点：前 3 点中位数定锚后固定
+        pending: tuple[int, float, float] | None = None
+        prev = evs[0]
+        for e in evs[1:]:
+            ts, lat, lon = e
+            dt = (ts - prev[0]) / 1000.0
+            dist_prev = _haversine(prev[1], prev[2], lat, lon)
+            speed = dist_prev / dt if dt > 0 else 0.0
+            # 超速 + 突跳 → GPS 飞点，直接丢弃（不断开停留）
+            if speed > max_speed_mps and dist_prev > max_jump_m:
+                prev = e
+                continue
+            dist_anchor = _haversine(anchor[0], anchor[1], lat, lon)
+            if dist_anchor <= large_radius_m:
+                # 回到停留内；若有挂起点说明那是尖刺，丢弃
+                pending = None
+                cur.append(e)
+                # 仅前 3 点用中位数重定锚（抗首点抖动），之后锚点固定不漂移
+                if len(cur) <= 3:
+                    anchor = _median_center([(x[1], x[2]) for x in cur])
+            else:
+                if pending is None:
+                    # 首个远离点：挂起观察（可能是尖刺弹回，也可能是真离开）
+                    pending = e
+                else:
+                    # 连续两个远离锚点 → 确认离开，切段；新段以挂起点为锚
+                    raw_segs.append(cur)
+                    cur = [pending, e]
+                    anchor = (pending[1], pending[2])
+                    pending = None
+            prev = e
+        if pending is not None:
+            raw_segs.append(cur)
+            cur = [pending]
+        if cur:
+            raw_segs.append(cur)
+
+        # ---- 边界合并（间隔 < merge_gap 且 相邻段中心距离 < merge_radius → 同一段） ----
+        # 双条件：仅按时间间隔合并且移动中采样点间隔通常 <5min，会把通勤过渡段
+        # 误并入停留段导致半径膨胀（实测家段被拉到 587m）；空间相近才合并。
+        segs: list[list[tuple[int, float, float]]] = []
+        for seg in raw_segs:
+            if segs and (seg[0][0] - segs[-1][-1][0]) < merge_gap_ms:
+                c1 = _median_center([(x[1], x[2]) for x in segs[-1]])
+                c2 = _median_center([(x[1], x[2]) for x in seg])
+                if _haversine(c1[0], c1[1], c2[0], c2[1]) <= merge_radius_m:
+                    segs[-1].extend(seg)
+                    continue
+            segs.append(list(seg))
+
+        # ---- 生成停留记录（时长达标才保留） ----
+        for seg in segs:
+            start_ts = seg[0][0]
+            end_ts = seg[-1][0]
+            duration = end_ts - start_ts
+            if duration < min_stay_ms:
+                continue
+            pts = [(x[1], x[2]) for x in seg]
+            clat, clon = _median_center(pts)
+            radius = max(_haversine(clat, clon, la, lo) for la, lo in pts)
+            # 阈值分档：覆盖半径 <= 小圈 → 记小圈（商圈/密集区），否则大圈（家/公司）
+            radius_m = min(radius, small_radius_m) if radius <= small_radius_m else max(radius, large_radius_m)
+            lats = [la for la, _ in pts]
+            lons = [lo for _, lo in pts]
+            gk = f"{round(clat * 1000) / 1000:.3f},{round(clon * 1000) / 1000:.3f}"
+            stays.append((
+                device_id, start_ts, end_ts, duration,
+                clat, clon, min(lats), min(lons), max(lats), max(lons),
+                len(pts), round(radius_m, 1), gk, day_of(start_ts),
+            ))
+    stays.sort(key=lambda s: (s[0], s[1]))
+    return stays
+
+
 def build_places(events) -> list[tuple]:
-    """位置网格聚类：0.001° (~110m) 网格，聚合停留次数与时间范围。"""
+    """位置网格聚类：0.001° (~110m) 网格，聚合停留次数与时间范围。
+
+    修复：device_id 按事件实际值填充（不再写死空串），多设备按 (device_id, grid) 隔离。
+    """
     grid: dict[tuple, dict] = {}
-    for _, ts, type_, p in events:
+    for device_id, ts, type_, p in events:
         if type_ != "location":
             continue
         lat = p.get("lat")
@@ -253,15 +474,292 @@ def build_places(events) -> list[tuple]:
         if lat is None or lon is None:
             continue
         gk = (round(lat * 1000) / 1000, round(lon * 1000) / 1000)
-        cell = grid.setdefault(gk, {"lat": lat, "lon": lon, "first": ts, "last": ts, "n": 0})
+        cell = grid.setdefault((device_id, gk), {"lat": lat, "lon": lon, "first": ts, "last": ts, "n": 0})
         cell["first"] = min(cell["first"], ts)
         cell["last"] = max(cell["last"], ts)
         cell["n"] += 1
     rows = []
-    for (glat, glon), c in grid.items():
-        rows.append(("", f"{glat:.3f},{glon:.3f}", c["lat"], c["lon"],
+    for (device_id, (glat, glon)), c in grid.items():
+        rows.append((device_id, f"{glat:.3f},{glon:.3f}", c["lat"], c["lon"],
                      "未知", c["first"], c["last"], c["n"]))
     return rows
+
+
+def infer_home_work_candidates(conn: sqlite3.Connection) -> int:
+    """L1 家/公司置信度推断（候选制 + 双榜并行 + 已确认点置信度回填）。
+
+    - 家：凌晨 00:00-05:00 停留天数 >=3 → 高置信（home 榜）。
+    - 公司：工作日白天 09:00-18:00 高频停留（>=15 次）→ 高置信（work 榜）。
+    - 双榜并行：评估网格 = 凌晨停留榜 ∪ 工作日白天高频榜；纯白天高频、
+      凌晨无停留的办公网格也能进入公司候选（修复验收盲区③）。
+    - 已确认点（label 家/公司）不再跳过，同样计算并回填 confidence_home /
+      confidence_work，candidate_label 记为其确认标签（修复验收盲区②）；
+      未确认点 candidate_label 记推断候选，label 保持中性由用户确认。
+    """
+    home_days: dict[str, set[str]] = defaultdict(set)
+    work_count: dict[str, int] = defaultdict(int)
+    rows = conn.execute(
+        "SELECT ts, payload FROM events WHERE type='location'"
+    ).fetchall()
+    import datetime
+    for ts, raw in rows:
+        try:
+            p = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        lat, lon = p.get("lat"), p.get("lon")
+        if lat is None or lon is None:
+            continue
+        gk = f"{round(lat * 1000) / 1000:.3f},{round(lon * 1000) / 1000:.3f}"
+        dt = datetime.datetime.fromtimestamp(ts / 1000)
+        hour = dt.hour
+        if hour < 5:
+            home_days[gk].add(dt.strftime("%Y-%m-%d"))
+        if 9 <= hour < 18 and dt.weekday() < 5:
+            work_count[gk] += 1
+
+    # 已确认标签（label 家/公司）按网格索引，用于回填 candidate_label
+    confirmed: dict[str, str] = {}
+    for gk, lab in conn.execute(
+        "SELECT grid_key, label FROM places WHERE label IN ('家','公司')"
+    ):
+        confirmed.setdefault(gk, lab)
+
+    WORK_THRESHOLD = 15  # 工作日白天高频阈值：>=15 次进入公司候选评估
+    # 评估网格 = 凌晨停留榜 ∪ 工作日白天高频榜 ∪ 已确认 label 网格。
+    # 已确认点强制纳入，保证置信度无条件回填（即使不在任何高频榜）。
+    grids = set(home_days) | {gk for gk, n in work_count.items() if n >= WORK_THRESHOLD} | set(confirmed)
+
+    n_updated = 0
+    for gk in grids:
+        home_conf = min(1.0, len(home_days.get(gk, ())) / 3.0)
+        work_conf = min(1.0, work_count.get(gk, 0) / WORK_THRESHOLD)
+        candidate = None
+        if home_conf >= 0.67 and home_conf > work_conf:
+            candidate = "家"
+        elif work_conf >= 0.67 and work_conf > home_conf:
+            candidate = "公司"
+        # 已确认点回填确认标签；未确认点写入推断候选
+        cand_final = confirmed.get(gk, candidate)
+        cur = conn.execute(
+            "UPDATE places SET candidate_label=?, confidence_home=?, confidence_work=? "
+            "WHERE grid_key=?",
+            (cand_final, round(home_conf, 2), round(work_conf, 2), gk),
+        )
+        n_updated += cur.rowcount
+    return n_updated
+
+
+def detect_anomalies(conn: sqlite3.Connection, lookback_days: int = 7) -> int:
+    """P1-3 新地点/异常事件探测：识别打破规律的点，写入 anomalies 表。
+
+    三类异常（作画像叙事节点）：
+    - new_place      首次到访新地点：近 lookback_days 天内 first_seen 且访问次数 <= 3，
+                     且非已确认家/公司（如新出现的医院、商场、陌生住宅区）。
+    - late_night_out 深夜/凌晨在外：停驻点开始时间落在 23:00-05:00 且不在家网格
+                     （深夜还待在公司/外出场所，规律打破）。
+    - off_schedule   工作日白天缺席公司：当天有停驻但 10:00-17:00 无公司网格停留
+                     （居家办公/请假/翘班，与"白天在公司"惯例相悖）。
+    """
+    conn.row_factory = sqlite3.Row
+    conn.execute("DELETE FROM anomalies")
+    now_ms = int(time.time() * 1000)
+    home = {r[0] for r in conn.execute("SELECT grid_key FROM places WHERE label='家'")}
+    work = {r[0] for r in conn.execute("SELECT grid_key FROM places WHERE label='公司'")}
+
+    def place_name(gk: str) -> str:
+        r = conn.execute(
+            "SELECT poi, poi_fallback FROM places WHERE grid_key=? LIMIT 1", (gk,)
+        ).fetchone()
+        if r:
+            return r["poi"] or r["poi_fallback"] or gk
+        return gk
+
+    rows: list[tuple] = []
+
+    # 1) 新地点
+    for r in conn.execute("SELECT * FROM places"):
+        if r["label"] in ("家", "公司"):
+            continue
+        if r["first_seen"] and r["first_seen"] >= now_ms - lookback_days * 86400000 and r["visit_count"] <= 3:
+            day = datetime.datetime.fromtimestamp(r["first_seen"] / 1000).strftime("%Y-%m-%d")
+            name = r["poi"] or r["poi_fallback"] or r["grid_key"]
+            rows.append((
+                day, "new_place", r["device_id"], r["grid_key"], name,
+                f"首次到访新地点：{name}（访问 {r['visit_count']} 次）", r["first_seen"],
+            ))
+
+    # 2) 深夜/凌晨在外（23:00-05:00 停留且不在家网格）
+    for r in conn.execute("SELECT * FROM stays"):
+        h = datetime.datetime.fromtimestamp(r["start_ts"] / 1000).hour
+        if not (h >= 23 or h < 5):
+            continue
+        if r["grid_key"] in home:
+            continue
+        day = r["day"]
+        dur = (r["end_ts"] - r["start_ts"]) / 60000.0
+        name = place_name(r["grid_key"])
+        rows.append((
+            day, "late_night_out", r["device_id"], r["grid_key"], name,
+            f"深夜在外停留 {dur:.0f} 分钟：{name}", r["start_ts"],
+        ))
+
+    # 3) 工作日白天缺席公司（当天有停驻但 10:00-17:00 无公司网格停留）
+    for day, day_stays in _group_stays_by_day(conn):
+        if datetime.date.fromisoformat(day).weekday() >= 5:
+            continue
+        if not day_stays:
+            continue
+        # 正午 13:00 作为"白天在公司"的代表时刻：停留段覆盖 13:00 且落在公司网格
+        # （不能用 start_ts 落在窗口内判断——公司停留段常开始于 08:40/09:47，会被误判缺席）
+        noon = int(datetime.datetime.fromisoformat(f"{day} 13:00").timestamp() * 1000)
+        in_office = any(
+            s[2] in work and s[0] <= noon <= s[1]
+            for s in day_stays
+        )
+        if not in_office:
+            rows.append((
+                day, "off_schedule", day_stays[0][4], "", "",
+                "工作日白天未到公司（正午 13:00 无公司网格停驻）", day_stays[0][0],
+            ))
+
+    conn.executemany(
+        "INSERT OR IGNORE INTO anomalies(day, kind, device_id, grid_key, poi, detail, ts) "
+        "VALUES (?,?,?,?,?,?,?)",
+        rows,
+    )
+    conn.commit()
+    return len(rows)
+
+
+def _group_stays_by_day(conn: sqlite3.Connection) -> list[tuple[str, list[tuple]]]:
+    """按天分组停驻点：返回 [(day, [(start_ts, end_ts, grid_key, in_work_hours, device_id), ...])]。"""
+    by_day: dict[str, list] = defaultdict(list)
+    for r in conn.execute("SELECT * FROM stays"):
+        by_day[r["day"]].append((r["start_ts"], r["end_ts"], r["grid_key"], False, r["device_id"]))
+    return sorted(by_day.items())
+
+
+def migrate_places(conn: sqlite3.Connection) -> None:
+    """places 表迁移：补语义/候选列；修复旧库 device_id='' 归并到实际设备。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(places)")}
+    for col, ddl in {
+        "address": "TEXT",
+        "poi": "TEXT",
+        "district": "TEXT",
+        "township": "TEXT",
+        "business_area": "TEXT",
+        "poi_type": "TEXT",
+        "poi_l1": "TEXT",
+        "poi_l2": "TEXT",
+        "poi_l3": "TEXT",
+        "poi_signal": "TEXT",
+        "poi_fallback": "TEXT",
+        "matched_level": "TEXT",
+        "behavior": "TEXT",
+        "geocoded_at": "INTEGER",
+        "candidate_label": "TEXT",
+        "confidence_home": "REAL DEFAULT 0",
+        "confidence_work": "REAL DEFAULT 0",
+    }.items():
+        if col not in cols:
+            conn.execute(f"ALTER TABLE places ADD COLUMN {col} {ddl}")
+
+    # 修复旧库空 device_id：归并到 events 中实际设备（多设备时取最新活跃）
+    empty = conn.execute("SELECT id, grid_key, lat, lon, label, first_seen, last_seen, visit_count, is_primary "
+                         "FROM places WHERE device_id='' OR device_id IS NULL").fetchall()
+    if empty:
+        real = conn.execute(
+            "SELECT device_id FROM events WHERE type='location' ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+        target = real[0] if real else "unknown"
+        for (pid, gk, lat, lon, label, first, last, vc, isp) in empty:
+            exists = conn.execute(
+                "SELECT id FROM places WHERE device_id=? AND grid_key=?", (target, gk)
+            ).fetchone()
+            if exists:
+                conn.execute(
+                    "UPDATE places SET first_seen=MIN(first_seen,?), last_seen=MAX(last_seen,?), "
+                    "visit_count=visit_count+?, is_primary=MAX(is_primary,?) WHERE id=?",
+                    (first, last, vc, isp, exists[0]),
+                )
+                conn.execute("DELETE FROM places WHERE id=?", (pid,))
+            else:
+                conn.execute("UPDATE places SET device_id=? WHERE id=?", (target, pid))
+        print(f"[etl] 修复旧库空 device_id 常驻点: {len(empty)} 条 → {target}")
+
+
+def _load_device_aliases() -> dict[str, str]:
+    """读取设备别名映射（别名 → 主设备）。"""
+    if not DEVICE_ALIASES_PATH.exists():
+        return {}
+    try:
+        data = json.loads(DEVICE_ALIASES_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+        return {}
+    return {str(k).strip(): str(v).strip() for k, v in (data or {}).items() if k and v}
+
+
+def merge_device_aliases(conn: sqlite3.Connection) -> int:
+    """同设备重装前后 device_id 归一：把别名设备的数据并入主设备。
+
+    - events：别名 → 主设备（device_id 直接改写）
+    - places：同一 (device, grid) 合并统计（首末时间取并集、访问数累加、
+      非"未知"label 优先、语义字段主设备缺失时补别名），别名行删除
+    - devices：主设备时间范围吸收别名，删除别名行
+    返回归并的别名设备数。必须在 load_events 之前调用（build 系列以 device_id 分组）。
+    """
+    aliases = _load_device_aliases()
+    if not aliases:
+        return 0
+    merged = 0
+    for alias, primary in aliases.items():
+        if alias == primary:
+            continue
+        # events 归一
+        cur = conn.execute(
+            "UPDATE events SET device_id=? WHERE device_id=?", (primary, alias)
+        )
+        # places 归一（先合并统计再删别名行）
+        alias_rows = conn.execute(
+            "SELECT id, grid_key, lat, lon, label, first_seen, last_seen, visit_count, "
+            "is_primary, address, poi, poi_type, behavior, matched_level "
+            "FROM places WHERE device_id=?", (alias,)
+        ).fetchall()
+        for r in alias_rows:
+            # 元组索引: 0=id 1=grid_key 2=lat 3=lon 4=label 5=first_seen
+            #           6=last_seen 7=visit_count 8=is_primary 9=address 10=poi
+            r_id, r_gk, r_lat, r_lon, r_label, r_first, r_last, r_vc, r_isp = r[:9]
+            r_addr, r_poi = r[9], r[10]
+            exists = conn.execute(
+                "SELECT id, label, address, poi FROM places "
+                "WHERE device_id=? AND grid_key=?", (primary, r_gk)
+            ).fetchone()
+            if exists:
+                pid, plabel, paddr, ppoi = exists
+                label = plabel if plabel and plabel != "未知" else (r_label or "未知")
+                conn.execute(
+                    "UPDATE places SET first_seen=MIN(first_seen,?), last_seen=MAX(last_seen,?), "
+                    "visit_count=visit_count+?, is_primary=MAX(is_primary,?), label=?, "
+                    "address=COALESCE(NULLIF(?, ''), address), "
+                    "poi=COALESCE(NULLIF(?, ''), poi) WHERE id=?",
+                    (r_first, r_last, r_vc, r_isp, label, r_addr, r_poi, pid),
+                )
+                conn.execute("DELETE FROM places WHERE id=?", (r_id,))
+            else:
+                conn.execute("UPDATE places SET device_id=? WHERE id=?", (primary, r_id))
+        # devices 时间范围吸收 + 删除别名行
+        conn.execute(
+            "UPDATE devices SET first_seen=MIN(first_seen, (SELECT first_seen FROM devices WHERE device_id=?)), "
+            "last_seen=MAX(last_seen, (SELECT last_seen FROM devices WHERE device_id=?)), "
+            "updated_at=datetime('now','+8 hours') WHERE device_id=?",
+            (alias, alias, primary),
+        )
+        conn.execute("DELETE FROM devices WHERE device_id=?", (alias,))
+        merged += 1
+        print(f"[etl] 设备归一: {alias} → {primary} (events {cur.rowcount} 条, places {len(alias_rows)} 条)")
+    conn.commit()
+    return merged
 
 
 def purge_dirty(db_path: Path) -> None:
@@ -283,13 +781,19 @@ def purge_dirty(db_path: Path) -> None:
     conn.close()
 
 
-def run(db_path: Path = DB_PATH, device_id: str | None = None) -> None:
+def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool = True) -> None:
     conn = sqlite3.connect(db_path)
     conn.executescript(_SCHEMA)
-    # 迁移：旧 places 表补 is_primary 列
+    # 迁移：旧 places 表补 is_primary 列（新库已含）
     cols = {r[1] for r in conn.execute("PRAGMA table_info(places)")}
     if "is_primary" not in cols:
         conn.execute("ALTER TABLE places ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0")
+    # 迁移：places 语义/候选列 + 旧库空 device_id 归并
+    migrate_places(conn)
+    # 同设备重装前后 device_id 归一（必须在 load_events 之前，build 系列按 device_id 分组）
+    n_alias = merge_device_aliases(conn)
+    if n_alias:
+        print(f"[etl] 设备别名归并完成: {n_alias} 个")
 
     events = load_events(conn)
     print(f"[etl] 事件总数(清洗后): {len(events)}")
@@ -315,6 +819,17 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None) -> None:
     )
     print(f"[etl] daily_stats: {len(daily)}")
 
+    # L1：停驻点检测 → stays 表（全量重建）
+    conn.execute("DELETE FROM stays")
+    stays = build_stays(events)
+    conn.executemany(
+        "INSERT INTO stays(device_id, start_ts, end_ts, duration_ms, center_lat, center_lon, "
+        "min_lat, min_lon, max_lat, max_lon, n_points, radius_m, grid_key, day) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        stays,
+    )
+    print(f"[etl] stays(L1 停驻点): {len(stays)}")
+
     # places：保留已标注 label（家/公司/未知），只更新统计；新点以"未知"插入
     places = build_places(events)
     for p in places:
@@ -331,6 +846,10 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None) -> None:
             p,
         )
     print(f"[etl] places: {len(places)}")
+
+    # L1：家/公司置信度候选（不覆盖用户已确认标签）
+    n_cand = infer_home_work_candidates(conn)
+    print(f"[etl] 家/公司置信度候选更新: {n_cand} 个")
 
     # 自动标记 top2 主常驻点（按访问次数），不覆盖已确认的家/公司标签
     top2 = conn.execute(
@@ -349,6 +868,21 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None) -> None:
             print(f"[etl] 恢复持久化地点标签: {n} 个")
     except ImportError:
         pass
+    # P1-3：新地点/异常事件探测（依赖 places 标签已恢复，家/公司网格集合准确）
+    conn = sqlite3.connect(db_path)
+    n_anom = detect_anomalies(conn)
+    conn.close()
+    print(f"[etl] anomalies 异常事件: {n_anom} 条")
+    # L2：增量 regeo 编码（仅未编码常驻点，ETL 重跑零新增调用）
+    if run_geocode:
+        try:
+            from gacore.weitrack import geocode
+            n = geocode.incremental_encode(db_path)
+            print(f"[etl] 增量 regeo 编码: {n} 个常驻点")
+        except SystemExit as e:
+            print(f"[etl] 跳过增量 regeo 编码: {e}")
+        except Exception as e:
+            print(f"[etl] 增量 regeo 编码失败(不影响 ETL): {e}")
     print("[etl] 完成")
 
 
@@ -356,10 +890,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="weiTrack ETL")
     parser.add_argument("--db", type=Path, default=DB_PATH)
     parser.add_argument("--purge", action="store_true", help="先清理异常事件再重建事实表")
+    parser.add_argument("--no-geocode", action="store_true", help="跳过高德增量 regeo 编码")
     args = parser.parse_args()
     if args.purge:
         purge_dirty(args.db)
-    run(args.db)
+    run(args.db, run_geocode=not args.no_geocode)
 
 
 if __name__ == "__main__":

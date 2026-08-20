@@ -1,8 +1,16 @@
-"""高德逆地理编码：把 places 表中的常驻点坐标 → 地址/场景标签（家/公司/未知）。
+"""高德逆地理编码（L2 语义化）：把 places 表未编码常驻点 → 语义字段全量落库。
+
+改造要点（v0.2 P0）：
+- regeo(extensions=all)：一次拿到 行政区/门牌号/POI 列表/AOI/道路/商圈，全部落库
+- 批量编码：regeo 支持一次传 20 点（| 分隔）；单请求响应过大/失败时自动降级 10/5/1 点重试
+- 增量缓存：只对 geocoded_at IS NULL 的常驻点编码，ETL 重跑零新增调用
+- 先 regeo 命中、再 around 兜底：regeo 无 POI 时才调周边搜索补一次
+- 行为语义：POI type 六位码前两位 → 行为标签（behavior）
 
 用法：
-    python -m gacore.weitrack.geocode            # 对全部无标签常驻点编码
-    python -m gacore.weitrack.geocode --label 家  # 给编码结果统一标"家"
+    python -m gacore.weitrack.geocode              # 增量编码（只编码未编码点）
+    python -m gacore.weitrack.geocode --all        # 强制全部重编码
+    python -m gacore.weitrack.geocode --label 家   # 给已编码结果统一标"家"（强制标注）
 
 依赖环境变量 AMAP_KEY（.env 中配置，高德 Web 服务 Key）。
 版权合规：结果展示需标注"高德地图"。
@@ -13,12 +21,77 @@ import argparse
 import json
 import os
 import sqlite3
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 DB_PATH = Path(__file__).resolve().parents[3] / "data" / "weitrack.db"
-AMAP_URL = "https://restapi.amap.com/v3/geocode/regeo"
+REVERSED_GEO_URL = "https://restapi.amap.com/v3/geocode/regeo"
+AROUND_URL = "https://restapi.amap.com/v3/place/around"
+
+# 批量档位：默认 20 点/次（高德上限），响应过大/失败逐级降级
+BATCH_SIZES = (20, 10, 5, 1)
+
+# POI type 中文大类（高德 regeo 返回 type 形如"餐饮服务;中餐厅;中餐馆"，
+# 第一段即大类中文名，非六位数字码）→ 行为语义（画像叙事用）
+BEHAVIOR_MAP = {
+    "汽车服务": "汽车服务",
+    "汽车销售": "汽车销售",
+    "汽车维修": "汽车维修",
+    "摩托车服务": "摩托车服务",
+    "餐饮服务": "用餐",
+    "购物服务": "购物",
+    "生活服务": "办事/日常",
+    "体育休闲服务": "健身/娱乐",
+    "医疗保健服务": "就医",
+    "住宿服务": "住宿/过夜",
+    "风景名胜": "游玩",
+    "商务住宅": "住宅/楼宇",
+    "政府机构及社会团体": "办事",
+    "科教文化服务": "学习/文化活动",
+    "交通设施服务": "出行中转",
+    "金融保险服务": "银行/金融",
+    "公司企业": "办公",
+    "道路附属设施": "道路设施",
+    "地名地址信息": "地名地址",
+    "公共设施": "公共设施",
+    "事件活动": "事件活动",
+    "室内设施": "室内设施",
+}
+
+
+# POI 名称品牌/类型硬信号（P1-2：name 命中即强化行为语义，弥补 type 大类映射的盲区）
+SIGNAL_KEYWORDS: tuple[tuple[str, str], ...] = (
+    ("医院", "就医"),
+    ("诊所", "就医"),
+    ("学校", "学习/文化活动"),
+    ("大学", "学习/文化活动"),
+    ("学院", "学习/文化活动"),
+    ("中学", "学习/文化活动"),
+    ("小学", "学习/文化活动"),
+    ("图书馆", "学习/文化活动"),
+    ("政府", "办事"),
+    ("政务", "办事"),
+    ("派出所", "办事"),
+    ("税务局", "办事"),
+    ("地铁", "出行中转"),
+    ("公交", "出行中转"),
+    ("车站", "出行中转"),
+    ("银行", "银行/金融"),
+    ("商场", "购物"),
+    ("购物中心", "购物"),
+    ("超市", "购物"),
+    ("影院", "娱乐"),
+    ("电影院", "娱乐"),
+    ("KTV", "娱乐"),
+    ("公园", "游玩"),
+    ("景区", "游玩"),
+    ("酒店", "住宿/过夜"),
+    ("健身", "健身/娱乐"),
+    ("体育馆", "健身/娱乐"),
+    ("体育场", "健身/娱乐"),
+)
 
 
 def _amap_key() -> str:
@@ -41,42 +114,243 @@ def _amap_key() -> str:
     return key
 
 
-def reverse_geocode(lat: float, lon: float, key: str) -> dict | None:
-    """调用高德 regeo 接口，返回地址/兴趣点信息。"""
+def behavior_of(poi_type: str, poi_name: str = "") -> str:
+    """POI type（中文大类）→ 行为语义。type 形如 '交通设施服务;地铁站;地铁站'，取第一段。
+
+    P1-2 增强：POI 名称硬信号（品牌/类型关键词）优先于 type 大类映射——
+    如名称含"医院/学校/地铁"等时直接采用对应行为，弥补大类映射盲区。
+    """
+    if poi_name:
+        for _kw, beh in SIGNAL_KEYWORDS:
+            if _kw in poi_name:
+                return beh
+    if not poi_type:
+        return "未知"
+    head = poi_type.split(";")[0].strip()
+    return BEHAVIOR_MAP.get(head, "未知")
+
+
+def _parse_regeocode(rc: dict) -> dict:
+    """解析单个点的 regeocode（兼容批量 regeocodes[i].regeocode 与单点 regeocode 两种结构）。"""
+    inner = rc.get("regeocode") or rc
+    formatted = inner.get("formatted_address", "")
+    address = inner.get("addressComponent", {})
+    pois = inner.get("pois") or []
+    aois = inner.get("aois") or []
+    business = inner.get("businessAreas") or []
+    roads = inner.get("roads") or []
+    poi = pois[0] if pois else {}
+    aoi = aois[0] if aois else {}
+    poi_type = poi.get("type", "") or ""
+    # 语义匹配粒度：POI > AOI > 道路 > 行政区
+    if poi:
+        matched_level = "POI"
+    elif aoi:
+        matched_level = "AOI"
+    elif roads:
+        matched_level = "道路"
+    else:
+        matched_level = "行政区"
+    # P1-2 POI 三级语义：高德 type 为"大类;中类;细类"（如"餐饮服务;中餐厅;中餐馆"）
+    type_levels = [t.strip() for t in poi_type.split(";") if t.strip()] if poi_type else []
+    poi_l1 = type_levels[0] if len(type_levels) > 0 else ""
+    poi_l2 = type_levels[1] if len(type_levels) > 1 else ""
+    poi_l3 = type_levels[2] if len(type_levels) > 2 else ""
+    # P1-2 品牌/名称硬信号：POI 名称命中关键词 → 强化行为语义
+    poi_signal = ""
+    name = poi.get("name", "") or ""
+    for kw, _beh in SIGNAL_KEYWORDS:
+        if kw in name:
+            poi_signal = kw
+            break
+    district = address.get("district", "")
+    township = address.get("township", "")
+    # P1-2 无 POI 兜底：AOI / 道路 / 行政区拼接成人话描述
+    if poi:
+        fallback_desc = f"{name}（{district}{township}）" if district or township else name
+    else:
+        parts: list[str] = []
+        if aois:
+            parts.append(aois[0].get("name", ""))
+        if roads:
+            parts.append(roads[0].get("name", ""))
+        if district or township:
+            parts.append(f"{district}{township}")
+        fallback_desc = "；".join(p for p in parts if p) or formatted
+    return {
+        "formatted": formatted,
+        "poi": name,
+        "poi_type": poi_type,
+        "poi_l1": poi_l1,
+        "poi_l2": poi_l2,
+        "poi_l3": poi_l3,
+        "poi_signal": poi_signal,
+        "poi_fallback": fallback_desc,
+        "province": address.get("province", ""),
+        "city": address.get("city", "") or address.get("province", ""),
+        "district": district,
+        "township": township,
+        "business_area": (business[0].get("name", "") if business else ""),
+        "road": (roads[0].get("name", "") if roads else ""),
+        "aoi": aoi.get("name", ""),
+        "matched_level": matched_level,
+    }
+
+
+# 高德 regeo 的"多点批量"在多数 Key（含当前 Key）下实测不生效：
+# 无论 location 传几个点（base/all），返回都是单点 regeocode 结构（只覆盖首点）。
+# 因此采用"探测式批量"：首次探测发现不支持 → 永久降级逐点单请求，并缓存结论避免反复探测。
+_SUPPORT_BATCH: bool | None = None
+
+
+def _probe_batch_support(key: str) -> bool:
+    """探测当前 Key 是否真正支持多点批量 regeo。结果模块级缓存，只探测一次。"""
+    global _SUPPORT_BATCH
+    if _SUPPORT_BATCH is not None:
+        return _SUPPORT_BATCH
+    pts = [(31.99, 118.78), (31.99 + 0.001, 118.78)]
+    out, failed = _regeo_request(pts, key)
+    _SUPPORT_BATCH = (not failed)
+    if not _SUPPORT_BATCH:
+        print("[geocode] 当前 Key 不支持多点批量 regeo（返回单点结构），已降级为逐点编码")
+    return _SUPPORT_BATCH
+
+
+def _regeo_one(lat: float, lon: float, key: str) -> dict | None:
+    """单点 regeo(extensions=all)，返回完整语义 dict；失败返回 None。"""
     params = urllib.parse.urlencode({
-        "location": f"{lon},{lat}",  # 高德要求 经度,纬度
+        "location": f"{lon},{lat}",
         "key": key,
-        "extensions": "base",
+        "extensions": "all",
         "radius": "500",
     })
     try:
-        with urllib.request.urlopen(f"{AMAP_URL}?{params}", timeout=10) as resp:
+        with urllib.request.urlopen(f"{REVERSED_GEO_URL}?{params}", timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        if data.get("status") != "1":
-            return None
-        regeocode = data.get("regeocode", {})
-        formatted = regeocode.get("formatted_address", "")
-        address = regeocode.get("addressComponent", {})
-        # 语义标签：优先用 poi 名称（公司/小区/商场），回退行政区
-        poi_name = ""
-        pois = regeocode.get("pois") or []
-        if pois:
-            poi_name = pois[0].get("name", "")
-        return {
-            "formatted": formatted,
-            "poi": poi_name,
-            "province": address.get("province", ""),
-            "city": address.get("city", "") or address.get("province", ""),
-            "district": address.get("district", ""),
-            "township": address.get("township", ""),
-        }
     except Exception as e:
-        print(f"[geocode] 请求失败 ({lat},{lon}): {e}")
+        print(f"[geocode] 单点请求失败 ({lat},{lon}): {e}")
         return None
+    if data.get("status") != "1":
+        return None
+    info = _parse_regeocode(data.get("regeocode") or {})
+    return info if info.get("formatted") else None
+
+
+def _regeo_request(points: list[tuple[float, float]], key: str) -> tuple[dict, list[int]]:
+    """请求一组点（批量 regeo）。返回 ({idx: info}, 失败idx列表)。"""
+    if not points:
+        return {}, []
+    locs = "|".join(f"{lon},{lat}" for lat, lon in points)
+    params = urllib.parse.urlencode({
+        "location": locs,
+        "key": key,
+        "extensions": "all",
+        "radius": "500",
+    })
+    try:
+        with urllib.request.urlopen(f"{REVERSED_GEO_URL}?{params}", timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[geocode] 批量请求失败({len(points)}点): {e}")
+        return {}, list(range(len(points)))
+    if data.get("status") != "1":
+        return {}, list(range(len(points)))
+    regeocodes = data.get("regeocodes")
+    if not isinstance(regeocodes, list):
+        # 不支持批量：返回的是单点 regeocode（只覆盖首点），不可信 → 全部视为失败
+        return {}, list(range(len(points)))
+    out: dict[int, dict] = {}
+    failed: list[int] = []
+    for i, rc in enumerate(regeocodes):
+        if not rc:
+            failed.append(i)
+            continue
+        info = _parse_regeocode(rc)
+        if info.get("formatted"):
+            out[i] = info
+        else:
+            failed.append(i)
+    # 响应数量不足（被截断/超限）也视为失败
+    for i in range(len(points)):
+        if i not in out:
+            failed.append(i)
+    return out, failed
+
+
+def batch_reverse_geocode(points: list[tuple[float, float]], key: str) -> tuple[dict, list[int]]:
+    """高德 regeo 编码入口：优先多点批量（20 点/次，失败按 10/5/1 降级）；
+    若 Key 不支持批量（实测返回单点结构），自动降级为逐点单请求。
+
+    返回 ({idx: info}, 最终失败 idx 列表)。不抛异常，失败点留待下次增量重试。
+    """
+    results: dict[int, dict] = {}
+    pending: list[tuple[int, tuple[float, float]]] = list(enumerate(points))
+    if not pending:
+        return results, []
+    support_batch = _probe_batch_support(key)
+    if not support_batch:
+        # 逐点单请求：每次 1 点，可靠性最高；成本受增量缓存控制（每天仅新增点）
+        failed: list[int] = []
+        for original_idx, (lat, lon) in pending:
+            info = _regeo_one(lat, lon, key)
+            if info:
+                results[original_idx] = info
+            else:
+                failed.append(original_idx)
+        return results, failed
+    for batch_size in BATCH_SIZES:
+        if not pending:
+            break
+        # 按 batch_size 分组
+        groups = [pending[i:i + batch_size] for i in range(0, len(pending), batch_size)]
+        still_failed: list[tuple[int, tuple[float, float]]] = []
+        for group in groups:
+            idxs = [p[0] for p in group]
+            pts = [p[1] for p in group]
+            out, failed_local = _regeo_request(pts, key)
+            for j, original_idx in enumerate(idxs):
+                if j in out:
+                    results[original_idx] = out[j]
+                else:
+                    still_failed.append((original_idx, pts[j]))
+        pending = still_failed
+    failed = [p[0] for p in pending]
+    return results, failed
+
+
+def reverse_geocode(lat: float, lon: float, key: str) -> dict | None:
+    """单点 regeo(extensions=all)，返回完整语义 dict（供 label_places 交互确认展示）。"""
+    out, failed = batch_reverse_geocode([(lat, lon)], key)
+    if failed:
+        return None
+    return out.get(0)
+
+
+def around_search(lat: float, lon: float, key: str, radius: int = 500) -> dict | None:
+    """周边搜索兜底：regeo 无 POI 时按坐标检索最近 POI 补行为语义。"""
+    params = urllib.parse.urlencode({
+        "location": f"{lon},{lat}",
+        "key": key,
+        "radius": str(radius),
+        "extensions": "base",
+    })
+    try:
+        with urllib.request.urlopen(f"{AROUND_URL}?{params}", timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        print(f"[geocode] 周边搜索失败 ({lat},{lon}): {e}")
+        return None
+    if data.get("status") != "1":
+        return None
+    pois = data.get("pois") or []
+    if not pois:
+        return None
+    p = pois[0]
+    return {"poi": p.get("name", ""), "poi_type": p.get("type", "")}
 
 
 def infer_label(info: dict | None) -> str:
-    """根据逆编码结果推断常驻点语义：家 / 公司 / 未知。"""
+    """根据逆编码结果推断常驻点语义（保留兼容；家/公司改由置信度候选系统决定）。"""
     if not info:
         return "未知"
     text = " ".join([info.get("poi", ""), info.get("formatted", "")])
@@ -89,42 +363,120 @@ def infer_label(info: dict | None) -> str:
     return "未知"
 
 
-def run(db_path: Path = DB_PATH, label: str | None = None) -> None:
+def incremental_encode(db_path: Path = DB_PATH, force_all: bool = False) -> int:
+    """增量编码：只对 geocoded_at IS NULL 的常驻点调用高德 regeo（force_all 则全部重编）。
+
+    语义字段全量落库；regeo 无 POI 时 around 兜底补一次；成功才标 geocoded_at，
+    失败点不标记、下次 ETL 重跑自动重试。ETL 重跑时无新增点 → 零 API 调用。
+    返回成功编码数。
+    """
     key = _amap_key()
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-
-    rows = conn.execute(
-        "SELECT id, lat, lon, label, visit_count FROM places ORDER BY visit_count DESC"
-    ).fetchall()
+    if force_all:
+        rows = conn.execute("SELECT id, lat, lon, grid_key FROM places").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, lat, lon, grid_key FROM places WHERE geocoded_at IS NULL"
+        ).fetchall()
+    if not rows:
+        print("[geocode] 无新增待编码常驻点（增量缓存命中，零调用）")
+        conn.close()
+        return 0
     print(f"[geocode] 待编码常驻点: {len(rows)} 个")
 
-    for r in rows:
-        # 已有明确标签（家/公司）且非本次强制覆盖，跳过
-        if r["label"] in ("家", "公司") and label is None:
+    points = [(r["lat"], r["lon"]) for r in rows]
+    results, failed = batch_reverse_geocode(points, key)
+
+    now = int(time.time() * 1000)
+    n = 0
+    for i, r in enumerate(rows):
+        if i not in results:
             continue
-        info = reverse_geocode(r["lat"], r["lon"], key)
-        new_label = label or (infer_label(info) if info else "未知")
-        addr = info.get("formatted", "") if info else ""
-        poi = info.get("poi", "") if info else ""
-        print(f"  ({r['lat']:.4f},{r['lon']:.4f}) 访问{r['visit_count']}次 → "
-              f"[{new_label}] {poi} | {addr}")
+        info = results[i]
+        # around 兜底：regeo 无 POI 时补一次周边搜索
+        if not info.get("poi"):
+            around = around_search(r["lat"], r["lon"], key)
+            if around:
+                info.update(around)
+                # 周边搜索返回 base 结构，补充三级/信号/兜底字段
+                tl = [t.strip() for t in (info.get("poi_type") or "").split(";") if t.strip()]
+                info.setdefault("poi_l1", tl[0] if len(tl) > 0 else "")
+                info.setdefault("poi_l2", tl[1] if len(tl) > 1 else "")
+                info.setdefault("poi_l3", tl[2] if len(tl) > 2 else "")
+                sig = ""
+                for _kw, _b in SIGNAL_KEYWORDS:
+                    if _kw in (info.get("poi") or ""):
+                        sig = _kw
+                        break
+                info.setdefault("poi_signal", sig)
+                info.setdefault("poi_fallback", info.get("poi") or "")
+        behavior = behavior_of(info.get("poi_type", ""), info.get("poi", ""))
         conn.execute(
-            "UPDATE places SET label=? WHERE id=?",
-            (new_label, r["id"]),
+            "UPDATE places SET address=?, poi=?, district=?, township=?, business_area=?, "
+            "poi_type=?, matched_level=?, behavior=?, poi_l1=?, poi_l2=?, poi_l3=?, "
+            "poi_signal=?, poi_fallback=?, geocoded_at=? WHERE id=?",
+            (
+                info.get("formatted", ""), info.get("poi", ""), info.get("district", ""),
+                info.get("township", ""), info.get("business_area", ""),
+                info.get("poi_type", ""), info.get("matched_level", ""),
+                behavior, info.get("poi_l1", ""), info.get("poi_l2", ""),
+                info.get("poi_l3", ""), info.get("poi_signal", ""),
+                info.get("poi_fallback", ""), now, r["id"],
+            ),
         )
+        n += 1
     conn.commit()
     conn.close()
-    print("[geocode] 完成")
+    if failed:
+        print(f"[geocode] 失败 {len(failed)} 点（未标 geocoded_at，下次重试）")
+    print(f"[geocode] 完成，成功编码 {n} 个常驻点")
+    return n
+
+
+def refresh_behavior(db_path: Path = DB_PATH) -> int:
+    """刷新已编码点的 behavior（不调 API）：基于现有 poi_type 中文大类 + 名称硬信号重算。"""
+    conn = sqlite3.connect(db_path)
+    rows = conn.execute(
+        "SELECT id, poi_type, poi FROM places WHERE poi IS NOT NULL AND poi != ''"
+    ).fetchall()
+    n = 0
+    for pid, pt, pn in rows:
+        b = behavior_of(pt, pn)
+        conn.execute("UPDATE places SET behavior=? WHERE id=?", (b, pid))
+        n += 1
+    conn.commit()
+    conn.close()
+    return n
+
+
+def run(db_path: Path = DB_PATH, label: str | None = None, force_all: bool = False) -> None:
+    key = _amap_key()  # 提前校验 key，避免走到一半才发现缺配置
+    n = incremental_encode(db_path, force_all=force_all)
+    if label:
+        conn = sqlite3.connect(db_path)
+        cur = conn.execute(
+            "UPDATE places SET label=? WHERE geocoded_at IS NOT NULL", (label,)
+        )
+        conn.commit()
+        conn.close()
+        print(f"[geocode] 强制标注 [{label}]: {cur.rowcount} 个已编码常驻点")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="高德逆地理编码")
+    parser = argparse.ArgumentParser(description="高德逆地理编码（L2 语义化增量编码）")
     parser.add_argument("--db", type=Path, default=DB_PATH)
+    parser.add_argument("--all", action="store_true", help="强制全部重编码（忽略增量缓存）")
     parser.add_argument("--label", type=str, default=None,
-                        help="强制指定标签（如 家/公司），不传则自动推断")
+                        help="给已编码常驻点强制统一标标签（如 家/公司），不传则不覆盖 label")
+    parser.add_argument("--rebehavior", action="store_true",
+                        help="仅刷新已编码点的 behavior（不调 API），基于 poi_type 中文大类重算")
     args = parser.parse_args()
-    run(args.db, args.label)
+    if args.rebehavior:
+        n = refresh_behavior(args.db)
+        print(f"[geocode] 刷新 behavior 完成: {n} 条")
+        return
+    run(args.db, args.label, args.all)
 
 
 if __name__ == "__main__":
