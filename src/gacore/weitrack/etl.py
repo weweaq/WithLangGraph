@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
 import sqlite3
 import time
 from collections import defaultdict
@@ -198,6 +199,29 @@ CREATE TABLE IF NOT EXISTS trips (
 );
 CREATE INDEX IF NOT EXISTS idx_trips_device ON trips(device_id);
 CREATE INDEX IF NOT EXISTS idx_trips_day ON trips(day);
+
+-- P1 路过网格统计（通勤带）：trips.polyline 网格量化后的高频经过网格（纯本地，零配额）
+CREATE TABLE IF NOT EXISTS route_grids (
+  device_id TEXT NOT NULL,
+  day TEXT NOT NULL,
+  grid_lat REAL NOT NULL,
+  grid_lon REAL NOT NULL,
+  n_pass INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER,
+  PRIMARY KEY(device_id, day, grid_lat, grid_lon)
+);
+CREATE INDEX IF NOT EXISTS idx_route_grids_grid ON route_grids(grid_lat, grid_lon);
+
+-- P2 沿途 POI（网格级缓存）：每个网格最多一条周边 POI（around 100 次/日，低频克制）
+CREATE TABLE IF NOT EXISTS grid_pois (
+  grid_lat REAL NOT NULL,
+  grid_lon REAL NOT NULL,
+  name TEXT,
+  type TEXT,
+  distance TEXT,
+  queried_at INTEGER,
+  PRIMARY KEY(grid_lat, grid_lon)
+);
 """
 
 
@@ -860,7 +884,11 @@ def purge_dirty(db_path: Path) -> None:
     conn.close()
 
 
-def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool = True, run_route: bool = True) -> None:
+# P2 沿途 POI 每轮 ETL 查询网格上限（around 免费配额仅 100 次/日，克制）
+_POI_MAX_PER_RUN = int(os.environ.get("WEITRACK_POI_MAX_PER_RUN", "5"))
+
+
+def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool = True, run_route: bool = True, run_poi: bool = True) -> None:
     conn = sqlite3.connect(db_path)
     conn.executescript(_SCHEMA)
     # 迁移：旧 places 表补 is_primary 列（新库已含）
@@ -998,6 +1026,22 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool
     n_rc = detect_route_changes(conn)
     conn.close()
     print(f"[etl] route_change 路线变化事件: {n_rc} 条")
+    # P1：路过网格统计（通勤带）——纯本地零配额，全量重建
+    try:
+        from gacore.weitrack import routes as _routes_p1
+        n_g = _routes_p1.build_route_grids(db_path)
+        print(f"[etl] 路过网格统计(通勤带): {n_g} 行")
+    except Exception as e:
+        print(f"[etl] 路过网格统计失败(不影响 ETL): {e}")
+    # P2：沿途 POI（around 100 次/日受限，默认每轮最多 5 网格，网格级缓存去重）
+    if run_poi:
+        try:
+            n_p = routes.encode_belt_pois(db_path, limit=_POI_MAX_PER_RUN)
+            print(f"[etl] 沿途 POI 编码: {n_p} 个网格")
+        except SystemExit as e:
+            print(f"[etl] 跳过沿途 POI 编码: {e}")
+        except Exception as e:
+            print(f"[etl] 沿途 POI 编码失败(不影响 ETL): {e}")
     print("[etl] 完成")
 
 
@@ -1007,10 +1051,11 @@ def main() -> None:
     parser.add_argument("--purge", action="store_true", help="先清理异常事件再重建事实表")
     parser.add_argument("--no-geocode", action="store_true", help="跳过高德增量 regeo 编码")
     parser.add_argument("--no-route", action="store_true", help="跳过高德路径规划补路(L3)")
+    parser.add_argument("--no-poi", action="store_true", help="跳过沿途 POI 编码(P2)")
     args = parser.parse_args()
     if args.purge:
         purge_dirty(args.db)
-    run(args.db, run_geocode=not args.no_geocode, run_route=not args.no_route)
+    run(args.db, run_geocode=not args.no_geocode, run_route=not args.no_route, run_poi=not args.no_poi)
 
 
 if __name__ == "__main__":

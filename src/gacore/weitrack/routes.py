@@ -29,6 +29,10 @@ from pathlib import Path
 DB_PATH = Path(__file__).resolve().parents[3] / "data" / "weitrack.db"
 # 步行路径规划（上限 100km，最宽）；骑行/驾车可经 WEITRACK_ROUTE_MODE 切换
 DIRECTION_URL = "https://restapi.amap.com/v3/direction/walking"
+# 周边搜索（免费配额仅 100 次/日，P2 沿途 POI 必须网格级缓存 + 低频克制）
+AROUND_URL = "https://restapi.amap.com/v3/place/around"
+# 网格边长（route_key 与路过网格统计共用，≈330m，吸收端点微差）
+_GRID = 0.003
 
 # 移动段识别阈值
 TRIP_MIN_DURATION_MS = 60_000          # 移动段最短时长 60s
@@ -246,6 +250,108 @@ def run(db_path: Path = DB_PATH, force_all: bool = False) -> None:
         conn.commit()
         conn.close()
     incremental_encode_trips(db_path)
+
+
+def _grid_of(lat: float, lon: float, grid: float = _GRID) -> tuple[float, float]:
+    """坐标 → 网格键（与 route_key 网格量化一致，≈330m）。"""
+    return round(lat / grid) * grid, round(lon / grid) * grid
+
+
+def build_route_grids(db_path: Path = DB_PATH) -> int:
+    """P1 路过网格统计（通勤带）：从 trips.polyline 全量重建 route_grids 表。
+
+    纯本地计算（网格量化 + 聚合），零高德配额。每段路线的网格集合去重后，
+    按 (device_id, day, grid) 累计 n_pass（每段经过该网格计 1 次）。
+    高频多日网格 = 通勤走廊/常走路段。返回写入行数。
+    """
+    conn = sqlite3.connect(db_path)
+    conn.execute("DELETE FROM route_grids")
+    rows = conn.execute(
+        "SELECT device_id, day, polyline FROM trips WHERE polyline IS NOT NULL"
+    ).fetchall()
+    agg: dict[tuple, int] = defaultdict(int)
+    for device_id, day, pl in rows:
+        try:
+            pts = json.loads(pl)
+        except Exception:
+            continue
+        cells = set()
+        for lat, lon in pts:
+            cells.add(_grid_of(lat, lon))
+        for gk_lat, gk_lon in cells:
+            agg[(device_id, day, gk_lat, gk_lon)] += 1
+    now = int(time.time() * 1000)
+    data = [
+        (dev, day, gk_lat, gk_lon, cnt, now)
+        for (dev, day, gk_lat, gk_lon), cnt in agg.items()
+    ]
+    conn.executemany(
+        "INSERT OR REPLACE INTO route_grids(device_id, day, grid_lat, grid_lon, n_pass, updated_at) "
+        "VALUES (?,?,?,?,?,?)", data,
+    )
+    conn.commit()
+    conn.close()
+    print(f"[routes] 路过网格统计(通勤带): {len(data)} 行")
+    return len(data)
+
+
+def encode_belt_pois(db_path: Path = DB_PATH, limit: int = 5) -> int:
+    """P2 沿途 POI：对通勤带高频网格增量 around 查询（网格级缓存，低频克制）。
+
+    around 免费配额仅 100 次/日，必须克制：只取 route_grids 中按累计路过次数
+    排名靠前、且 grid_pois 尚未缓存的网格；每网格查最近 1 个 POI 落库。
+    默认单次最多 limit 个（5），多轮 ETL 累积覆盖整个通勤带。返回新增 POI 网格数。
+    """
+    key = _amap_key()
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cand = conn.execute(
+        "SELECT g.grid_lat AS glat, g.grid_lon AS glon, SUM(g.n_pass) AS total "
+        "FROM route_grids g LEFT JOIN grid_pois p "
+        "  ON g.grid_lat = p.grid_lat AND g.grid_lon = p.grid_lon "
+        "WHERE p.grid_lat IS NULL "
+        "GROUP BY g.grid_lat, g.grid_lon ORDER BY total DESC LIMIT ?", (limit,)
+    ).fetchall()
+    if not cand:
+        print("[routes] 无新增沿途 POI 待查网格（网格级缓存命中，零调用）")
+        conn.close()
+        return 0
+    n = 0
+    now = int(time.time() * 1000)
+    for r in cand:
+        time.sleep(0.5)
+        params = urllib.parse.urlencode({
+            "location": f"{r['glon']},{r['glat']}",
+            "key": key, "radius": 300, "offset": 1, "extensions": "base",
+        })
+        try:
+            with urllib.request.urlopen(f"{AROUND_URL}?{params}", timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            print(f"[routes] around 失败 ({r['glat']},{r['glon']}): {e}")
+            continue
+        if data.get("status") != "1":
+            print(f"[routes] around 业务失败: {data.get('info')}")
+            continue
+        pois = data.get("pois") or []
+        if not pois:
+            conn.execute(
+                "INSERT OR REPLACE INTO grid_pois(grid_lat, grid_lon, name, type, distance, queried_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (r["glat"], r["glon"], "", "", None, now),
+            )
+            continue
+        po = pois[0]
+        conn.execute(
+            "INSERT OR REPLACE INTO grid_pois(grid_lat, grid_lon, name, type, distance, queried_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (r["glat"], r["glon"], po.get("name", ""), po.get("type", ""), po.get("distance"), now),
+        )
+        n += 1
+    conn.commit()
+    conn.close()
+    print(f"[routes] 沿途 POI 编码: {n} 个网格")
+    return n
 
 
 def main() -> None:
