@@ -813,7 +813,7 @@ def _kill_stale_instances(exclude_pid: int) -> int:
     A process counts as ours when its command line (lower-cased) contains
     "start.py" or "withlanggraph" — this covers `python start.py` and
     `python -m gacore.frontends.qq` runs from this repo, while leaving unrelated
-    python services (e.g. gacore.weitrack launched from another repo) untouched.
+    python services (e.g. gacore.langtrack launched from another repo) untouched.
     """
     killed = 0
     try:

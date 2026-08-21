@@ -8,9 +8,9 @@
 - 行为语义：POI type 六位码前两位 → 行为标签（behavior）
 
 用法：
-    python -m gacore.weitrack.geocode              # 增量编码（只编码未编码点）
-    python -m gacore.weitrack.geocode --all        # 强制全部重编码
-    python -m gacore.weitrack.geocode --label 家   # 给已编码结果统一标"家"（强制标注）
+    python -m gacore.langtrack.geocode              # 增量编码（只编码未编码点）
+    python -m gacore.langtrack.geocode --all        # 强制全部重编码
+    python -m gacore.langtrack.geocode --label 家   # 给已编码结果统一标"家"（强制标注）
 
 依赖环境变量 AMAP_KEY（.env 中配置，高德 Web 服务 Key）。
 版权合规：结果展示需标注"高德地图"。
@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parents[3] / "data" / "weitrack.db"
+DB_PATH = Path(__file__).resolve().parents[3] / "data" / "langtrack.db"
 REVERSED_GEO_URL = "https://restapi.amap.com/v3/geocode/regeo"
 AROUND_URL = "https://restapi.amap.com/v3/place/around"
 

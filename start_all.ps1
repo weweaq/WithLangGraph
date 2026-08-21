@@ -1,4 +1,4 @@
-# start_all.ps1 - single-window launcher (weitrack + gacore)
+# start_all.ps1 - single-window launcher (langtrack + gacore)
 # Usage: run in PowerShell:  .\start_all.ps1
 # Both services run as background jobs; logs stream to this window with prefixes.
 # Ctrl+C or closing the window stops both. ASCII-only to avoid BOM/encoding issues.
@@ -6,17 +6,17 @@ $ErrorActionPreference = "Continue"
 
 $ROOT = "D:\AAAmyPrj\github\myrepos\WithLangGraph"
 $PORT = 8000
-# weitrack needs .venv (has uvicorn); gacore uses py12 (main env)
-$PY_WEITRACK = "$ROOT\.venv\Scripts\python.exe"
+# langtrack needs .venv (has uvicorn); gacore uses py12 (main env)
+$PY_LANGTRACK = "$ROOT\.venv\Scripts\python.exe"
 $PY_GACORE = "D:\softwares\miniconda\envs\py12\python.exe"
 
 Write-Host "============================================" -ForegroundColor Cyan
-Write-Host " [gacore] single-window launch (QQ Bot + Scheduler + Weitrack)" -ForegroundColor Cyan
+Write-Host " [gacore] single-window launch (QQ Bot + Scheduler + Langtrack)" -ForegroundColor Cyan
 Write-Host "============================================" -ForegroundColor Cyan
 
-Write-Host "[1/3] Stopping old instances (weitrack :$PORT) ..."
+Write-Host "[1/3] Stopping old instances (langtrack :$PORT) ..."
 Get-CimInstance Win32_Process -Filter "Name like 'python%'" |
-    Where-Object { $_.CommandLine -match 'gacore\.weitrack|start\.py' } |
+    Where-Object { $_.CommandLine -match 'gacore\.langtrack|start\.py' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Milliseconds 800
 
@@ -30,15 +30,15 @@ if ($conn) {
 }
 Write-Host "[1/3] old instances cleaned" -ForegroundColor Green
 
-Write-Host "[2/3] Starting weitrack (:${PORT}) and gacore ..."
+Write-Host "[2/3] Starting langtrack (:${PORT}) and gacore ..."
 $env:PYTHONPATH = "$ROOT\src"
 
-$weitrackJob = Start-Job -Name weitrack -ScriptBlock {
+$langtrackJob = Start-Job -Name langtrack -ScriptBlock {
     param($Root, $Py, $Port)
     Set-Location $Root
     $env:PYTHONPATH = "$Root\src"
-    & $Py -m gacore.weitrack --host 0.0.0.0 --port $Port 2>&1
-} -ArgumentList $ROOT, $PY_WEITRACK, $PORT
+    & $Py -m gacore.langtrack --host 0.0.0.0 --port $Port 2>&1
+} -ArgumentList $ROOT, $PY_LANGTRACK, $PORT
 
 $gacoreJob = Start-Job -Name gacore -ScriptBlock {
     param($Root, $Py)
@@ -55,12 +55,12 @@ Write-Host "--------------------------------------------" -ForegroundColor DarkG
 try {
     while ($true) {
         $alive = $false
-        foreach ($job in @($weitrackJob, $gacoreJob)) {
+        foreach ($job in @($langtrackJob, $gacoreJob)) {
             if ($null -ne $job -and $job.State -ne 'Completed' -and $job.State -ne 'Failed') {
                 $alive = $true
                 Receive-Job -Job $job -ErrorAction SilentlyContinue | ForEach-Object {
-                    $prefix = if ($job.Name -eq 'weitrack') { '[weitrack]' } else { '[gacore]  ' }
-                    $color = if ($job.Name -eq 'weitrack') { 'Yellow' } else { 'White' }
+                    $prefix = if ($job.Name -eq 'langtrack') { '[langtrack]' } else { '[gacore]  ' }
+                    $color = if ($job.Name -eq 'langtrack') { 'Yellow' } else { 'White' }
                     Write-Host ("{0} {1}" -f $prefix, $_) -ForegroundColor $color
                 }
             }
@@ -74,14 +74,14 @@ try {
 }
 finally {
     Write-Host "Stopping all services ..." -ForegroundColor Yellow
-    foreach ($job in @($weitrackJob, $gacoreJob)) {
+    foreach ($job in @($langtrackJob, $gacoreJob)) {
         if ($null -ne $job) {
             Stop-Job -Job $job -ErrorAction SilentlyContinue
             Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
         }
     }
     Get-CimInstance Win32_Process -Filter "Name like 'python%'" |
-        Where-Object { $_.CommandLine -match 'gacore\.weitrack|start\.py' } |
+        Where-Object { $_.CommandLine -match 'gacore\.langtrack|start\.py' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Write-Host "All stopped." -ForegroundColor Green
 }

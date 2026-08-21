@@ -1,4 +1,4 @@
-"""python -m gacore.weitrack 启动接收服务。"""
+"""python -m gacore.langtrack 启动接收服务。"""
 from __future__ import annotations
 
 import argparse
@@ -6,21 +6,21 @@ from pathlib import Path
 
 import uvicorn
 
-from gacore.weitrack.server import create_app
-from gacore.weitrack.storage import Storage
+from gacore.langtrack.server import create_app
+from gacore.langtrack.storage import Storage
 
-# 项目根目录：src/gacore/weitrack/__main__.py -> 项目根
+# 项目根目录：src/gacore/langtrack/__main__.py -> 项目根
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="weiTrack ingest server")
+    parser = argparse.ArgumentParser(description="langTrack ingest server")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     # 默认落到项目 data/ 目录，持久安全，不随启动目录变化
     parser.add_argument(
         "--db",
-        default=str(_PROJECT_ROOT / "data" / "weitrack.db"),
+        default=str(_PROJECT_ROOT / "data" / "langtrack.db"),
         help="SQLite 文件路径",
     )
     args = parser.parse_args()

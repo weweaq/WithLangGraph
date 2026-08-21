@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from gacore.weitrack.schemas import IngestRequest
+from gacore.langtrack.schemas import IngestRequest
 
 
 def test_valid_request():

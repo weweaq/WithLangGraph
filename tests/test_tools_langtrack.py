@@ -1,4 +1,4 @@
-"""Tests for gacore.tools.weitrack_tools — fully mocked, no real DB / ETL / network."""
+"""Tests for gacore.tools.langtrack_tools — fully mocked, no real DB / ETL / network."""
 
 from __future__ import annotations
 
@@ -8,18 +8,18 @@ import sys
 import types
 from pathlib import Path
 
-import gacore.tools.weitrack_tools as weitrack_mod
+import gacore.tools.langtrack_tools as langtrack_mod
 
 # Ensure we have the real module (not the StructuredTool shadowed in __init__.py).
-if not isinstance(weitrack_mod, types.ModuleType):
-    weitrack_mod = sys.modules["gacore.tools.weitrack_tools"]
+if not isinstance(langtrack_mod, types.ModuleType):
+    langtrack_mod = sys.modules["gacore.tools.langtrack_tools"]
 
-from gacore.tools.weitrack_tools import weitrack_stats
+from gacore.tools.langtrack_tools import langtrack_stats
 
 
 def _make_db(root: Path, day: str, with_stats: bool = True) -> None:
-    """Build a minimal weitrack.db with daily_stats / places / events for a day."""
-    db = root / "data" / "weitrack.db"
+    """Build a minimal langtrack.db with daily_stats / places / events for a day."""
+    db = root / "data" / "langtrack.db"
     db.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db)
     conn.executescript(
@@ -80,19 +80,19 @@ def _make_db(root: Path, day: str, with_stats: bool = True) -> None:
 def test_registered_in_tool_names():
     """工具必须在 registry 中注册（外挂式：import + TOOL_NAMES + _TOOLS 三处）。"""
     from gacore.tools import TOOL_NAMES, build_tool_list
-    assert "weitrack_stats" in TOOL_NAMES
+    assert "langtrack_stats" in TOOL_NAMES
     names = [t.name for t in build_tool_list(None)]
-    assert "weitrack_stats" in names
+    assert "langtrack_stats" in names
 
 
 def test_stats_returns_day_profile(monkeypatch, tmp_path):
     """正常路径：返回结构化画像。"""
     _make_db(tmp_path, "2026-08-18", with_stats=True)
-    monkeypatch.setattr(weitrack_mod, "_DEFAULT_ROOT", tmp_path)
+    monkeypatch.setattr(langtrack_mod, "_DEFAULT_ROOT", tmp_path)
     # 跳过真实 ETL（子进程）
-    monkeypatch.setattr(weitrack_mod, "_ensure_etl", lambda: True)
+    monkeypatch.setattr(langtrack_mod, "_ensure_etl", lambda: True)
 
-    r = weitrack_stats.invoke({"day": "2026-08-18"})
+    r = langtrack_stats.invoke({"day": "2026-08-18"})
     assert r["available"] is True
     assert r["day"] == "2026-08-18"
     assert r["screen_hours"] == round(7_000_000 / 3600000, 2)
@@ -105,20 +105,20 @@ def test_stats_returns_day_profile(monkeypatch, tmp_path):
 def test_stats_no_data_returns_unavailable(monkeypatch, tmp_path):
     """无当日数据：available=False + 说明。"""
     _make_db(tmp_path, "2026-08-18", with_stats=False)
-    monkeypatch.setattr(weitrack_mod, "_DEFAULT_ROOT", tmp_path)
-    monkeypatch.setattr(weitrack_mod, "_ensure_etl", lambda: True)
+    monkeypatch.setattr(langtrack_mod, "_DEFAULT_ROOT", tmp_path)
+    monkeypatch.setattr(langtrack_mod, "_ensure_etl", lambda: True)
 
-    r = weitrack_stats.invoke({"day": "2026-08-18"})
+    r = langtrack_stats.invoke({"day": "2026-08-18"})
     assert r["available"] is False
     assert "无数据" in r["sleep_signal"]
 
 
 def test_stats_missing_db_returns_unavailable(monkeypatch, tmp_path):
     """数据库不存在：available=False，不抛异常。"""
-    monkeypatch.setattr(weitrack_mod, "_DEFAULT_ROOT", tmp_path)
-    monkeypatch.setattr(weitrack_mod, "_ensure_etl", lambda: True)
+    monkeypatch.setattr(langtrack_mod, "_DEFAULT_ROOT", tmp_path)
+    monkeypatch.setattr(langtrack_mod, "_ensure_etl", lambda: True)
 
-    r = weitrack_stats.invoke({"day": "2026-08-18"})
+    r = langtrack_stats.invoke({"day": "2026-08-18"})
     assert r["available"] is False
     assert "不存在" in r["sleep_signal"]
 
@@ -126,21 +126,21 @@ def test_stats_missing_db_returns_unavailable(monkeypatch, tmp_path):
 def test_stats_etl_failure_does_not_block(monkeypatch, tmp_path):
     """ETL 失败不阻塞：返回旧数据或 unavailable。"""
     _make_db(tmp_path, "2026-08-18", with_stats=True)
-    monkeypatch.setattr(weitrack_mod, "_DEFAULT_ROOT", tmp_path)
-    monkeypatch.setattr(weitrack_mod, "_ensure_etl", lambda: False)
+    monkeypatch.setattr(langtrack_mod, "_DEFAULT_ROOT", tmp_path)
+    monkeypatch.setattr(langtrack_mod, "_ensure_etl", lambda: False)
 
-    r = weitrack_stats.invoke({"day": "2026-08-18"})
+    r = langtrack_stats.invoke({"day": "2026-08-18"})
     assert r["available"] is True  # ETL 失败但仍读到旧事实表
 
 
 def test_stats_db_error_returns_message(monkeypatch, tmp_path):
     """DB 读取异常：返回错误信息而非抛出。"""
-    monkeypatch.setattr(weitrack_mod, "_DEFAULT_ROOT", tmp_path)
-    monkeypatch.setattr(weitrack_mod, "_ensure_etl", lambda: True)
+    monkeypatch.setattr(langtrack_mod, "_DEFAULT_ROOT", tmp_path)
+    monkeypatch.setattr(langtrack_mod, "_ensure_etl", lambda: True)
     # 建一个损坏的 db 文件
     (tmp_path / "data").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "data" / "weitrack.db").write_bytes(b"not a database")
+    (tmp_path / "data" / "langtrack.db").write_bytes(b"not a database")
 
-    r = weitrack_stats.invoke({"day": "2026-08-18"})
+    r = langtrack_stats.invoke({"day": "2026-08-18"})
     assert r["available"] is False
     assert "读取失败" in r["sleep_signal"]

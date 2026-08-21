@@ -1,6 +1,6 @@
-# weiTrack ETL 数据清洗详解
+# langTrack ETL 数据清洗详解
 
-> 对应代码：`src/gacore/weitrack/etl.py`
+> 对应代码：`src/gacore/langtrack/etl.py`
 > 本文档逐条对应代码实现，讲清楚"每一条脏数据从哪来、为什么被清、清了之后数据变成什么样"。
 >
 > **数据基准**：本文所有"当前库"数字均为 2026-08-19 全量重跑结果（events 6360 / 脏数据 77 / sessions 413 / daily_stats 4 / places 14）。历史运行数字单独标注「历史值」。

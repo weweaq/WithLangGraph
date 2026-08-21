@@ -211,11 +211,11 @@ python -m gacore.scheduler
 
 前台运行，`Ctrl-C` 停止。job 定义在 `config/schedule.json`，支持热更新——无需重启。
 
-### 接收服务（weiTrackApp 数据接收）
+### 接收服务（langTrackApp 数据接收）
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m gacore.weitrack --host 0.0.0.0 --port 8000 --db wei_track.db
+python -m gacore.langtrack --host 0.0.0.0 --port 8000 --db lang_track.db
 ```
 
 - `POST /ingest`：接收手机上报的事件（批量 JSON），幂等去重后落库。

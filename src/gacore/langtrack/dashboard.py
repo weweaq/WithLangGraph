@@ -1,4 +1,4 @@
-"""weiTrack Web 仪表盘：基于事实表生成深色仪表盘 HTML（与 App 主题一致）。
+"""langTrack Web 仪表盘：基于事实表生成深色仪表盘 HTML（与 App 主题一致）。
 
 用法：FastAPI 挂载 GET /dashboard → render_dashboard_html(conn, day)
 不引第三方框架，纯内联 CSS/JS。数据来源：sessions / daily_stats / places（ETL 产出）。
@@ -11,7 +11,7 @@ import sqlite3
 from html import escape
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parents[3] / "data" / "weitrack.db"
+DB_PATH = Path(__file__).resolve().parents[3] / "data" / "langtrack.db"
 
 PAGE_CSS = """
 :root{--bg:#05060A;--card:#11151F;--line:#1C2333;--ink:#E9EDF6;--ink2:#96A0B4;
@@ -90,7 +90,7 @@ def render_dashboard_html(conn: sqlite3.Connection, day: str | None = None) -> s
     # 可用日期列表（daily_stats）
     days = [r["day"] for r in conn.execute("SELECT day FROM daily_stats ORDER BY day DESC")]
     if not days:
-        return "<html><body><h1>暂无数据</h1><p>先运行 ETL: python -m gacore.weitrack.etl</p></body></html>"
+        return "<html><body><h1>暂无数据</h1><p>先运行 ETL: python -m gacore.langtrack.etl</p></body></html>"
     if day not in days:
         day = days[0]
 
@@ -188,9 +188,9 @@ def render_dashboard_html(conn: sqlite3.Connection, day: str | None = None) -> s
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>weiTrack · {day}</title><style>{PAGE_CSS}</style></head>
+<title>langTrack · {day}</title><style>{PAGE_CSS}</style></head>
 <body>
-<h1>weiTrack 数据仪表盘</h1>
+<h1>langTrack 数据仪表盘</h1>
 <div class="sub">自用数据监控 · 数据源: events + ETL 事实表</div>
 <div class="nav">{nav}</div>
 {body}

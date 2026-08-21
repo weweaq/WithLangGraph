@@ -1,4 +1,4 @@
-"""weiTrack L3 移动轨迹段（trips）与路线变化事件。
+"""langTrack L3 移动轨迹段（trips）与路线变化事件。
 
 给相邻停驻点（stays）之间的移动段用高德路径规划 API 补路线坐标（polyline），
 生成无向规范化路线指纹 route_key，比对相邻出行识别通勤路线变化。
@@ -9,8 +9,8 @@
 - 逆地理 regeo 5000 次/日：不动
 
 用法：
-    python -m gacore.weitrack.routes            # 增量补路（仅未编码新段）
-    python -m gacore.weitrack.routes --all      # 强制全部重编（慎用，烧配额）
+    python -m gacore.langtrack.routes            # 增量补路（仅未编码新段）
+    python -m gacore.langtrack.routes --all      # 强制全部重编（慎用，烧配额）
 依赖环境变量 AMAP_KEY（.env 中配置，复用 geocode 的 Key）。
 """
 from __future__ import annotations
@@ -26,8 +26,8 @@ import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parents[3] / "data" / "weitrack.db"
-# 步行路径规划（上限 100km，最宽）；骑行/驾车可经 WEITRACK_ROUTE_MODE 切换
+DB_PATH = Path(__file__).resolve().parents[3] / "data" / "langtrack.db"
+# 步行路径规划（上限 100km，最宽）；骑行/驾车可经 LANGTRACK_ROUTE_MODE 切换
 DIRECTION_URL = "https://restapi.amap.com/v3/direction/walking"
 # 周边搜索（免费配额仅 100 次/日，P2 沿途 POI 必须网格级缓存 + 低频克制）
 AROUND_URL = "https://restapi.amap.com/v3/place/around"
@@ -38,13 +38,13 @@ _GRID = 0.003
 TRIP_MIN_DURATION_MS = 60_000          # 移动段最短时长 60s
 TRIP_MIN_DIST_M = 300.0                # 起终点直线距离 >= 300m 才算移动段
 # 配额节流：单次 ETL 增量补路上限（远低于 5000 次/日）
-_MAX_ENCODE_PER_RUN = int(os.environ.get("WEITRACK_ROUTE_MAX_PER_RUN", "100"))
-_ROUTE_MODE = os.environ.get("WEITRACK_ROUTE_MODE", "walking")
+_MAX_ENCODE_PER_RUN = int(os.environ.get("LANGTRACK_ROUTE_MAX_PER_RUN", "100"))
+_ROUTE_MODE = os.environ.get("LANGTRACK_ROUTE_MODE", "walking")
 
 
 def _amap_key() -> str:
     """复用 geocode 的 Key 读取逻辑（环境变量 AMAP_KEY 或 .env）。"""
-    from gacore.weitrack import geocode
+    from gacore.langtrack import geocode
     return geocode._amap_key()
 
 

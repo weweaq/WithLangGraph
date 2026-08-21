@@ -3,13 +3,13 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from gacore.weitrack.server import create_app
-from gacore.weitrack.storage import Storage
+from gacore.langtrack.server import create_app
+from gacore.langtrack.storage import Storage
 
 
 @pytest.fixture
 def client(tmp_path):
-    storage = Storage(tmp_path / "wei_track.db")
+    storage = Storage(tmp_path / "lang_track.db")
     app = create_app(storage)
     c = TestClient(app)
     yield c, storage

@@ -6,13 +6,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from gacore.weitrack.storage import Storage
+from gacore.langtrack.storage import Storage
 
 CST = timezone(timedelta(hours=8))
 
 
 def _new_storage(tmp_path):
-    return Storage(tmp_path / "wei_track.db")
+    return Storage(tmp_path / "lang_track.db")
 
 
 def test_insert_event_and_count(tmp_path):

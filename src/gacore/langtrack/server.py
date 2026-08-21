@@ -14,25 +14,25 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
-from gacore.weitrack.dashboard import DB_PATH, render_dashboard_html
-from gacore.weitrack.schemas import IngestRequest
-from gacore.weitrack.storage import Storage
+from gacore.langtrack.dashboard import DB_PATH, render_dashboard_html
+from gacore.langtrack.schemas import IngestRequest
+from gacore.langtrack.storage import Storage
 
-logger = logging.getLogger("gacore.weitrack.server")
+logger = logging.getLogger("gacore.langtrack.server")
 
-# 项目根目录：src/gacore/weitrack/server.py -> 项目根
+# 项目根目录：src/gacore/langtrack/server.py -> 项目根
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 # 周期 ETL 间隔（秒），默认 30 分钟；可用环境变量覆盖
-_ETL_INTERVAL_SECONDS = int(os.environ.get("WEITRACK_ETL_INTERVAL_SECONDS", "1800"))
+_ETL_INTERVAL_SECONDS = int(os.environ.get("LANGTRACK_ETL_INTERVAL_SECONDS", "1800"))
 # 单次 ETL 超时（秒）
-_ETL_TIMEOUT_SECONDS = int(os.environ.get("WEITRACK_ETL_TIMEOUT_SECONDS", "120"))
+_ETL_TIMEOUT_SECONDS = int(os.environ.get("LANGTRACK_ETL_TIMEOUT_SECONDS", "120"))
 
 
 def _run_etl_once() -> None:
     """幂等重建事实表；失败只记日志不阻塞。"""
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "gacore.weitrack.etl"],
+            [sys.executable, "-m", "gacore.langtrack.etl"],
             cwd=str(_PROJECT_ROOT),
             capture_output=True,
             timeout=_ETL_TIMEOUT_SECONDS,
@@ -62,7 +62,7 @@ def _etl_loop(stop_event: threading.Event) -> None:
 async def _lifespan(app: FastAPI):
     stop_event = threading.Event()
     thread = threading.Thread(
-        target=_etl_loop, args=(stop_event,), daemon=True, name="weitrack-etl"
+        target=_etl_loop, args=(stop_event,), daemon=True, name="langtrack-etl"
     )
     thread.start()
     logger.info("periodic ETL thread started (interval=%ss)", _ETL_INTERVAL_SECONDS)
@@ -74,7 +74,7 @@ async def _lifespan(app: FastAPI):
 
 
 def create_app(storage: Storage) -> FastAPI:
-    app = FastAPI(title="weiTrack ingest", lifespan=_lifespan)
+    app = FastAPI(title="langTrack ingest", lifespan=_lifespan)
 
     @app.get("/health")
     def health() -> dict:

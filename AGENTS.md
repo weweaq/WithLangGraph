@@ -1,6 +1,6 @@
 # AGENTS.md — WithLangGraph 项目工作规则
 
-> 本项目是 weiTrack 数据链路（weiCheckApp 客户端 + 本仓库服务端）的**服务端/数据侧**。
+> 本项目是 langTrack 数据链路（weiCheckApp 客户端 + 本仓库服务端）的**服务端/数据侧**。
 > 与客户端仓库 `weiCheckApp` 配合：客户端负责采集上报，本仓库负责接收存储、ETL 加工、分析展示。
 
 ## 项目定位（必须遵守）
@@ -13,7 +13,7 @@
 
 ### 改完必更路书
 
-**`docs/weitrack-roadmap.md` 是本项目的数据链路路书（指南 + 工作日志）。**
+**`docs/langtrack-roadmap.md` 是本项目的数据链路路书（指南 + 工作日志）。**
 
 **每次改动代码（客户端或服务端，哪怕一行）后，必须：**
 
@@ -103,7 +103,7 @@
     - 测试完按 cmdline 杀子进程（`Get-CimInstance` + `Stop-Process`）+ 清端口
 13. **fastapi TestClient 的 deprecation warning 会让 PowerShell 报 exit code 1**，但测试实际 PASS
     - 别被 `[stderr]` + exit 1 误导，看断言结果（`assert PASS` 才算数）
-14. **服务/后台进程必须用正确的解释器**（本项目双环境：weitrack 用 `.venv` 有 uvicorn，gacore 用 py12）
+14. **服务/后台进程必须用正确的解释器**（本项目双环境：langtrack 用 `.venv` 有 uvicorn，gacore 用 py12）
     - 启动前先确认目标进程的依赖装在哪个环境（`python -c "import uvicorn"`）
 
 ## 常用命令速查
@@ -111,15 +111,15 @@
 ```powershell
 # 服务端测试（py12 环境）
 $env:PYTHONPATH = "src"
-& "D:\softwares\miniconda\envs\py12\python.exe" -m pytest tests/test_weitrack_*.py -q
+& "D:\softwares\miniconda\envs\py12\python.exe" -m pytest tests/test_langtrack_*.py -q
 
 # ETL + 清理 + 报告
-python -m gacore.weitrack.etl --purge
-python -m gacore.weitrack.report --day 2026-08-18
+python -m gacore.langtrack.etl --purge
+python -m gacore.langtrack.report --day 2026-08-18
 
 # 高德逆编码 / 标签确认
-python -m gacore.weitrack.geocode
-python -m gacore.weitrack.label_places
+python -m gacore.langtrack.geocode
+python -m gacore.langtrack.label_places
 
 # 客户端构建安装（weiCheckApp 仓库）
 gradlew.bat :app:assembleDebug --offline

@@ -1,7 +1,7 @@
 """家/公司标签确认工具：把常驻点坐标映射持久化，ETL 重跑后标签不丢。
 
 用法（首次确认）：
-    python -m gacore.weitrack.label_places
+    python -m gacore.langtrack.label_places
     # 输出 top 主点 + 高德地址，按提示输入每个点的标签（家/公司/未知）
 
 配置文件：data/place_labels.json（gitignore 之外的用户数据）
@@ -13,7 +13,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parents[3] / "data" / "weitrack.db"
+DB_PATH = Path(__file__).resolve().parents[3] / "data" / "langtrack.db"
 CONFIG_PATH = Path(__file__).resolve().parents[3] / "data" / "place_labels.json"
 
 
@@ -56,7 +56,7 @@ def confirm() -> None:
     P1-1 确认闭环：优先展示【待确认候选点】（label=未知 且 candidate_label 非空），
     用户确认后正式定名；随后展示已确认点供复核修改。
     """
-    from gacore.weitrack.geocode import reverse_geocode, _amap_key
+    from gacore.langtrack.geocode import reverse_geocode, _amap_key
 
     key = _amap_key()
     labels = load_labels()

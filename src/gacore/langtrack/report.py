@@ -1,9 +1,9 @@
-"""weiTrack 分析报告：基于事实表生成"今天发生了什么"的数字生活画像与决策建议。
+"""langTrack 分析报告：基于事实表生成"今天发生了什么"的数字生活画像与决策建议。
 
 用法：
-    python -m gacore.weitrack.report            # 今日
-    python -m gacore.weitrack.report --day 2026-08-17
-    python -m gacore.weitrack.report --day 2026-08-17 --verbose   # 含原始明细
+    python -m gacore.langtrack.report            # 今日
+    python -m gacore.langtrack.report --day 2026-08-17
+    python -m gacore.langtrack.report --day 2026-08-17 --verbose   # 含原始明细
 
 输出分四块（对应修订文档 R6-P2）：
 1. 屏幕时间（总量/app 排行/最长会话）
@@ -20,7 +20,7 @@ import sqlite3
 from collections import defaultdict
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parents[3] / "data" / "weitrack.db"
+DB_PATH = Path(__file__).resolve().parents[3] / "data" / "langtrack.db"
 
 
 def fmt_dur(ms: int) -> str:
@@ -357,7 +357,7 @@ def _rhythm_weather(conn: sqlite3.Connection, day: str) -> dict:
           f" / 周末平均 {fmt_dur(rhythm['weekend_screen_avg_ms'])}")
 
     try:
-        from gacore.weitrack import weather
+        from gacore.langtrack import weather
         w = weather.get_weather(day)
     except Exception as e:
         print(f"  [天气] 获取失败: {e}")
@@ -376,7 +376,7 @@ def _write_snapshot(conn: sqlite3.Connection, day: str, profile: dict) -> None:
     """P2-0 L5 画像快照：结构化 JSON 落盘，LLM 渲染与数据解耦，支持历史对比。"""
     out = DB_PATH.parent / "profiles"
     out.mkdir(parents=True, exist_ok=True)
-    p = out / f"weitrack_profile_{day}.json"
+    p = out / f"langtrack_profile_{day}.json"
     p.write_text(json.dumps(profile, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"  → L5 画像快照已落盘: {p}")
 
@@ -384,7 +384,7 @@ def _write_snapshot(conn: sqlite3.Connection, day: str, profile: dict) -> None:
 def report(conn: sqlite3.Connection, day: str, verbose: bool = False) -> None:
     conn.row_factory = sqlite3.Row
     print("=" * 52)
-    print(f"  weiTrack 数字生活画像 · {day}")
+    print(f"  langTrack 数字生活画像 · {day}")
     print("=" * 52)
 
     # ---------- 1. 屏幕时间 ----------
@@ -503,7 +503,7 @@ def report(conn: sqlite3.Connection, day: str, verbose: bool = False) -> None:
             conf = f"家 {p['confidence_home']:.2f} / 公司 {p['confidence_work']:.2f}"
             print(f"  [疑似{p['candidate_label']}] ({p['lat']:.4f},{p['lon']:.4f}) "
                   f"访问 {p['visit_count']} 次 · {conf} · {p['poi'] or '无POI'}")
-        print("  → 运行 python -m gacore.weitrack.label_places 确认定名，"
+        print("  → 运行 python -m gacore.langtrack.label_places 确认定名，"
               "确认后写入 data/place_labels.json 并在下次 ETL 正式生效")
     else:
         print("  暂无待确认候选点")
@@ -588,7 +588,7 @@ def report(conn: sqlite3.Connection, day: str, verbose: bool = False) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="weiTrack 分析报告")
+    parser = argparse.ArgumentParser(description="langTrack 分析报告")
     parser.add_argument("--db", type=Path, default=DB_PATH)
     parser.add_argument("--day", default=None, help="日期 YYYY-MM-DD，默认今天")
     parser.add_argument("--verbose", action="store_true")

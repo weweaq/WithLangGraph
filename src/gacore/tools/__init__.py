@@ -31,7 +31,7 @@ from .ncm_tools import (
 )
 from .ocr_tools import ocr_image, ocr_screen
 from .web_tools import web_execute_js, web_scan
-from .weitrack_tools import weitrack_stats
+from .langtrack_tools import langtrack_stats
 
 __all__ = ["TOOL_NAMES", "build_tool_list"]
 
@@ -60,7 +60,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "ocr_image",
     "ocr_screen",
     "send_email",
-    "weitrack_stats",
+    "langtrack_stats",
 )
 
 _TOOLS: tuple[BaseTool, ...] = (
@@ -88,7 +88,7 @@ _TOOLS: tuple[BaseTool, ...] = (
     ocr_image,
     ocr_screen,
     send_email,
-    weitrack_stats,
+    langtrack_stats,
 )
 
 

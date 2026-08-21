@@ -1,4 +1,4 @@
-"""weiTrack ETL：把原始事件流清洗并加工成可分析的事实表。
+"""langTrack ETL：把原始事件流清洗并加工成可分析的事实表。
 
 产出三张表：
 - sessions    前台会话（usage + session 事件拼接，含 app/起止/时长/activity）
@@ -21,7 +21,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parents[3] / "data" / "weitrack.db"
+DB_PATH = Path(__file__).resolve().parents[3] / "data" / "langtrack.db"
 
 # 同设备重装前后 device_id 别名映射（data/device_aliases.json）：别名 → 主设备。
 # app 端已改为基于 ANDROID_ID 的稳定标识，但历史数据里重装前的旧 device_id 仍存在，
@@ -885,7 +885,7 @@ def purge_dirty(db_path: Path) -> None:
 
 
 # P2 沿途 POI 每轮 ETL 查询网格上限（around 免费配额仅 100 次/日，克制）
-_POI_MAX_PER_RUN = int(os.environ.get("WEITRACK_POI_MAX_PER_RUN", "5"))
+_POI_MAX_PER_RUN = int(os.environ.get("LANGTRACK_POI_MAX_PER_RUN", "5"))
 
 
 def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool = True, run_route: bool = True, run_poi: bool = True) -> None:
@@ -939,7 +939,7 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool
 
     # L3：移动轨迹段（trips）——全量重建结构，已编码路线按 (device,start_ts,end_ts) 带回，
     # 已编码列保留（不烧高德配额）；新移动段编码列为空，由下方增量补路补齐。
-    from gacore.weitrack.routes import build_trips
+    from gacore.langtrack.routes import build_trips
     old_route: dict[tuple, tuple] = {}
     for r in conn.execute(
         "SELECT device_id, start_ts, end_ts, polyline, route_key, route_mode, route_encoded_at FROM trips"
@@ -990,7 +990,7 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool
     conn.close()
     # 恢复持久化的家/公司标签（data/place_labels.json）
     try:
-        from gacore.weitrack.label_places import apply_labels
+        from gacore.langtrack.label_places import apply_labels
         n = apply_labels(db_path)
         if n:
             print(f"[etl] 恢复持久化地点标签: {n} 个")
@@ -1004,7 +1004,7 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool
     # L2：增量 regeo 编码（仅未编码常驻点，ETL 重跑零新增调用）
     if run_geocode:
         try:
-            from gacore.weitrack import geocode
+            from gacore.langtrack import geocode
             n = geocode.incremental_encode(db_path)
             print(f"[etl] 增量 regeo 编码: {n} 个常驻点")
         except SystemExit as e:
@@ -1014,7 +1014,7 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool
     # L3：增量路径规划补路（仅未编码新移动段，单次上限节流；失败跳过不阻塞）
     if run_route:
         try:
-            from gacore.weitrack import routes
+            from gacore.langtrack import routes
             n = routes.incremental_encode_trips(db_path)
             print(f"[etl] 增量补路(路径规划): {n} 段")
         except SystemExit as e:
@@ -1028,7 +1028,7 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool
     print(f"[etl] route_change 路线变化事件: {n_rc} 条")
     # P1：路过网格统计（通勤带）——纯本地零配额，全量重建
     try:
-        from gacore.weitrack import routes as _routes_p1
+        from gacore.langtrack import routes as _routes_p1
         n_g = _routes_p1.build_route_grids(db_path)
         print(f"[etl] 路过网格统计(通勤带): {n_g} 行")
     except Exception as e:
@@ -1046,7 +1046,7 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="weiTrack ETL")
+    parser = argparse.ArgumentParser(description="langTrack ETL")
     parser.add_argument("--db", type=Path, default=DB_PATH)
     parser.add_argument("--purge", action="store_true", help="先清理异常事件再重建事实表")
     parser.add_argument("--no-geocode", action="store_true", help="跳过高德增量 regeo 编码")

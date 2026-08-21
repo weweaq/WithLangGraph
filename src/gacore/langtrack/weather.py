@@ -1,7 +1,7 @@
-"""weiTrack 天气语境（P2-2）：高德天气接口，按日缓存，供画像加环境语境。
+"""langTrack 天气语境（P2-2）：高德天气接口，按日缓存，供画像加环境语境。
 
 用法：
-    python -m gacore.weitrack.weather --day 2026-08-20
+    python -m gacore.langtrack.weather --day 2026-08-20
 
 历史画像日（如 8-19）不在接口返回的预报窗内时，回退到最近可用预报日并在
 返回中加入 approx 标记，report 侧据此标注。
@@ -90,7 +90,7 @@ def get_weather(day: str, cache_path: Path | None = None) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="weiTrack 天气语境（P2-2）")
+    parser = argparse.ArgumentParser(description="langTrack 天气语境（P2-2）")
     parser.add_argument("--day", default=datetime.date.today().isoformat())
     args = parser.parse_args()
     w = get_weather(args.day)
