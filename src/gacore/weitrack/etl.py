@@ -175,6 +175,29 @@ CREATE TABLE IF NOT EXISTS stays (
 );
 CREATE INDEX IF NOT EXISTS idx_stays_device ON stays(device_id);
 CREATE INDEX IF NOT EXISTS idx_stays_day ON stays(day);
+
+-- L3 移动轨迹段：相邻停驻点之间的移动区间 + 高德路径规划补路
+CREATE TABLE IF NOT EXISTS trips (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id TEXT NOT NULL,
+  start_ts INTEGER NOT NULL,
+  end_ts INTEGER NOT NULL,
+  duration_ms INTEGER NOT NULL,
+  start_lat REAL NOT NULL,
+  start_lon REAL NOT NULL,
+  end_lat REAL NOT NULL,
+  end_lon REAL NOT NULL,
+  dist_m REAL NOT NULL,
+  n_points INTEGER NOT NULL DEFAULT 0,
+  day TEXT,
+  polyline TEXT,
+  route_key TEXT,
+  route_mode TEXT,
+  route_encoded_at INTEGER,
+  UNIQUE(device_id, start_ts, end_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_trips_device ON trips(device_id);
+CREATE INDEX IF NOT EXISTS idx_trips_day ON trips(day);
 """
 
 
@@ -632,6 +655,62 @@ def detect_anomalies(conn: sqlite3.Connection, lookback_days: int = 7) -> int:
     return len(rows)
 
 
+def detect_route_changes(conn: sqlite3.Connection) -> int:
+    """L3 路线变化事件：同日相邻出行的 route_key 不同 → route_change（复用 anomalies 叙事表）。
+
+    前置：trips 已完成高德补路（route_key 非空）。anomalies 表 UNIQUE(day, kind, grid_key)，
+    故 grid_key 存 'rc:'+route_key[:8] 承载指纹保唯一。返回新增事件数。
+    """
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT device_id, day, start_ts, start_lat, start_lon, end_lat, end_lon, route_key "
+        "FROM trips WHERE route_key IS NOT NULL AND route_key != '' "
+        "ORDER BY device_id, start_ts"
+    ).fetchall()
+
+    def hav(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        import math
+        r = 6371000.0
+        p1, p2 = math.radians(lat1), math.radians(lat2)
+        dp, dl = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+        a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+        return 2 * r * math.asin(math.sqrt(a))
+
+    by_dev: dict[str, list] = defaultdict(list)
+    for r in rows:
+        by_dev[r["device_id"]].append(r)
+    changes: list[tuple] = []
+    PAIR_DIST = 400.0  # 往返对判距：A起点≈B终点 且 A终点≈B起点
+    for _device_id, trips in by_dev.items():
+        for i in range(1, len(trips)):
+            prev, cur = trips[i - 1], trips[i]
+            if prev["day"] != cur["day"] or prev["route_key"] == cur["route_key"]:
+                continue
+            # 往返对（去程+回程）：同一通勤路往返不报"路线变化"
+            round_trip = (
+                hav(prev["start_lat"], prev["start_lon"], cur["end_lat"], cur["end_lon"]) < PAIR_DIST
+                and hav(prev["end_lat"], prev["end_lon"], cur["start_lat"], cur["start_lon"]) < PAIR_DIST
+            )
+            if round_trip:
+                continue
+            gk = "rc:" + (cur["route_key"][:8] or "?")
+            detail = (
+                f"通勤路线变化（同日相邻出行指纹不同）: "
+                f"{prev['start_lat']:.4f},{prev['start_lon']:.4f} → "
+                f"{cur['end_lat']:.4f},{cur['end_lon']:.4f}"
+            )
+            changes.append((
+                cur["day"], "route_change", _device_id, gk, "", detail, cur["start_ts"],
+            ))
+    conn.executemany(
+        "INSERT OR IGNORE INTO anomalies(day, kind, device_id, grid_key, poi, detail, ts) "
+        "VALUES (?,?,?,?,?,?,?)",
+        changes,
+    )
+    conn.commit()
+    return len(changes)
+
+
 def _group_stays_by_day(conn: sqlite3.Connection) -> list[tuple[str, list[tuple]]]:
     """按天分组停驻点：返回 [(day, [(start_ts, end_ts, grid_key, in_work_hours, device_id), ...])]。"""
     by_day: dict[str, list] = defaultdict(list)
@@ -781,7 +860,7 @@ def purge_dirty(db_path: Path) -> None:
     conn.close()
 
 
-def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool = True) -> None:
+def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool = True, run_route: bool = True) -> None:
     conn = sqlite3.connect(db_path)
     conn.executescript(_SCHEMA)
     # 迁移：旧 places 表补 is_primary 列（新库已含）
@@ -829,6 +908,27 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool
         stays,
     )
     print(f"[etl] stays(L1 停驻点): {len(stays)}")
+
+    # L3：移动轨迹段（trips）——全量重建结构，已编码路线按 (device,start_ts,end_ts) 带回，
+    # 已编码列保留（不烧高德配额）；新移动段编码列为空，由下方增量补路补齐。
+    from gacore.weitrack.routes import build_trips
+    old_route: dict[tuple, tuple] = {}
+    for r in conn.execute(
+        "SELECT device_id, start_ts, end_ts, polyline, route_key, route_mode, route_encoded_at FROM trips"
+    ):
+        old_route[(r[0], r[1], r[2])] = (r[3], r[4], r[5], r[6])
+    conn.execute("DELETE FROM trips")
+    trips = build_trips(events, stays)
+    for t in trips:
+        poly, rk, mode, enc = old_route.get((t[0], t[1], t[2]), (None, None, None, None))
+        conn.execute(
+            "INSERT INTO trips(device_id, start_ts, end_ts, duration_ms, start_lat, start_lon, "
+            "end_lat, end_lon, dist_m, n_points, day, polyline, route_key, route_mode, route_encoded_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10],
+             poly, rk, mode, enc),
+        )
+    print(f"[etl] trips(L3 移动段): {len(trips)}")
 
     # places：保留已标注 label（家/公司/未知），只更新统计；新点以"未知"插入
     places = build_places(events)
@@ -883,6 +983,21 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool
             print(f"[etl] 跳过增量 regeo 编码: {e}")
         except Exception as e:
             print(f"[etl] 增量 regeo 编码失败(不影响 ETL): {e}")
+    # L3：增量路径规划补路（仅未编码新移动段，单次上限节流；失败跳过不阻塞）
+    if run_route:
+        try:
+            from gacore.weitrack import routes
+            n = routes.incremental_encode_trips(db_path)
+            print(f"[etl] 增量补路(路径规划): {n} 段")
+        except SystemExit as e:
+            print(f"[etl] 跳过增量补路: {e}")
+        except Exception as e:
+            print(f"[etl] 增量补路失败(不影响 ETL): {e}")
+    # L3：路线变化事件（复用 anomalies 叙事表，依赖 trips 已完成补路）
+    conn = sqlite3.connect(db_path)
+    n_rc = detect_route_changes(conn)
+    conn.close()
+    print(f"[etl] route_change 路线变化事件: {n_rc} 条")
     print("[etl] 完成")
 
 
@@ -891,10 +1006,11 @@ def main() -> None:
     parser.add_argument("--db", type=Path, default=DB_PATH)
     parser.add_argument("--purge", action="store_true", help="先清理异常事件再重建事实表")
     parser.add_argument("--no-geocode", action="store_true", help="跳过高德增量 regeo 编码")
+    parser.add_argument("--no-route", action="store_true", help="跳过高德路径规划补路(L3)")
     args = parser.parse_args()
     if args.purge:
         purge_dirty(args.db)
-    run(args.db, run_geocode=not args.no_geocode)
+    run(args.db, run_geocode=not args.no_geocode, run_route=not args.no_route)
 
 
 if __name__ == "__main__":
