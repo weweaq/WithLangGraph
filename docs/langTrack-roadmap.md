@@ -501,3 +501,30 @@ B 阶段完成数据模型与 ETL 重构后，langTrack 已具备 sessions / sta
 - [x] C1 人物画像：persona.py + app_categories.json + 三出口 + 单测 + 健壮降级。
 - [ ] C2 数据质量可视化、C3 可行动洞察：本期未做（按北极星 C1>C2>C3 优先级，C1 先行）。
 - [ ] 分类映射持续补全：真实 DB 新 app 显示名出现时，`uncategorized` 清单会提示需补 `app_categories.json`。
+
+## 2026-08-22：新增技术实现参考文档 docs/langTrack-tech.md
+
+### 背景
+
+需要一份面向开发者的代码级技术参考：接口、实体、数据库表字段用途、数据流图。现有两份文档（本路书=工作日志、`etl-cleaning-guide.md`=清洗规则详解）均非结构化参考视角。
+
+### 已完成
+
+- ✅ `docs/langTrack-tech.md`，8 节：
+  1. 端到端数据流总览（mermaid flowchart：采集→接收→原始层→事实层→四出口）
+  2. HTTP 接口（/health、/ingest、/dashboard 表格 + ingest_batch 幂等单事务时序图；周期 ETL 线程与 env 覆盖）
+  3. Pydantic 实体（Event/IngestRequest + 上报 JSON 示例）
+  4. 数据库表字典：原始层 3 表逐字段（events 列名为 `payload`）+ 事实层 12 表逐字段用途（sessions/daily_stats PK(device_id,day)/stays/trips 高德缓存四列/places 全量语义列与保标签 UPSERT/contract_coverage 四态/etl_state 水位线/etl_runs 血缘/dirty_events 隔离区/anomalies/route_grids/grid_pois），B8 etl_version 自然时间列映射表 + erDiagram 关系图
+  5. 出口实体：LangTrackDayStats TypedDict 全字段来源表、persona.build() 返回键树+五组判定阈值表、契约 18 类型×consumed
+  6. ETL run() 十四步 mermaid flowchart（增量水位线回看3天/trips 已编码路线带回/places 保标签/高德三处外呼失败隔离不阻塞）
+  7. 外部依赖与配置（env 变量、data/ 下四个文件含 gitignore 说明）
+  8. 测试与常用命令
+
+### 验证
+
+- 所有字段名/行号/阈值对照 codegraph 逐字源码核验（storage/server/schemas/contract/persona/etl/routes/langTrack_tools 共 9 文件），无凭记忆杜撰项。
+- 检视说明：独立 agent 检视两次被中断，改为基于同会话逐字源码自查 + mermaid 4 图人工核对语法。
+
+### 待办更新
+
+- [x] 技术实现参考文档落库。
