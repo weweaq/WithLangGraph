@@ -411,4 +411,71 @@ top_notification_apps, sleep_start_ms, sleep_end_ms, silent_hours, place_distrib
 
 ### 待办更新
 - [x] P4 AI 日报 → 已通过 langTrack_stats 融合进现有 daily-report（不另起炉灶）
-- [ ] 验证：23:50 日报实际跑起来后，确认邮件正文含 langTrack 信号节
+- [ ] 验证：23:50 日报实际跑起来后，确认邮件正文含 langTrack 信号节
+
+
+
+## 2026-08-22：A① 服务端契约覆盖校验（contract coverage check）
+
+### 背景
+- D 阶段排查发现 17 类设计事件里仅有 14 类实际落地（`screen_content`/`media`/`bt_device`/`call` 从未到达），且服务端无任何机制发现此缺失。本期收敛为**纯观测**的契约覆盖校验（断流告警/客户端保活用户已明确不做）。
+
+### 已完成
+- ✅ **契约模块**（`src/gacore/langTrack/contract.py`）：`EXPECTED_EVENT_TYPES`（17 类，含 desc/consumed）、`STALE_DAYS=7`，作为期望事件类型的唯一权威副本。
+- ✅ **ETL 新步骤**（`etl.py` `build_contract_coverage(conn)`）：`SELECT type,COUNT(*),MAX(ts) FROM events GROUP BY type` 比对契约，全量重建事实表 `contract_coverage`（列含 type/expected/consumed/desc/arrived/event_count/last_seen_ts/status/created_at/updated_at）；status ∈ {ok, stale, missing, unexpected}；`REPLACE` 幂等；接入 `run()` 末尾（`etl.execute()` 实为 `run()`，函数名偏差，见下）。
+- ✅ **工具出口**（`src/gacore/tools/langTrack_tools.py`）：`LangTrackDayStats` 增 `coverage: list[dict]`；`langTrack_stats` 读取非 `ok` 类型（`{type,desc,status,last_seen,consumed}`）。
+- ✅ **仪表盘**（`dashboard.py` `render_dashboard_html`）：新增「采集覆盖」卡片，按状态着色 chip（🟢ok/🟡stale/🔴missing/⚪unexpected），复用既有深色样式，无 print。
+- ✅ **报告**（`report.py`）：新增「■ 采集覆盖」小节，列出 missing/stale/unexpected 及 desc、last_seen。
+- ✅ **单测**（`tests/test_langTrack_contract.py`）：构造假 events（部分 ok / 一个 stale / 一个 unexpected / 四个缺失），断言 status 判定正确，3 用例全过。
+
+### 实测验证（8-22 跑 ETL 后）
+- `contract_coverage` 共 18 行（17 契约 + 1 unexpected）。
+- missing：`screen_content` / `media` / `bt_device` / `call`（与 D 阶段结论一致）。
+- unexpected：`accel`（客户端实际在送、契约未登记——反向信号生效，提示需把 accel 同步进契约）。
+- 单测：`3 passed`；`import gacore.langTrack.etl, gacore.tools.langTrack_tools, gacore.langTrack.dashboard, gacore.langTrack.report, gacore.langTrack.contract` 干净。
+
+### 偏差/说明
+- 任务书称 `langTrack_tools.py` 在 `gacore.langTrack` 下，实际位于 `gacore.tools`（`tools/__init__.py` 注册）。按真实位置集成，未新建文件。
+- 任务书称「接入 `etl.execute()`」，实际函数名为 `run()`，已接入 `run()` 末尾（其他事实表之后）。
+- 单测用 `conn.executescript(etl._SCHEMA)` 建表（单一来源），不依赖真实 DB。
+
+### 待办更新
+- [x] A① 服务端契约覆盖校验：contract.py + build_contract_coverage + 三出口 + 单测。
+- [x] 契约同步：客户端在送的 `accel` 已显式加入 `EXPECTED_EVENT_TYPES`（desc=加速度聚合, consumed=false）。重跑 `build_contract_coverage` 后 `contract_coverage` 共 18 行全为 expected，accel=ok，不再误报 unexpected（原 4 类 missing 仍正确保留）。单测 3 passed 仍通过（`test_contract_coverage_rowcount` 断言动态取 `len(EXPECTED_EVENT_TYPES)+1`）。
+- [x] A① 检视闭环：5-Agent 审阅，context-mining 发现 accel 漏登阻塞项，已修复并复跑验证通过。
+
+---
+
+## 2026-08-22：C1 服务端人物画像（persona / 甲·外挂式）
+
+### 背景
+B 阶段完成数据模型与 ETL 重构后，langTrack 已具备 sessions / stays / trips / places / daily_stats 事实表。C1（北极星最高优先级：行为模式/人物画像）目标=刻画"完全懂主人"的助手——把事实表加工成可解读的行为模式画像。本期采用「外挂式」纯读聚合：不动 ETL、不加表、不污染既有模块。
+
+### 已完成
+- ✅ **画像核心**（`src/gacore/langTrack/persona.py`）：`build(conn=None, device_id=None, days=7, db_path=None) -> dict`，纯读 B 阶段事实表，输出 5 维度：
+  - 应用分类聚合（按 `data/app_categories.json` 显示名→分类，未登记 app 落入「其他」+ `uncategorized` 清单）
+  - 屏幕健康度（日均时长 / 趋势 up·down·flat / 重度屏幕使用者判定）
+  - 使用时段分布（CST 6 段划分，深夜占比→夜猫子，峰值时段）
+  - 生活规律（家/公司 stay JOIN places 取出门时刻；数据不足降级）
+  - 特征 + 画像卡片文本（traits / card）
+- ✅ **分类映射**（`data/app_categories.json`）：基于真实 DB 实测 16 个 app 显示名（抖音/微信/Edge/小红书/哔哩哔哩/网易云音乐/夸克/飞书/淘宝/时钟/WeLink/QQ/华为乾崑/天气/便签/Marvis）→ 视频/社交/工具/购物/通讯/其他。
+- ✅ **三出口接入**（与既有 TypedDict / 卡片 / 报告章节风格一致，零侵入）：
+  - `tools/langTrack_tools.py`：`LangTrackDayStats` 增 `persona: dict`，`langTrack_stats` 返回填充。
+  - `dashboard.py`：新增 `_render_persona` 卡片（traits chips / 日均屏幕 / 深夜活跃 / 分类 Top），插入 dashboard body。
+  - `report.py`：新增「■ 人物画像」小节（§9.5）+ 画像写入既有 L5 profile 快照（`data/profiles/langTrack_profile_YYYY-MM-DD.json`）。
+- ✅ **单测**（`tests/test_langTrack_persona.py`）：6 用例（分类求和与占比 / 屏幕重度 / 夜猫子 / 规律路径 / 设备过滤无数据 / 旧库无 device_id 列兼容），全过。
+- ✅ **健壮降级**：`persona.build` 对 `sessions`/`stays`/`trips`/`places` 缺失表做 `try/except sqlite3.OperationalError` 降级（daily_stats 仍为必需），避免极简库/测试夹具触发 `no such table` 拖垮整个 `langTrack_stats` 调用。
+
+### 实测验证（2026-08-21 真实 DB 拷贝）
+- 报告「■ 人物画像」渲染正常：分类 Top `视频 5.05h / 社交 4.8h / 其他 2.86h`；屏幕 `日均 2.2h（正常区间）`；节奏 `深夜活跃 20.0%（正常），高峰 晚上`；规律 `作息规律；约 09:09 出门上班`；卡片 `作息规律的通勤上班族；视频消费者（日均 5.05h，居首）；社交轻度。`
+- 仪表盘 `_render_persona` 卡片 HTML 正常渲染（traits chips + 指标行）。
+- `pytest tests/ -k langTrack`：**31 passed**（含 6 persona 新用例；回归修复后原 2 失败用例恢复）。
+
+### 偏差/说明
+- 任务书称 persona 在 `gacore.langTrack` 下，已落地于 `src/gacore/langTrack/persona.py`，与 contract 同目录，符合「外挂式」原则。
+- 旧库 `daily_stats` 无 `device_id` 列时：`build(device_id=None)` 自动退化为全量读（已单测覆盖）。
+
+### 待办更新
+- [x] C1 人物画像：persona.py + app_categories.json + 三出口 + 单测 + 健壮降级。
+- [ ] C2 数据质量可视化、C3 可行动洞察：本期未做（按北极星 C1>C2>C3 优先级，C1 先行）。
+- [ ] 分类映射持续补全：真实 DB 新 app 显示名出现时，`uncategorized` 清单会提示需补 `app_categories.json`。
