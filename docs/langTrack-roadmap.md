@@ -446,6 +446,28 @@ top_notification_apps, sleep_start_ms, sleep_end_ms, silent_hours, place_distrib
 
 ---
 
+## 2026-08-22：B 阶段 ETL 全量重建 + 配置外置
+
+### 背景
+
+A① 之后数据侧欠账集中暴露：`daily_stats` 缺 device 维度（多设备无法区分）、清洗阈值散落硬编码在 `etl.py` 内部、`routes.build_trips` 的 `day` 归日用本地时区存在漂移风险。B 阶段目标 = 一次性重建 ETL 层，为 C1 人物画像提供干净的多设备事实表。
+
+### 已完成
+
+- ✅ **ETL 全量重建**（`etl.py`，步骤 B1–B8）：sessions / stays / trips / places / daily_stats 五张事实表统一重建，均带 `created_at` / `updated_at`（东八区）与 `etl_version` 列，清洗与合并规则按最新口径实现。
+- ✅ **配置外置**（新增 `src/gacore/langTrack/etl_config.py`）：阈值、白名单等可调参数从 `etl.py` 抽出集中管理，ETL 行为改配置不改代码。
+- ✅ **B2 主键修正**：`daily_stats` 主键定为 `(device_id, day)`；`_migrate_daily_stats_pk` 对旧库迁移时保留历史数据不丢行。
+- ✅ **trips 构建改进**（`routes.py`）：`build_trips` 参数化 `min_duration_ms` / `min_dist_m`；`day` 归日改用 `_TZ_CST` 显式东八区，消除本地时区依赖。
+
+### 实测验证
+
+- 单测 9 passed。
+- 真实库拷贝跑全量 ETL：退出码 0；`daily_stats` PK 实测为 `['device_id','day']`；8 张事实表 `etl_version` 全部非空；`etl_state` 恰 1 行。
+
+### 待办更新
+
+- [x] B 阶段 ETL 全量重建 + 配置外置 + B2 主键修正。
+
 ## 2026-08-22：C1 服务端人物画像（persona / 甲·外挂式）
 
 ### 背景
