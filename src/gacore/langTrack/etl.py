@@ -18,9 +18,12 @@ import json
 import os
 import sqlite3
 import time
-from collections import defaultdict
-from pathlib import Path
-
+from collections import defaultdict
+
+from pathlib import Path
+
+
+from gacore.langTrack.etl_config import load_etl_config
 DB_PATH = Path(__file__).resolve().parents[3] / "data" / "langTrack.db"
 
 # 同设备重装前后 device_id 别名映射（data/device_aliases.json）：别名 → 主设备。
@@ -75,7 +78,11 @@ SYSTEM_PACKAGES = {
     "com.heytap.quicksearchbox",
 }
 # 自家 App 不进使用统计
-OWN_PACKAGES = {"com.wei.checkapp"}
+OWN_PACKAGES = {"com.wei.checkapp"}
+
+
+# ETL 事实表版本（B5 血缘）：B1–B8 任一逻辑变更时 bump。
+ETL_VERSION = "1.0.0"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -93,7 +100,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_day ON sessions(day);
 CREATE INDEX IF NOT EXISTS idx_sessions_pkg ON sessions(pkg);
 
 CREATE TABLE IF NOT EXISTS daily_stats (
-  day TEXT PRIMARY KEY,
+  device_id TEXT NOT NULL DEFAULT 'unknown',
+  day TEXT NOT NULL,
   total_screen_ms INTEGER NOT NULL DEFAULT 0,
   app_ranking_json TEXT,
   notification_count INTEGER NOT NULL DEFAULT 0,
@@ -105,7 +113,10 @@ CREATE TABLE IF NOT EXISTS daily_stats (
   switch_count INTEGER NOT NULL DEFAULT 0,
   location_count INTEGER NOT NULL DEFAULT 0,
   audio_clip_count INTEGER NOT NULL DEFAULT 0,
-  updated_at TEXT DEFAULT (datetime('now', '+8 hours'))
+  updated_at TEXT DEFAULT (datetime('now', '+8 hours')),
+  created_at TEXT,
+  etl_version TEXT,
+  PRIMARY KEY(device_id, day)
 );
 
 CREATE TABLE IF NOT EXISTS places (
@@ -211,18 +222,84 @@ CREATE TABLE IF NOT EXISTS route_grids (
   PRIMARY KEY(device_id, day, grid_lat, grid_lon)
 );
 CREATE INDEX IF NOT EXISTS idx_route_grids_grid ON route_grids(grid_lat, grid_lon);
-
--- P2 沿途 POI（网格级缓存）：每个网格最多一条周边 POI（around 100 次/日，低频克制）
-CREATE TABLE IF NOT EXISTS grid_pois (
-  grid_lat REAL NOT NULL,
-  grid_lon REAL NOT NULL,
-  name TEXT,
-  type TEXT,
-  distance TEXT,
-  queried_at INTEGER,
-  PRIMARY KEY(grid_lat, grid_lon)
-);
-"""
+-- A① 契约覆盖校验事实表：期望事件类型契约 vs 实际到达类型
+
+CREATE TABLE IF NOT EXISTS contract_coverage (
+
+  type          TEXT PRIMARY KEY,
+
+  expected      INTEGER NOT NULL DEFAULT 1,
+
+  consumed      TEXT    NOT NULL DEFAULT 'false',  -- true / partial / false
+
+  desc          TEXT,
+
+  arrived       INTEGER NOT NULL DEFAULT 0,        -- 是否在观察窗口内到达过
+
+  event_count   INTEGER NOT NULL DEFAULT 0,
+
+  last_seen_ts  INTEGER,
+
+  status        TEXT    NOT NULL DEFAULT 'unknown', -- ok / stale / missing / unexpected
+
+  created_at    TEXT DEFAULT (datetime('now','+8 hours')),
+
+  updated_at    TEXT DEFAULT (datetime('now','+8 hours'))
+
+);
+
+
+
+-- P2 沿途 POI（网格级缓存）：每个网格最多一条周边 POI（around 100 次/日，低频克制）
+
+CREATE TABLE IF NOT EXISTS grid_pois (
+  grid_lat REAL NOT NULL,
+  grid_lon REAL NOT NULL,
+  name TEXT,
+  type TEXT,
+  distance TEXT,
+  queried_at INTEGER,
+  PRIMARY KEY(grid_lat, grid_lon)
+);
+
+-- B5 ETL 运行血缘：每次 ETL 运行一条记录
+CREATE TABLE IF NOT EXISTS etl_runs (
+  run_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  version      TEXT NOT NULL,
+  started_at   TEXT,
+  finished_at  TEXT,
+  mode         TEXT NOT NULL DEFAULT 'full',
+  device_id    TEXT,
+  affected_days TEXT,
+  status       TEXT NOT NULL DEFAULT 'running',
+  git_rev      TEXT,
+  rows_daily   INTEGER DEFAULT 0,
+  rows_sessions INTEGER DEFAULT 0,
+  rows_stays   INTEGER DEFAULT 0,
+  created_at   TEXT DEFAULT (datetime('now','+8 hours')),
+  updated_at   TEXT DEFAULT (datetime('now','+8 hours'))
+);
+
+-- B4 脏事件隔离：schema 校验未通过的事件落此处，不进 events 主流程、不崩 ETL
+CREATE TABLE IF NOT EXISTS dirty_events (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  type        TEXT,
+  raw         TEXT,
+  reason      TEXT,
+  arrived_at  TEXT DEFAULT (datetime('now','+8 hours')),
+  created_at  TEXT DEFAULT (datetime('now','+8 hours')),
+  updated_at  TEXT DEFAULT (datetime('now','+8 hours'))
+);
+
+-- B1 增量水位线（per-device）：上次已处理的最大事件 ts
+CREATE TABLE IF NOT EXISTS etl_state (
+  device_id    TEXT PRIMARY KEY,
+  last_event_ts INTEGER,
+  last_run_at  TEXT,
+  updated_at   TEXT DEFAULT (datetime('now','+8 hours'))
+);
+
+"""
 
 
 def clean_ts(ts: int) -> bool:
@@ -245,10 +322,14 @@ def load_events(conn: sqlite3.Connection) -> list[tuple[int, str, dict]]:
     return out
 
 
-def day_of(ts: int) -> str:
-    """时间戳 → 本地日期字符串（东八区）。"""
-    import datetime
-    return datetime.datetime.fromtimestamp(ts / 1000).strftime("%Y-%m-%d")
+_TZ_CST = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def day_of(ts: int) -> str:
+    """时间戳 → 日期字符串（显式东八区，不依赖服务器本地时区）。"""
+    return datetime.datetime.fromtimestamp(
+        ts / 1000, tz=_TZ_CST
+    ).strftime("%Y-%m-%d")
 
 
 def is_noise(pkg: str) -> bool:
@@ -299,48 +380,71 @@ def build_sessions(events: list[tuple[int, str, int, dict]]) -> list[tuple]:
     return sessions
 
 
-def build_daily_stats(events, sessions) -> list[tuple]:
-    """按天汇总。"""
-    stats: dict[str, dict] = defaultdict(lambda: {
-        "total_screen_ms": 0, "app_usage": defaultdict(int), "notif_count": 0,
-        "notif_clicked": 0, "notif_apps": defaultdict(int), "screen_on": 0,
-        "screen_off": 0, "unlock": 0, "switch": 0, "location": 0, "audio_clip": 0,
-    })
-    for device_id, day, pkg, app, activity, start_ms, end_ms, dur in sessions:
-        s = stats[day]
-        s["total_screen_ms"] += dur
-        s["app_usage"][app] += dur
-    for _, ts, type_, p in events:
-        d = day_of(ts)
-        s = stats[d]
-        if type_ == "notification":
-            s["notif_count"] += 1
-            if p.get("clicked"):
-                s["notif_clicked"] += 1
-            pkg = p.get("pkg", "unknown")
-            if not is_noise(pkg):
-                s["notif_apps"][p.get("app", pkg)] += 1
-        elif type_ == "session":
-            kind = p.get("kind")
-            if kind == "screen_on":
-                s["screen_on"] += 1
-            elif kind == "screen_off":
-                s["screen_off"] += 1
-            elif kind == "unlock":
-                s["unlock"] += 1
-            elif kind == "app_switch":
-                s["switch"] += 1
-        elif type_ == "location":
-            s["location"] += 1
-        elif type_ == "audio_clip":
-            s["audio_clip"] += 1
+def derive_screen_states(events) -> dict[tuple, dict]:
+    """集中推导屏幕状态计数（on/off/unlock/switch），消除多处散算。
+
+    统一口径：仅由 session 类事件的 kind 推导，按 (device_id, day) 聚合。
+    不做跨天边界特殊处理（保持与历史 build_daily_stats 一致：每条事件按其 ts 的日历日计）。
+    """
+    counts: dict[tuple, dict] = defaultdict(lambda: {
+        "screen_on": 0, "screen_off": 0, "unlock": 0, "switch": 0,
+    })
+    for device_id, ts, type_, p in events:
+        if type_ != "session":
+            continue
+        kind = p.get("kind")
+        d = day_of(ts)
+        c = counts[(device_id, d)]
+        if kind == "screen_on":
+            c["screen_on"] += 1
+        elif kind == "screen_off":
+            c["screen_off"] += 1
+        elif kind == "unlock":
+            c["unlock"] += 1
+        elif kind == "app_switch":
+            c["switch"] += 1
+    return counts
+
+
+def build_daily_stats(events, sessions) -> list[tuple]:
+    """按 (device_id, day) 汇总。"""
+    stats: dict[tuple, dict] = defaultdict(lambda: {
+        "total_screen_ms": 0, "app_usage": defaultdict(int), "notif_count": 0,
+        "notif_clicked": 0, "notif_apps": defaultdict(int), "screen_on": 0,
+        "screen_off": 0, "unlock": 0, "switch": 0, "location": 0, "audio_clip": 0,
+    })
+    for device_id, day, pkg, app, activity, start_ms, end_ms, dur in sessions:
+        s = stats[(device_id, day)]
+        s["total_screen_ms"] += dur
+        s["app_usage"][app] += dur
+    for device_id, ts, type_, p in events:
+        d = day_of(ts)
+        s = stats[(device_id, d)]
+        if type_ == "notification":
+            s["notif_count"] += 1
+            if p.get("clicked"):
+                s["notif_clicked"] += 1
+            pkg = p.get("pkg", "unknown")
+            if not is_noise(pkg):
+                s["notif_apps"][p.get("app", pkg)] += 1
+        elif type_ == "location":
+            s["location"] += 1
+        elif type_ == "audio_clip":
+            s["audio_clip"] += 1
+    # 屏幕状态统一由 derive_screen_states 推导，合并到每日汇总
+    for (device_id, d), sc in derive_screen_states(events).items():
+        s = stats[(device_id, d)]
+        s["screen_on"] += sc["screen_on"]
+        s["screen_off"] += sc["screen_off"]
+        s["unlock"] += sc["unlock"]
+        s["switch"] += sc["switch"]
 
     rows = []
-    for day, s in sorted(stats.items()):
+    for (device_id, day), s in sorted(stats.items()):
         top_apps = sorted(s["app_usage"].items(), key=lambda kv: -kv[1])[:10]
         top_notif = sorted(s["notif_apps"].items(), key=lambda kv: -kv[1])[:5]
         rows.append((
-            day, s["total_screen_ms"],
+            device_id, day, s["total_screen_ms"],
             json.dumps([{"app": a, "ms": m} for a, m in top_apps], ensure_ascii=False),
             s["notif_count"], s["notif_clicked"],
             json.dumps([{"app": a, "n": n} for a, n in top_notif], ensure_ascii=False),
@@ -554,14 +658,14 @@ def infer_home_work_candidates(conn: sqlite3.Connection) -> int:
             p = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
             continue
-        lat, lon = p.get("lat"), p.get("lon")
-        if lat is None or lon is None:
-            continue
-        gk = f"{round(lat * 1000) / 1000:.3f},{round(lon * 1000) / 1000:.3f}"
-        dt = datetime.datetime.fromtimestamp(ts / 1000)
-        hour = dt.hour
-        if hour < 5:
-            home_days[gk].add(dt.strftime("%Y-%m-%d"))
+        lat, lon = p.get("lat"), p.get("lon")
+        if lat is None or lon is None:
+            continue
+        gk = f"{round(lat * 1000) / 1000:.3f},{round(lon * 1000) / 1000:.3f}"
+        dt = datetime.datetime.fromtimestamp(ts / 1000, tz=_TZ_CST)
+        hour = dt.hour
+        if hour < 5:
+            home_days[gk].add(dt.strftime("%Y-%m-%d"))
         if 9 <= hour < 18 and dt.weekday() < 5:
             work_count[gk] += 1
 
@@ -597,7 +701,15 @@ def infer_home_work_candidates(conn: sqlite3.Connection) -> int:
     return n_updated
 
 
-def detect_anomalies(conn: sqlite3.Connection, lookback_days: int = 7) -> int:
+def detect_anomalies(conn: sqlite3.Connection, lookback_days: int = 7) -> int:
+    """P1-3 新地点/异常事件探测：识别打破规律的点，写入 anomalies 表。
+
+    夜间边界（深夜在外判定）与 new_place 回看窗口走 etl_config 外置配置。
+    """
+    cfg = load_etl_config()["anomaly"]
+    night_start_h = cfg["night_start_h"]
+    night_end_h = cfg["night_end_h"]
+    lookback_days = cfg.get("new_place_lookback_days", lookback_days)
     """P1-3 新地点/异常事件探测：识别打破规律的点，写入 anomalies 表。
 
     三类异常（作画像叙事节点）：
@@ -628,19 +740,19 @@ def detect_anomalies(conn: sqlite3.Connection, lookback_days: int = 7) -> int:
     for r in conn.execute("SELECT * FROM places"):
         if r["label"] in ("家", "公司"):
             continue
-        if r["first_seen"] and r["first_seen"] >= now_ms - lookback_days * 86400000 and r["visit_count"] <= 3:
-            day = datetime.datetime.fromtimestamp(r["first_seen"] / 1000).strftime("%Y-%m-%d")
+        if r["first_seen"] and r["first_seen"] >= now_ms - lookback_days * 86400000 and r["visit_count"] <= 3:
+            day = datetime.datetime.fromtimestamp(r["first_seen"] / 1000, tz=_TZ_CST).strftime("%Y-%m-%d")
             name = r["poi"] or r["poi_fallback"] or r["grid_key"]
             rows.append((
                 day, "new_place", r["device_id"], r["grid_key"], name,
                 f"首次到访新地点：{name}（访问 {r['visit_count']} 次）", r["first_seen"],
             ))
 
-    # 2) 深夜/凌晨在外（23:00-05:00 停留且不在家网格）
-    for r in conn.execute("SELECT * FROM stays"):
-        h = datetime.datetime.fromtimestamp(r["start_ts"] / 1000).hour
-        if not (h >= 23 or h < 5):
-            continue
+    # 2) 深夜/凌晨在外（23:00-05:00 停留且不在家网格）
+    for r in conn.execute("SELECT * FROM stays"):
+        h = datetime.datetime.fromtimestamp(r["start_ts"] / 1000, tz=_TZ_CST).hour
+        if not (h >= night_start_h or h < night_end_h):
+            continue
         if r["grid_key"] in home:
             continue
         day = r["day"]
@@ -659,7 +771,7 @@ def detect_anomalies(conn: sqlite3.Connection, lookback_days: int = 7) -> int:
             continue
         # 正午 13:00 作为"白天在公司"的代表时刻：停留段覆盖 13:00 且落在公司网格
         # （不能用 start_ts 落在窗口内判断——公司停留段常开始于 08:40/09:47，会被误判缺席）
-        noon = int(datetime.datetime.fromisoformat(f"{day} 13:00").timestamp() * 1000)
+        noon = int(datetime.datetime.fromisoformat(f"{day} 13:00").replace(tzinfo=_TZ_CST).timestamp() * 1000)
         in_office = any(
             s[2] in work and s[0] <= noon <= s[1]
             for s in day_stays
@@ -865,6 +977,65 @@ def merge_device_aliases(conn: sqlite3.Connection) -> int:
     return merged
 
 
+def build_contract_coverage(conn: sqlite3.Connection) -> int:
+    """A① 契约覆盖校验：比对期望事件类型契约(contract.EXPECTED_EVENT_TYPES)与
+    events 实际到达类型，产出 contract_coverage 事实表（全量重建，幂等）。
+
+    - 期望类型不在 events 中 → missing
+    - 期望类型到达但 last_seen 超过 STALE_DAYS 天 → stale
+    - 期望类型近期到达 → ok
+    - events 中出现但不在契约中的类型 → unexpected（expected=0）
+    """
+    from gacore.langTrack.contract import EXPECTED_EVENT_TYPES, STALE_DAYS
+    from gacore.jsonl_logger import get_logger
+
+    log = get_logger("langTrack.etl")
+
+    # 实际到达类型：type -> (count, max_ts)
+    actual: dict[str, tuple[int, int]] = {}
+    try:
+        rows = conn.execute(
+            "SELECT type, COUNT(*), MAX(ts) FROM events GROUP BY type"
+        ).fetchall()
+    except sqlite3.OperationalError as e:
+        # events 表不存在（极端情况）时不阻塞 ETL
+        log.warning("contract_coverage 跳过: events 表不可读", error_type=type(e).__name__, error=str(e))
+        return 0
+    for type_, cnt, max_ts in rows:
+        if type_ is not None:
+            actual[type_] = (cnt, max_ts)
+
+    now_ms = int(time.time() * 1000)
+    stale_ms = STALE_DAYS * 86400000
+
+    out: list[tuple] = []
+    for type_, meta in EXPECTED_EVENT_TYPES.items():
+        desc = meta.get("desc", "")
+        consumed = meta.get("consumed", "false")
+        if type_ not in actual:
+            out.append((type_, 1, consumed, desc, 0, 0, None, "missing"))
+        else:
+            cnt, last_seen = actual[type_]
+            status = "stale" if (now_ms - last_seen) > stale_ms else "ok"
+            out.append((type_, 1, consumed, desc, 1, cnt, last_seen, status))
+
+    # 实际到达但不在契约中的类型 → unexpected
+    for type_, (cnt, last_seen) in actual.items():
+        if type_ not in EXPECTED_EVENT_TYPES:
+            out.append((type_, 0, "false", None, 1, cnt, last_seen, "unexpected"))
+
+    conn.execute("DELETE FROM contract_coverage")
+    conn.executemany(
+        "INSERT OR REPLACE INTO contract_coverage"
+        "(type, expected, consumed, desc, arrived, event_count, last_seen_ts, status) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        out,
+    )
+    conn.commit()
+    log.info("contract_coverage 重建完成", type_count=len(out))
+    return len(out)
+
+
 def purge_dirty(db_path: Path) -> None:
     """删除 events 表中的异常数据：ts 脏数据 + payload 非 JSON。幂等，可重复执行。"""
     conn = sqlite3.connect(db_path)
@@ -888,7 +1059,149 @@ def purge_dirty(db_path: Path) -> None:
 _POI_MAX_PER_RUN = int(os.environ.get("LANGTRACK_POI_MAX_PER_RUN", "5"))
 
 
-def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool = True, run_route: bool = True, run_poi: bool = True) -> None:
+def _now_cst(conn: sqlite3.Connection) -> str:
+    """东八区当前时间字符串（与 schema 默认值格式一致）。"""
+    return conn.execute("SELECT datetime('now','+8 hours')").fetchone()[0]
+
+
+def _migrate_fact_tables(conn: sqlite3.Connection) -> None:
+    """PRAGMA 守卫的事实表迁移：补齐 device_id / created_at / updated_at / etl_version。"""
+
+    # daily_stats：SQLite 不支持 ALTER PRIMARY KEY，需重建表修正主键为 (device_id, day)
+    _migrate_daily_stats_pk(conn)
+
+    fact_tables = ["sessions", "stays", "trips", "daily_stats", "places", "anomalies", "grid_pois", "route_grids"]
+    for t in fact_tables:
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({t})")}
+        for col in ("created_at", "updated_at", "etl_version"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE {t} ADD COLUMN {col} TEXT")
+    conn.commit()
+
+
+def _migrate_daily_stats_pk(conn: sqlite3.Connection) -> None:
+    """将 daily_stats 主键由 (day) 修正为 (device_id, day)；若已正确则跳过。
+    旧库可能：a) 无 device_id 列且 PK=day；b) 已有 device_id 列但 PK 仍=day。
+    两种都需重建。保留全部历史数据。
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(daily_stats)")}
+    pk_cols = [r[1] for r in conn.execute("PRAGMA table_info(daily_stats)") if r[5]]
+    if pk_cols == ["day"] or "device_id" not in cols:
+        has_dev = "device_id" in cols
+        sel_dev = "COALESCE(device_id, 'unknown')" if has_dev else "'unknown'"
+        conn.execute("DROP TABLE IF EXISTS daily_stats_old")
+        conn.execute("ALTER TABLE daily_stats RENAME TO daily_stats_old")
+        conn.execute(
+            """
+            CREATE TABLE daily_stats (
+                device_id TEXT NOT NULL DEFAULT 'unknown',
+                day TEXT NOT NULL,
+                total_screen_ms INTEGER NOT NULL DEFAULT 0,
+                app_ranking_json TEXT,
+                notification_count INTEGER NOT NULL DEFAULT 0,
+                notification_clicked INTEGER NOT NULL DEFAULT 0,
+                top_notification_apps_json TEXT,
+                screen_on_count INTEGER NOT NULL DEFAULT 0,
+                screen_off_count INTEGER NOT NULL DEFAULT 0,
+                unlock_count INTEGER NOT NULL DEFAULT 0,
+                switch_count INTEGER NOT NULL DEFAULT 0,
+                location_count INTEGER NOT NULL DEFAULT 0,
+                audio_clip_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT DEFAULT (datetime('now', '+8 hours')),
+                created_at TEXT,
+                etl_version TEXT,
+                PRIMARY KEY(device_id, day)
+            )
+            """
+        )
+        conn.execute(
+            f"""
+            INSERT INTO daily_stats (
+                device_id, day, total_screen_ms, app_ranking_json,
+                notification_count, notification_clicked, top_notification_apps_json,
+                screen_on_count, screen_off_count, unlock_count,
+                switch_count, location_count, audio_clip_count, updated_at
+            )
+            SELECT {sel_dev}, day, total_screen_ms, app_ranking_json,
+                notification_count, notification_clicked, top_notification_apps_json,
+                screen_on_count, screen_off_count, unlock_count,
+                switch_count, location_count, audio_clip_count, updated_at
+            FROM daily_stats_old
+            """
+        )
+        conn.execute("DROP TABLE daily_stats_old")
+        conn.commit()
+
+
+def _stamp_fact_tables(conn: sqlite3.Connection) -> None:
+    """B8：标注 etl_version/updated_at，并回填 created_at（按各表自然时间字段）。"""
+
+    # (表, 自然时间字段, 是否毫秒时间戳)
+    spec = {
+        "sessions": ("start_ms", True),
+        "stays": ("start_ts", True),
+        "trips": ("start_ts", True),
+        "daily_stats": ("day", False),
+        "places": ("first_seen", True),
+        "anomalies": ("ts", True),
+        "grid_pois": ("queried_at", True),
+        "route_grids": ("day", False),
+    }
+    for t, (time_col, is_ms) in spec.items():
+        conn.execute(
+            f"UPDATE {t} SET etl_version=?, updated_at=datetime('now','+8 hours') "
+            f"WHERE etl_version IS NULL OR etl_version != ?",
+            (ETL_VERSION, ETL_VERSION),
+        )
+        if is_ms:
+            conn.execute(
+                f"UPDATE {t} SET created_at=datetime({time_col}/1000,'unixepoch','+8 hours') "
+                f"WHERE created_at IS NULL AND {time_col} IS NOT NULL"
+            )
+        else:
+            conn.execute(
+                f"UPDATE {t} SET created_at={time_col} WHERE created_at IS NULL AND {time_col} IS NOT NULL"
+            )
+    conn.commit()
+
+
+def _read_watermarks(conn: sqlite3.Connection) -> dict[str, int]:
+    """B1：读取 etl_state 中的 per-device 水位线（上次处理的最大事件 ts）。"""
+    rows = conn.execute("SELECT device_id, last_event_ts FROM etl_state").fetchall()
+    return {r[0]: r[1] for r in rows if r[1] is not None}
+
+
+def _compute_affected_days(conn: sqlite3.Connection, watermarks: dict[str, int], lookback_days: int = 3) -> set[str]:
+    """B1：以水位线为锚，回看 lookback_days 天，得到需要重建的日期集合。"""
+    min_ts = min(watermarks.values())
+    start = datetime.datetime.fromtimestamp(min_ts / 1000, _TZ_CST).date() - datetime.timedelta(days=lookback_days)
+    end = datetime.datetime.now(_TZ_CST).date()
+    days: set[str] = set()
+    cur = start
+    while cur <= end:
+        days.add(cur.isoformat())
+        cur += datetime.timedelta(days=1)
+    return days
+
+
+def _update_etl_state(conn: sqlite3.Connection) -> None:
+    """B1：成功重建后写入 per-device 水位线。"""
+    now = _now_cst(conn)
+    rows = conn.execute("SELECT device_id, MAX(ts) FROM events GROUP BY device_id").fetchall()
+    for device_id, last_ts in rows:
+        if last_ts is None:
+            continue
+        conn.execute(
+            "INSERT INTO etl_state(device_id, last_event_ts, last_run_at, updated_at) "
+            "VALUES (?,?,?,?) "
+            "ON CONFLICT(device_id) DO UPDATE SET "
+            "last_event_ts=excluded.last_event_ts, last_run_at=excluded.last_run_at, updated_at=excluded.updated_at",
+            (device_id, last_ts, now, now),
+        )
+    conn.commit()
+
+
+def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool = True, run_route: bool = True, run_poi: bool = True, incremental: bool = False) -> None:
     conn = sqlite3.connect(db_path)
     conn.executescript(_SCHEMA)
     # 迁移：旧 places 表补 is_primary 列（新库已含）
@@ -896,7 +1209,25 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool
     if "is_primary" not in cols:
         conn.execute("ALTER TABLE places ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0")
     # 迁移：places 语义/候选列 + 旧库空 device_id 归并
-    migrate_places(conn)
+    migrate_places(conn)
+
+    # B migration: ensure fact tables have device_id / created_at / updated_at / etl_version
+    _migrate_fact_tables(conn)
+
+    # B1 incremental watermark: read etl_state; if watermark exists, rebuild only lookback window
+    incremental_active = False
+    affected_days: set[str] = set()
+    if incremental:
+        watermarks = _read_watermarks(conn)
+        if watermarks:
+            affected_days = _compute_affected_days(conn, watermarks, lookback_days=3)
+            if affected_days:
+                incremental_active = True
+                print(f"[etl] incremental: rebuild {len(affected_days)} affected days")
+            else:
+                print("[etl] incremental: no affected days, full rebuild")
+        else:
+            print("[etl] incremental: no watermark in etl_state, full rebuild")
     # 同设备重装前后 device_id 归一（必须在 load_events 之前，build 系列按 device_id 分组）
     n_alias = merge_device_aliases(conn)
     if n_alias:
@@ -906,10 +1237,16 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool
     print(f"[etl] 事件总数(清洗后): {len(events)}")
 
     # 重置表（全量重建，简单可靠）；places 用 upsert 保留已标注标签（家/公司）
-    conn.execute("DELETE FROM sessions")
-    conn.execute("DELETE FROM daily_stats")
-
-    sessions = build_sessions(events)
+    if incremental_active:
+        ph = ",".join("?" * len(affected_days))
+        conn.execute(f"DELETE FROM sessions WHERE day IN ({ph})", list(affected_days))
+        conn.execute(f"DELETE FROM daily_stats WHERE day IN ({ph})", list(affected_days))
+    else:
+        conn.execute("DELETE FROM sessions")
+        conn.execute("DELETE FROM daily_stats")
+    sessions = build_sessions(events)
+    if incremental_active:
+        sessions = [r for r in sessions if r[1] in affected_days]
     conn.executemany(
         "INSERT INTO sessions(device_id, day, pkg, app, activity, start_ms, end_ms, duration_ms) "
         "VALUES (?,?,?,?,?,?,?,?)",
@@ -917,18 +1254,26 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool
     )
     print(f"[etl] sessions: {len(sessions)}")
 
-    daily = build_daily_stats(events, sessions)
+    daily = build_daily_stats(events, sessions)
+    if incremental_active:
+        daily = [r for r in daily if r[1] in affected_days]
     conn.executemany(
-        "INSERT INTO daily_stats(day, total_screen_ms, app_ranking_json, notification_count, "
+        "INSERT INTO daily_stats(device_id, day, total_screen_ms, app_ranking_json, notification_count, "
         "notification_clicked, top_notification_apps_json, screen_on_count, screen_off_count, "
-        "unlock_count, switch_count, location_count, audio_clip_count) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        "unlock_count, switch_count, location_count, audio_clip_count) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
         daily,
     )
     print(f"[etl] daily_stats: {len(daily)}")
 
     # L1：停驻点检测 → stays 表（全量重建）
-    conn.execute("DELETE FROM stays")
-    stays = build_stays(events)
+    if incremental_active:
+        ph = ",".join("?" * len(affected_days))
+        conn.execute(f"DELETE FROM stays WHERE day IN ({ph})", list(affected_days))
+    else:
+        conn.execute("DELETE FROM stays")
+    stays = build_stays(events)
+    if incremental_active:
+        stays = [r for r in stays if r[-1] in affected_days]
     conn.executemany(
         "INSERT INTO stays(device_id, start_ts, end_ts, duration_ms, center_lat, center_lon, "
         "min_lat, min_lon, max_lat, max_lon, n_points, radius_m, grid_key, day) "
@@ -945,8 +1290,14 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool
         "SELECT device_id, start_ts, end_ts, polyline, route_key, route_mode, route_encoded_at FROM trips"
     ):
         old_route[(r[0], r[1], r[2])] = (r[3], r[4], r[5], r[6])
-    conn.execute("DELETE FROM trips")
-    trips = build_trips(events, stays)
+    if incremental_active:
+        ph = ",".join("?" * len(affected_days))
+        conn.execute(f"DELETE FROM trips WHERE day IN ({ph})", list(affected_days))
+    else:
+        conn.execute("DELETE FROM trips")
+    trips = build_trips(events, stays)
+    if incremental_active:
+        trips = [t for t in trips if t[10] in affected_days]
     for t in trips:
         poly, rk, mode, enc = old_route.get((t[0], t[1], t[2]), (None, None, None, None))
         conn.execute(
@@ -1040,9 +1391,22 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool
             print(f"[etl] 沿途 POI 编码: {n_p} 个网格")
         except SystemExit as e:
             print(f"[etl] 跳过沿途 POI 编码: {e}")
-        except Exception as e:
-            print(f"[etl] 沿途 POI 编码失败(不影响 ETL): {e}")
-    print("[etl] 完成")
+        except Exception as e:
+            print(f"[etl] 沿途 POI 编码失败(不影响 ETL): {e}")
+
+    # A① 契约覆盖校验：期望事件类型 vs 实际到达（全量重建，写在最后）
+    conn = sqlite3.connect(db_path)
+    n_cov = build_contract_coverage(conn)
+    conn.close()
+    print(f"[etl] contract_coverage: {n_cov} 种类型覆盖校验完成")
+
+    # B8 版本标注 + B1 增量水位线（最后统一打标，覆盖全部事实表）
+    conn = sqlite3.connect(db_path)
+    _stamp_fact_tables(conn)
+    _update_etl_state(conn)
+    conn.close()
+
+    print("[etl] 完成")
 
 
 def main() -> None:
@@ -1052,10 +1416,11 @@ def main() -> None:
     parser.add_argument("--no-geocode", action="store_true", help="跳过高德增量 regeo 编码")
     parser.add_argument("--no-route", action="store_true", help="跳过高德路径规划补路(L3)")
     parser.add_argument("--no-poi", action="store_true", help="跳过沿途 POI 编码(P2)")
+    parser.add_argument("--incremental", action="store_true", help="incremental rebuild from watermark")
     args = parser.parse_args()
     if args.purge:
         purge_dirty(args.db)
-    run(args.db, run_geocode=not args.no_geocode, run_route=not args.no_route, run_poi=not args.no_poi)
+    run(args.db, run_geocode=not args.no_geocode, run_route=not args.no_route, run_poi=not args.no_poi, incremental=args.incremental)
 
 
 if __name__ == "__main__":

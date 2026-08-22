@@ -26,6 +26,10 @@ import urllib.request
 from collections import defaultdict
 from pathlib import Path
 
+import datetime  # noqa: E402  (routes 仅在此模块用 datetime，局部已无顶层导入)
+
+_TZ_CST = datetime.timezone(datetime.timedelta(hours=8))
+
 DB_PATH = Path(__file__).resolve().parents[3] / "data" / "langTrack.db"
 # 步行路径规划（上限 100km，最宽）；骑行/驾车可经 LANGTRACK_ROUTE_MODE 切换
 DIRECTION_URL = "https://restapi.amap.com/v3/direction/walking"
@@ -57,7 +61,7 @@ def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
-def build_trips(events, stays) -> list[tuple]:
+def build_trips(events, stays, min_duration_ms: int = TRIP_MIN_DURATION_MS, min_dist_m: float = TRIP_MIN_DIST_M) -> list[tuple]:
     """识别移动段：相邻两个停留段之间的区间。
 
     events: [(device_id, ts, type, payload)]；stays: build_stays 的 tuple 列表。
@@ -86,9 +90,7 @@ def build_trips(events, stays) -> list[tuple]:
         stays_by_dev[s[0]].append(s)
     for lst in stays_by_dev.values():
         lst.sort(key=lambda s: s[1])
-
-    import datetime
-    trips: list[tuple] = []
+    trips: list[tuple] = []
     for device_id, segs in stays_by_dev.items():
         pts = by_dev.get(device_id, [])
         # 指针式取 gap 内点（stays 有序、pts 有序）
@@ -117,7 +119,7 @@ def build_trips(events, stays) -> list[tuple]:
             dist = _haversine(start_lat, start_lon, end_lat, end_lon)
             if dist < TRIP_MIN_DIST_M:
                 continue
-            day = datetime.datetime.fromtimestamp(start_ts / 1000).strftime("%Y-%m-%d")
+            day = datetime.datetime.fromtimestamp(start_ts / 1000, tz=_TZ_CST).strftime("%Y-%m-%d")
             trips.append((
                 device_id, start_ts, end_ts, duration,
                 round(start_lat, 6), round(start_lon, 6),
