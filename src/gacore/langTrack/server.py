@@ -31,13 +31,14 @@ _ETL_TIMEOUT_SECONDS = int(os.environ.get("LANGTRACK_ETL_TIMEOUT_SECONDS", "120"
 def _run_etl_once() -> None:
     """幂等重建事实表；失败只记日志不阻塞。"""
     try:
-        result = subprocess.run(
-            [sys.executable, "-m", "gacore.langTrack.etl"],
-            cwd=str(_PROJECT_ROOT),
-            capture_output=True,
-            timeout=_ETL_TIMEOUT_SECONDS,
-            check=False,
-        )
+        result = subprocess.run(
+            [sys.executable, "-m", "gacore.langTrack.etl"],
+            cwd=str(_PROJECT_ROOT),
+            capture_output=True,
+            timeout=_ETL_TIMEOUT_SECONDS,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
         if result.returncode == 0:
             logger.info("periodic ETL ok")
         else:
