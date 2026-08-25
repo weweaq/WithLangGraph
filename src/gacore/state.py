@@ -35,9 +35,11 @@ class GAState(AgentState[Any], total=False):
     retry_count: int
     exit_reason: str | None
     pending_images: list[str]  # accumulated image paths for multi-image processing
+    active_card: str | None  # active character-card id for this conversation; declared so the graph channel does not drop it
+    rollover_context: str | None  # one-shot cross-day memory injection (from onboard_pack.json); cleared after first turn
 
 
-def new_state(user_input: str, cfg: Config) -> GAState:
+def new_state(user_input: str, cfg: Config, active_card: str | None = None) -> GAState:
     """Seed a fresh GAState for a new conversation with the user's first message."""
     return GAState(
         messages=[HumanMessage(content=user_input)],
@@ -47,5 +49,6 @@ def new_state(user_input: str, cfg: Config) -> GAState:
         done_hooks=[],
         retry_count=0,
         exit_reason=None,
+        active_card=active_card,
         pending_images=[],
     )

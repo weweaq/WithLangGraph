@@ -264,3 +264,99 @@ async def test_stream_agent_renders_each_message_once(
     assert sum(1 for t in texts if t.startswith("[tools] <-")) == 1
     assert sum(1 for t in texts if "wrote it" in t) == 1   # not duplicated, not replayed in turn 2
     assert sum(1 for t in texts if "second reply" in t) == 1
+
+@pytest.mark.asyncio
+async def test_role_command_lists_cards():
+    """Given /角色 with no argument, the reply lists the available character cards."""
+    _processed_ids.clear()
+    from gacore.character import Card
+
+    graph = MagicMock()
+    app = QQApp(graph)
+    app.client = MagicMock()
+    app.send_text = AsyncMock()
+
+    msg = MagicMock()
+    msg.id = "msg-role-list"
+    msg.content = "/角色"
+    msg.author = MagicMock()
+    msg.author.user_openid = "user-1"
+    msg.author.id = "user-1"
+
+    with (
+        patch.object(qq, "_ALLOWED", frozenset({"user-1"})),
+        patch.object(qq, "list_cards", return_value=[Card(id="nami", name="娜美", path=Path("nami.md"))]),
+        patch.object(qq, "_save_user_cards"),
+    ):
+        await app.on_message(msg, is_group=False)
+
+    out = app.send_text.call_args.args[1]
+    assert "可用角色" in out
+    assert "娜美" in out
+
+
+@pytest.mark.asyncio
+async def test_role_command_switches_card_and_clears_thread():
+    """Given /角色 <id>, the user's card is set, thread cleared, and reply names the character."""
+    _processed_ids.clear()
+    qq._user_threads.clear()
+    qq._user_card.clear()
+    qq._user_threads["user-1"] = "old-thread"
+
+    graph = MagicMock()
+    graph.checkpointer = MagicMock()
+    app = QQApp(graph)
+    app.client = MagicMock()
+    app.send_text = AsyncMock()
+
+    msg = MagicMock()
+    msg.id = "msg-role-switch"
+    msg.content = "/角色 inoue"
+    msg.author = MagicMock()
+    msg.author.user_openid = "user-1"
+    msg.author.id = "user-1"
+
+    with (
+        patch.object(qq, "_ALLOWED", frozenset({"user-1"})),
+        patch.object(qq, "card_name", return_value="井上织姬"),
+        patch.object(qq, "_save_user_cards") as save,
+    ):
+        await app.on_message(msg, is_group=False)
+
+    assert qq._user_card.get("user-1") == "inoue"
+    assert "user-1" not in qq._user_threads
+    save.assert_called_once()
+    out = app.send_text.call_args.args[1]
+    assert "井上织姬" in out
+
+
+@pytest.mark.asyncio
+async def test_role_command_off_clears_card():
+    """Given /角色 off, the user's card is removed and a confirmation is sent."""
+    _processed_ids.clear()
+    qq._user_threads.clear()
+    qq._user_card.clear()
+    qq._user_card["user-1"] = "inoue"
+
+    graph = MagicMock()
+    graph.checkpointer = MagicMock()
+    app = QQApp(graph)
+    app.client = MagicMock()
+    app.send_text = AsyncMock()
+
+    msg = MagicMock()
+    msg.id = "msg-role-off"
+    msg.content = "/角色 off"
+    msg.author = MagicMock()
+    msg.author.user_openid = "user-1"
+    msg.author.id = "user-1"
+
+    with (
+        patch.object(qq, "_ALLOWED", frozenset({"user-1"})),
+        patch.object(qq, "_save_user_cards"),
+    ):
+        await app.on_message(msg, is_group=False)
+
+    assert "user-1" not in qq._user_card
+    out = app.send_text.call_args.args[1]
+    assert "已退出角色扮演" in out

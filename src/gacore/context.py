@@ -13,6 +13,7 @@ from typing import Final
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
+from gacore.character import card_prompt
 from gacore.config import Config
 from gacore.state import GAState
 from gacore.tools.daily_notes import load_recent_daily_summaries
@@ -24,12 +25,24 @@ _FOLD_LIMIT: Final = 30
 _TRUNCATION_MARKER: Final = "..."
 EARLIER_HEADER: Final = "=== Earlier context ==="
 DAILY_HEADER: Final = "=== Recent daily notes ==="
+ROLLOVER_HEADER: Final = "=== 昨日记忆注入 ==="
 
 _MEMORY_HINT: Final = "[Memory refresh: reload L1 insights and L2 facts into working memory]"
 _CHECKPOINT_HINT: Final = "[Checkpoint time: update working checkpoint]"
 _FILE_HINT: Final = "[Write your current state to a file]"
 _ASK_USER_HINT: Final = "[Long-running: consider asking the user for confirmation]"
 _ANTI_LOOP_HINT: Final = "[Warning: long loop detected, wrap up soon]"
+
+# Role-card injection: the persona text is stacked on top of the base rules when
+# state.active_card is set. Tool availability is decided by the runtime assembly
+# (graph/model binding), NOT by the persona — the bridge line keeps it explicit so
+# a character can call tools while replying in character.
+ROLE_HEADER: Final = "=== Active role ==="
+_ROLE_TOOL_BRIDGE: Final = (
+    "\n\n[你现在以角色的身份与对方对话,但保留系统智能体的全部能力:"
+    "可以看到并使用系统提供的工具。在需要帮助对方办具体的事时,"
+    "自然地调用工具完成,再用角色的方式表达结果。]"
+)
 
 # Fallback L0 rules (probe-first) used when config/assets/sys_prompt.txt is missing.
 _DEFAULT_BASE_PROMPT: Final = (
@@ -49,9 +62,21 @@ def build_system_prompt(state: GAState, cfg: Config) -> str:
         prompt = _DEFAULT_BASE_PROMPT
     now = datetime.now(_TZ).strftime("%Y-%m-%d %H:%M:%S")
     prompt += f"\n[Current time: {now}]"
+    # Role card: when active, stack the persona on top of the base rules. Tools
+    # stay available to both personas — the bridge line declares that explicitly.
+    card_id = (state.get("active_card") or "").strip()
+    if card_id:
+        role_text = card_prompt(cfg, card_id)
+        if role_text:
+            prompt += f"\n\n{ROLE_HEADER}\n{role_text}{_ROLE_TOOL_BRIDGE}"
     daily = load_recent_daily_summaries(cfg)
     if daily:
         prompt += f"\n{DAILY_HEADER}\n{daily}"
+    # One-shot cross-day memory injection: set by qq.py::_maybe_rollover on the first
+    # message of a new day and cleared by graph.py::cleanup_images after that turn.
+    rollover = (state.get("rollover_context") or "").strip()
+    if rollover:
+        prompt += f"\n{ROLLOVER_HEADER}\n{rollover}"
     key_info = (state.get("working") or {}).get("key_info")
     if key_info:
         prompt += f"\n[Working checkpoint]\n{key_info}"
