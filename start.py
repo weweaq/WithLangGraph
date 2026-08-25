@@ -40,7 +40,7 @@ async def _main() -> None:
     logger.info("Scheduler started (background thread)")
 
     # QQ Bot occupies the main asyncio event loop.
-    graph = build_config()
+    graph = await build_config()
     app = QQApp(graph)
     logger.info("QQ frontend starting")
     try:

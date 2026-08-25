@@ -10,6 +10,7 @@ dependencies = [
     "langchain",
     "langgraph",
     "langgraph-checkpoint",
+    "langgraph-checkpoint-sqlite",
     "langchain-core",
     "langchain-openai",
     "langchain-anthropic",

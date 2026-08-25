@@ -19,6 +19,8 @@ temp/
 *.egg-info/
 uv.lock
 data/
+botpy.log
+.omo/
 
 # 设计/巡检文档不入库（本地工作文档）
 docs/sre/
