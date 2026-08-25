@@ -41,6 +41,10 @@ _GRID = 0.003
 # 移动段识别阈值
 TRIP_MIN_DURATION_MS = 60_000          # 移动段最短时长 60s
 TRIP_MIN_DIST_M = 300.0                # 起终点直线距离 >= 300m 才算移动段
+# 无采样点"推断移动段"的间隔时长上限（默认 2h）：
+# 相邻停驻点 gap 内没有任何 location 采样点、且间隔超长时，无法证明存在单次端到点移动，
+# 通常对应设备采集空窗（如下班后 GPS 停采到深夜），跳过以免把停留间隔误记为移动时长
+TRIP_MAX_INFER_GAP_MS = int(os.environ.get("LANGTRACK_TRIP_MAX_INFER_GAP_MS", "7200000"))
 # 配额节流：单次 ETL 增量补路上限（远低于 5000 次/日）
 _MAX_ENCODE_PER_RUN = int(os.environ.get("LANGTRACK_ROUTE_MAX_PER_RUN", "100"))
 _ROUTE_MODE = os.environ.get("LANGTRACK_ROUTE_MODE", "walking")
@@ -97,8 +101,7 @@ def build_trips(events, stays, min_duration_ms: int = TRIP_MIN_DURATION_MS, min_
         for i in range(len(segs) - 1):
             a, b = segs[i], segs[i + 1]
             gap_start, gap_end = a[2], b[1]  # a.end_ts, b.start_ts
-            duration = gap_end - gap_start
-            if duration < TRIP_MIN_DURATION_MS:
+            if gap_end - gap_start < TRIP_MIN_DURATION_MS:
                 continue
             # gap 内采样点
             lo = 0
@@ -113,12 +116,19 @@ def build_trips(events, stays, min_duration_ms: int = TRIP_MIN_DURATION_MS, min_
                 start_ts, start_lat, start_lon = in_gap[0]
                 end_ts, end_lat, end_lon = in_gap[-1]
             else:
-                # 无采样点：用前后停留中心兜底
+                # 无采样点：仅当间隔在合理推断时长内才用前后停留中心兜底构造"推断移动段"；
+                # 超长间隔常见于设备采集空窗（如下班后 GPS 停采到深夜），无法证明存在单次
+                # 端到点移动，跳过以免把停留间隔误记为移动时长（08-21 17:51→00:08 6.28h 案例）
+                if gap_end - gap_start > TRIP_MAX_INFER_GAP_MS:
+                    continue
                 start_ts, start_lat, start_lon = gap_start, a[4], a[5]
                 end_ts, end_lat, end_lon = gap_end, b[4], b[5]
             dist = _haversine(start_lat, start_lon, end_lat, end_lon)
             if dist < TRIP_MIN_DIST_M:
                 continue
+            # 时长统一取端点到点时刻差，保证 duration_ms 与 (end_ts - start_ts) 自洽
+            # （原实现时长取 gap 全程，导致有采样旅行段 duration 与端点矛盾，如 08-19 4.12h vs 2.50h）
+            duration = end_ts - start_ts
             day = datetime.datetime.fromtimestamp(start_ts / 1000, tz=_TZ_CST).strftime("%Y-%m-%d")
             trips.append((
                 device_id, start_ts, end_ts, duration,

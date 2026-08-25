@@ -399,6 +399,122 @@ def _build(conn: sqlite3.Connection, device_id: str | None, days: int) -> dict[s
 
     }
 
+    # ---- 3.5 P0 拟人字段接入（v2 设计 3.3.1，只增不减；旧库缺列自动降级）----
+
+    p0_cols = ["sleep_start_hhmm", "sleep_end_hhmm", "sleep_duration_min", "time_app_json"]
+
+    if all(_has_col(conn, "daily_stats", c) for c in p0_cols):
+
+        _p0 = cur.execute(
+
+            f"SELECT sleep_start_hhmm, sleep_end_hhmm, sleep_duration_min, time_app_json "
+
+            f"FROM daily_stats {dev_filter} ORDER BY day DESC LIMIT 1",
+
+            dparams,
+
+        ).fetchone()
+
+        if _p0:
+
+            result["rhythm"]["sleep_start"] = _p0[0]
+
+            result["rhythm"]["sleep_end"] = _p0[1]
+
+            result["rhythm"]["sleep_duration_min"] = _p0[2]
+
+            result["rhythm"]["time_app_matrix"] = json.loads(_p0[3] or "[]")
+
+            try:
+
+                _rtf_days = cur.execute(
+
+                    f"SELECT COUNT(*) FROM daily_stats {dev_filter}", dparams
+
+                ).fetchone()[0]
+
+            except sqlite3.Error:  # noqa: BLE001
+
+                _rtf_days = 0
+
+            result["rhythm"]["sleep_confidence"] = "low" if _rtf_days < 14 else "ok"
+
+    # 行为稳定度：跨天聚合表 behavior_stability（P0 字段 3，8 天短窗 confidence=low）
+
+    stability: dict[str, Any] = {}
+
+    try:
+
+        _bs_cols = [r[1] for r in conn.execute("PRAGMA table_info(behavior_stability)")]
+
+    except sqlite3.OperationalError:
+
+        _bs_cols = []
+
+    if _bs_cols:
+
+        bs_q = "SELECT * FROM behavior_stability"
+
+        bs_params: list = []
+
+        if dev_filter:
+
+            bs_q += " WHERE device_id=?"
+
+            bs_params = dparams
+
+        bs_q += " ORDER BY day DESC LIMIT 1"
+
+        try:
+
+            bs_row = cur.execute(bs_q, bs_params).fetchone()
+
+            if bs_row:
+
+                _bs = dict(zip([c[0] for c in cur.description], bs_row))
+
+                try:
+
+                    _bs_days = cur.execute(
+
+                        f"SELECT COUNT(*) FROM daily_stats {dev_filter}", dparams
+
+                    ).fetchone()[0]
+
+                except sqlite3.Error:  # noqa: BLE001
+
+                    _bs_days = 0
+
+                stability = {
+
+                    "score": _bs.get("stability_score"),
+
+                    "leave_home_std_ms": _bs.get("leave_home_std_ms"),
+
+                    "return_home_std_ms": _bs.get("return_home_std_ms"),
+
+                    "route_key_reuse_rate": _bs.get("route_key_reuse_rate"),
+
+                    "sleep_regularity": _bs.get("sleep_regularity"),
+
+                    "window_days": _bs.get("window_days"),
+
+                    "confidence": "low" if _bs_days < 14 else "ok",
+
+                    "periodicity": json.loads(_bs.get("periodicity_json") or "{}"),
+
+                }
+
+        except sqlite3.OperationalError:
+
+            stability = {}
+
+    result["stability"] = stability
+
+    if stability.get("sleep_regularity") is not None:
+
+        result["rhythm"]["sleep_regularity"] = stability["sleep_regularity"]
+
 
 
     # ---- 4. 生活规律（routine）----

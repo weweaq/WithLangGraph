@@ -139,9 +139,29 @@ class LangTrackDayStats(TypedDict):
 
     sleep_signal: str
 
+    # P0 拟人语义字段（v2 设计文档附录 A；旧库未跑派生时为 None/[]，下游需做空值防御）
+    # 作息节律三标量来自 daily_stats P0 列；sleep_signal 为遗留兼容信号，保留但以本组为准
+    sleep_start_hhmm: int | None
+    sleep_end_hhmm: int | None
+    sleep_duration_min: int | None
+    time_app: list[dict]  # 时段×应用矩阵（daily_stats.time_app_json 解析后）
+
     # A① 契约覆盖：非 ok 的期望事件类型清单（缺失/停滞/未登记）
     coverage: list[dict]
     persona: dict
+
+
+def _row_val(row, col: str, default=None):
+    """安全读取 sqlite3.Row 列；旧库缺列（P0 派生未跑）时返回 default，不抛异常。"""
+    if row is None:
+        return default
+    try:
+        v = row[col]
+        return default if v is None else v
+    except (KeyError, IndexError):
+        return default
+
+
 def _today() -> str:
 
     import datetime
@@ -181,6 +201,8 @@ def langTrack_stats(day: str = "") -> dict:
                                 top_apps=[], notification_count=0, notification_clicked=0,
                                 unlock_count=0, switch_count=0, location_count=0,
                                 places=[], sleep_signal="langTrack 数据库不存在",
+                                sleep_start_hhmm=None, sleep_end_hhmm=None,
+                                sleep_duration_min=None, time_app=[],
                                 coverage=[], persona={})
 
 
@@ -202,6 +224,8 @@ def langTrack_stats(day: str = "") -> dict:
                                     top_apps=[], notification_count=0, notification_clicked=0,
                                     unlock_count=0, switch_count=0, location_count=0,
                                     places=[], sleep_signal="当日无数据（可能未采集或未同步）",
+                                    sleep_start_hhmm=None, sleep_end_hhmm=None,
+                                    sleep_duration_min=None, time_app=[],
                                     coverage=[], persona={})
 
 
@@ -252,6 +276,18 @@ def langTrack_stats(day: str = "") -> dict:
             # contract_coverage 表尚未建立（旧库未重跑 ETL）时不阻塞
             coverage = []
 
+        # P0 时段×应用矩阵：daily_stats.time_app_json（TEXT JSON）解析为 list；
+        # 旧库未跑 P0 派生（无该列）或值为空 → []
+        _time_app = []
+        _raw_ta = _row_val(stat, "time_app_json")
+        if _raw_ta:
+            try:
+                _time_app = json.loads(_raw_ta)
+            except (TypeError, ValueError):
+                _time_app = []
+        if not isinstance(_time_app, list):
+            _time_app = []
+
         conn.close()
 
         return LangTrackDayStats(
@@ -279,6 +315,11 @@ def langTrack_stats(day: str = "") -> dict:
 
             sleep_signal=sleep_signal,
 
+            sleep_start_hhmm=_row_val(stat, "sleep_start_hhmm"),
+            sleep_end_hhmm=_row_val(stat, "sleep_end_hhmm"),
+            sleep_duration_min=_row_val(stat, "sleep_duration_min"),
+            time_app=_time_app,
+
             coverage=coverage,
             persona=build_persona(db_path=str(db), days=7),
 
@@ -294,5 +335,8 @@ def langTrack_stats(day: str = "") -> dict:
 
                                 unlock_count=0, switch_count=0, location_count=0,
 
-                                places=[], sleep_signal=f"读取失败: {e}", coverage=[], persona={})
+                                places=[], sleep_signal=f"读取失败: {e}",
+                                sleep_start_hhmm=None, sleep_end_hhmm=None,
+                                sleep_duration_min=None, time_app=[],
+                                coverage=[], persona={})
 
