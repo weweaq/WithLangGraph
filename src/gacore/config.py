@@ -40,6 +40,45 @@ def _parse_max_turns(raw: str) -> int:
     return max_turns
 
 
+def _parse_bool(raw: str | None, default: bool) -> bool:
+    """Parse a boolean env value; unknown/missing values fall back to the given default."""
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_positive_int(raw: str | None, default: int) -> int:
+    """Parse a positive-int env value; invalid/missing values fall back to the given default."""
+    if raw is None:
+        return default
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return default
+
+
+@dataclass(frozen=True, slots=True)
+class RolloverConfig:
+    """Cross-day memory rollover policy for the QQ frontend.
+
+    Controls the "fresh thread every day + inject yesterday's memory pack into the
+    first message of a new day" mechanism:
+      - enabled: master switch. Off disables both rollover and pack consumption.
+      - inject_long_term_full: True injects the full global_mem_insight.txt into the
+        system prompt on the first turn after rollover; False injects a compact
+        summary derived from it.
+      - keep_old_thread: True keeps the previous day's SQLite checkpoint (searchable
+        history); False would delete it (not yet wired to deletion, reserved flag).
+      - recent_days: how many recent daily notes get summarized into the onboard
+        pack exported by scheduler.py after the daily-report job.
+    """
+
+    enabled: bool = True
+    inject_long_term_full: bool = False
+    keep_old_thread: bool = True
+    recent_days: int = 3
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     """Immutable runtime configuration shared by every gacore module.
@@ -54,6 +93,7 @@ class Config:
     logs_dir: Path
     temp_dir: Path
     max_turns: int = _DEFAULT_MAX_TURNS
+    rollover: RolloverConfig = RolloverConfig()
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Config:
@@ -66,6 +106,12 @@ class Config:
             logs_dir=_resolve_dir(_PROJECT_ROOT, source, "GACORE_LOGS_DIR", Path("logs")),
             temp_dir=_resolve_dir(_PROJECT_ROOT, source, "GACORE_TEMP_DIR", Path("temp")),
             max_turns=_parse_max_turns(source.get("DEFAULT_MAX_TURNS", str(_DEFAULT_MAX_TURNS))),
+            rollover=RolloverConfig(
+                enabled=_parse_bool(source.get("GACORE_ROLLOVER_ENABLED"), True),
+                inject_long_term_full=_parse_bool(source.get("GACORE_ROLLOVER_INJECT_LONG_TERM_FULL"), False),
+                keep_old_thread=_parse_bool(source.get("GACORE_ROLLOVER_KEEP_OLD_THREAD"), True),
+                recent_days=_parse_positive_int(source.get("GACORE_ROLLOVER_RECENT_DAYS"), 3),
+            ),
         )
 
     @classmethod
@@ -82,6 +128,7 @@ class Config:
             memory_dir=tmp_path / "memory",
             logs_dir=tmp_path / "logs",
             temp_dir=tmp_path / "temp",
+            rollover=RolloverConfig(),
         )
 
 

@@ -30,6 +30,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Final
 
 from gacore.config import Config, load_dotenv
@@ -239,6 +240,16 @@ def run_job(
     _write_daily_note(cfg, job, reply, error)
     _deliver(job, cfg, reply, error)
 
+    # Cross-day rollover: after a successful daily-report run, export an onboard
+    # memory pack (recent daily summaries + long-term persona) for the QQ frontend
+    # to consume on the first message of the new day. Best-effort only — a failure
+    # here must never block the report itself.
+    if error is None and "daily" in job.name.lower():
+        try:
+            _export_onboard_pack(cfg)
+        except Exception as e:  # noqa: BLE001 — pack export must never break the job
+            logger.error("onboard pack export failed", job=name, error_type=type(e).__name__, stack_trace=str(e))
+
     logger.info(
         "Job finished",
         job=name,
@@ -333,6 +344,101 @@ def _write_daily_note(cfg: Config, job: Job, reply: str, error: str | None) -> N
             if lines:
                 anchor = lines[-1]
                 edit_daily.func(date=today, old_str=anchor, new_str=anchor + "\n" + bullet, _cfg=cfg)
+
+
+def _onboard_pack_path(cfg: Config) -> Path:
+    """Return the onboard memory pack path (data/onboard_pack.json)."""
+    return cfg.root / "data" / "onboard_pack.json"
+
+
+def _load_active_qq_thread(cfg: Config) -> str:
+    """Return the first active QQ thread id from data/qq_user_threads.json, if any."""
+    path = cfg.root / "data" / "qq_user_threads.json"
+    if not path.is_file():
+        return ""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(raw, dict):
+        return ""
+    for thread in raw.values():
+        if isinstance(thread, str) and thread:
+            return thread
+    return ""
+
+
+def _long_term_insight(cfg: Config) -> str:
+    """Return the long-term persona text from memory/global_mem_insight.txt.
+
+    Falls back to any memory/global_mem*.txt file when the insight file is absent.
+    """
+    path = cfg.memory_dir / "global_mem_insight.txt"
+    if path.is_file():
+        return path.read_text(encoding="utf-8", errors="replace").strip()
+    candidates = sorted(cfg.memory_dir.glob("global_mem*.txt"))
+    for p in candidates:
+        text = p.read_text(encoding="utf-8", errors="replace").strip()
+        if text:
+            return text
+    return ""
+
+
+def _summarize_long_term(text: str, limit_lines: int = 40) -> str:
+    """Compress the long-term persona into a compact summary when inject_full is off."""
+    if not text:
+        return ""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) <= limit_lines:
+        return text
+    return "\n".join(lines[:limit_lines]) + "\n...(画像较长,已按摘要截断,完整内容见 memory/global_mem_insight.txt)"
+
+
+def _export_onboard_pack(cfg: Config) -> None:
+    """Assemble and write data/onboard_pack.json after a successful daily-report run.
+
+    The pack carries the recent N days of daily-note summaries plus the long-term
+    persona, so the QQ frontend can inject "yesterday's memory" into the first
+    message of the new day (see src/gacore/frontends/qq.py::_maybe_rollover).
+
+    Same-name overwrite makes the export naturally idempotent. Raises on failure —
+    callers wrap in try/except so a bad pack never blocks the report itself.
+    """
+    from gacore.tools.daily_notes import load_recent_daily_summaries
+
+    days = cfg.rollover.recent_days
+    daily_summary = load_recent_daily_summaries(cfg, days=days)
+    insight_full = _long_term_insight(cfg)
+    inject_full = cfg.rollover.inject_long_term_full
+    long_term_md = insight_full if inject_full else _summarize_long_term(insight_full)
+    now = datetime.now(UTC).astimezone()
+    date = now.date().isoformat()
+    pack = {
+        "date": date,
+        "created_at": now.isoformat(timespec="seconds"),
+        "source_job": "daily-report",
+        "prev_thread_id": _load_active_qq_thread(cfg),
+        "payload": {
+            "daily_summary_md": daily_summary,
+            "long_term_md": long_term_md,
+            "inject_full": inject_full,
+            "recent_days": days,
+        },
+    }
+    path = _onboard_pack_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(pack, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+        newline="",
+    )
+    logger.info(
+        "onboard pack exported for cross-day rollover",
+        path=str(path),
+        date=date,
+        daily_days=days,
+        inject_full=inject_full,
+    )
 
 
 def _resolve_email_recipient(job: Job, env: Mapping[str, str]) -> str:

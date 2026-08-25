@@ -159,7 +159,9 @@ def cleanup_images(state: GAState) -> dict:
                 cleaned.append(HumanMessage(content=new_content, id=msg.id))
         else:
             cleaned.append(msg)
-    return {"messages": cleaned, "pending_images": []}
+    # rollover_context is a one-shot injection: clear it here so it only appears in
+    # the first turn's system prompt (see context.build_system_prompt).
+    return {"messages": cleaned, "pending_images": [], "rollover_context": None}
 
 
 # --------------------------------------------------------------------------- graph assembly

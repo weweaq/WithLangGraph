@@ -389,3 +389,99 @@ python -m gacore.langTrack.label_places
 ```
 
 测试覆盖锚点：storage 幂等事务（test_langTrack_storage）、server 端点（test_langTrack_server）、契约覆盖（test_langTrack_contract，3 例）、persona 五维+降级（test_langTrack_persona，6 例）、工具出口（test_tools_langTrack）。
+
+
+---
+
+## 9. 人物卡切换（/角色）
+
+> 前端人设层：**工具能力与人设解耦**。工具可用性由运行时装配（graph/model 绑定）决定，角色激活只叠加人格文本，不削减工具准则。
+
+### 9.1 资产与接口（`src/gacore/character.py`）
+
+| 项 | 位置 | 说明 |
+|---|---|---|
+| 物料目录 | `config/assets/characters/<id>.md`（`character.py:card_dir`） | 卡 id=文件名 stem；显示名=`# ` 首标题；prompt=`# ` 标题后正文 |
+| `list_cards(cfg)` | `character.py` | 扫描目录返回 `Card(id,name,path)` 列表，按 id 排序 |
+| `card_prompt(cfg, id)` | `character.py` | 返回人格文本；缺失/不可读返回 `None`，调用方回退默认助手不崩溃 |
+| `card_name(cfg, id)` | `character.py` | 显示名查询，无此卡返回 `None` |
+
+### 9.2 装配与持久化
+
+```mermaid
+flowchart LR
+    A["config/assets/characters/*.md<br/>纯数据资产"] --> B["character.py<br/>扫描+读取(只读)"]
+    B --> C["state.py active_card<br/>会话内指定"]
+    C --> D["context.py 唯一注入点<br/>L0工具准则 + 人物卡 + 工具桥接句"]
+    E["frontends/qq.py /角色<br/>查看/切换/off"] -->|持久化| F["data/active_cards.json<br/>user->card 映射,重启不丢"]
+```
+
+- 角色激活时 system prompt = **L0 工具准则 + 人物卡 + 工具桥接句**（“保留系统智能体全部能力，可调用系统工具，用角色口吻表达”），实例见 `context.py`。
+- 切换角色即新开一段对话（复用 `/new` 清理逻辑），历史互不串戏（`qq.py:1107`）。
+- 持久化：`qq.py:_card_state_file()/_load_user_cards()/_save_user_cards()`，文件 `data/active_cards.json`，损坏降级为 `{}`。
+
+### 9.3 测试
+
+`tests/test_character.py`(7)、`tests/test_character_system_prompt.py`(4)、`tests/test_qq.py` `/角色` 相关 3 条；回归 69 passed。
+### 9.4 主动推送（openid 落库 + qq_push）
+
+- 落库：`frontends/qq.py:_record_known_user()` —— 每次收到消息把用户 openid 写入 `data/qq_known_users.json`（`first_seen`/`last_seen`，损坏自动降级重建，失败仅告警不阻塞消息处理）。
+- 推送：`gacore/langTrack/qq_push.py`（独立进程，`python -m gacore.langTrack.qq_push`，需 `PYTHONPATH=src`），读取 `data/qq_known_users.json` 后经 botpy `post_c2c_message` 主动推送。支持 `--to <openid>` 指定用户、`--show` 列出已知用户、`--sandbox` 切换沙箱域名。
+- **实现要点（实测踩坑）**：推送必须用 botpy 的 `BotHttp + BotAPI` 纯 REST（`http.login(Token(appid, secret))` → `api.post_c2c_message`），**不要用 `Client`**——`Client.start()` 会永久阻塞在 websocket 会话循环（`_pool_init` 的 `while not self._closed: await coroutine`），且 `Client.close()` 不关 ws，一键推送进程会假死、消息根本发不出去。修复后脚本数秒内干净退出（2026-08-22 实测）。
+- 实测验证（2026-08-22）：平台返回真实 message id（`ROBOT1.0_…`），船长 QQ 两条主动推送均送达。
+- **agent 工具**：`gacore/tools/qq_tools.py:qq_push`（`@tool`，schema=message/to）——复用 `langTrack/qq_push.py:send_c2c`（CLI 与工具共用同一发送实现）；botpy 异步调用经模块级单 worker 线程桥（`asyncio.run` in thread，90s 超时），QQ 前端 asyncio 环境下安全调用；`to` 缺省=全部已知用户（主人）；返回 TypedDict（`sent{ok,to,failures,ids}` / `error`），不抛异常。注册于 `tools/__init__.py`（TOOL_NAMES/_TOOLS，工具总数 26）；测试 `tests/test_tools_qq_push.py` 8 条（2026-08-22 真实发送冒烟通过）。
+- 前置条件与策略：botpy 沙箱模式主动推送要求接收方 openid 已在 QQ 开放平台沙箱名单；**2025-04 起官方公告不再支持「主动消息推送」**（能力收敛），实测仍送达但属灰色地带；最稳路径是用户消息后 5 分钟内的被动回复（带 `msg_id`）。
+
+
+### 9.5 QQ 对话上下文持久化（AsyncSqliteSaver，2026-08-24）
+
+- **存储载体**：`data/gacore_chat.db`（SQLite）。build_config 以 `AsyncSqliteSaver.from_conn_string()` 注入 graph 作为 checkpointer，替代原 MemorySaver 内存态——**重启不丢对话**。saver 生命周期挂在 helper（`__aenter__`/`__aexit__`）上全程复用，切勿每次 invoke 重建。
+- **线程键**：`qq.py:_thread_for(user, group)` → `f"qq-{group}:{user}"`，稳定映射保证跨重启命中同一 thread。
+- **删除语义（关键踩坑）**：`/new`、`/reboot`、`/reset` 清理上下文走异步接口 `await checkpointer.adelete_thread(thread_id)`；主线程直接调同步 `delete_thread` 会抛 `InvalidStateError`。get_state 读取同理必须 `await`（含 `update_*_overview` 场景）。
+- **用户会话目录**：`_user_threads` 由 dict 升级为落盘持久化——`data/qq_user_threads.json`，启动读入、变更即存、损坏降级 `{}`（对齐 active_cards.json 同款读写模式）。
+- **入口改造**：qq.py `main` 改为 `async _boot` 经 `asyncio.run` 启动；`start.py` 对 `build_config()` 加 `await`。
+- **前提条件**：需 `langgraph-checkpoint-sqlite`（pyproject 已声明）；QQ 前端运行还依赖 `qq-botpy`。
+- **与角色卡互不干扰**：对话 checkpointer（gacore_chat.db）与人物卡映射（data/active_cards.json）独立存储；切卡/清上下文仍走 `/new` 等既有逻辑。
+
+### 9.6 QQ 跨天记忆自动翻篇（onboard pack + _maybe_rollover，2026-08-24）
+
+> 目标：对话上下文不再无限累积 + 跨天记忆延续。设计文档见 `output/qq-crossday-rollover-design.md`。
+
+**核心思想**：把记忆导出（23:50 daily-report 成功后）与消费（次日首条消息）解耦，通过 `data/onboard_pack.json` 单文件交接。消费端只在真实跨天时一次性把「昨日日报 + 长期画像」注入首轮 system prompt，旧 checkpoint 完整保留可回溯。
+
+**数据流时序**：
+
+```mermaid
+sequenceDiagram
+    participant S as scheduler.run_job (23:50)
+    participant P as data/onboard_pack.json
+    participant Q as qq.on_message -> _maybe_rollover
+    participant G as graph process (首轮)
+    S->>S: daily-report job 成功后执行 _export_onboard_pack
+    S->>P: 写入(date/created_at/source_job/prev_thread_id/payload)
+    Note over Q: 次日用户首条消息
+    Q->>P: 读 pack
+    Q->>Q: pack.date<today && 仍是旧 thread → 新 thread_id + 更新 user_threads.json
+    Q->>P: unlink(pack, missing_ok=True)
+    Q->>G: state["rollover_context"]=昨日日报摘要+长期画像
+    G->>G: build_system_prompt 注入 → cleanup_images 清除 rollover_context
+```
+
+**关键位置**：
+
+| 职责 | 位置 | 说明 |
+|---|---|---|
+| 配置策略 | `config.py:RolloverConfig` / `Config.rollover` | enabled / inject_long_term_full / keep_old_thread / recent_days(默认3)；`from_env` 读 `GACORE_ROLLOVER_*` |
+| 记忆包导出 | `scheduler.py:_export_onboard_pack`（+`_long_term_insight/_summarize_long_term/_load_active_qq_thread/_onboard_pack_path`） | 复用 `daily_notes.load_recent_daily_summaries(cfg, days)`；画像从 `memory/global_mem_insight.txt`（兜底 `global_mem*.txt`）；同名覆盖天然幂等 |
+| 尾随触发 | `scheduler.py:run_job` | `if error is None and "daily" in job.name.lower(): try: _export_onboard_pack(cfg) except ...只记日志`——**不新增独立 job**，失败不阻塞日报 |
+| 翻篇消费 | `qq.py:_maybe_rollover(user_id)`（`on_message` 入口 await） | 保旧 checkpoint 不 delete；`qq-{user_id}-{uuid8}` 新 thread；更新 `_user_threads`+落盘；stage 到 `self._pending_rollover[user_id]`；清 pack |
+| 首轮注入 | `qq.py:_run_agent` | `self._pending_rollover.pop(user_id)` → `state["rollover_context"]` |
+| system prompt 注入 | `context.py:build_system_prompt` | `=== 昨日记忆注入 ===` 节，仅 `rollover_context` 非空时追加 |
+| 一次性语义 | `graph.py:cleanup_images` | 每轮 END 前返回 `rollover_context: None`，保证注入只在首轮出现 |
+| state channel | `state.py:GAState.rollover_context` | 声明为 `str | None`，随 checkpoint 持久化 |
+
+**幂等/防重**：pack `date >= today` 不动（同一天不重复翻篇）；`prev_thread_id` 与当前 thread 不一致（已被 `/new` 或已翻篇）→ 只 unlink pack 不翻篇；翻篇后 unlink `missing_ok=True`。
+
+**兜底铁律**：`_maybe_rollover` 整体 try/except，任一失败仅记 `rollover skipped (safe fallback to normal chat)`，聊天永不阻塞。注入对用户完全静默，仅日志留痕（`cross-day rollover executed` 含 old/new thread、pack_date、injected_chars）。
+
+**已知边界**：翻篇发生在 asyncio 主循环 on_message 入口；若首条是纯图片/命令消息，stage 可能在首个真实文本轮才被消费（`_run_agent`）；`rollover_context` 在 wait_for_text 中断后 resume 时仍在 state（cleanup_images 尚未跑），会在 resume 轮注入后清除——行为可接受。

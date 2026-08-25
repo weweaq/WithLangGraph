@@ -1499,3 +1499,46 @@ B 阶段完成数据模型与 ETL 重构后，langTrack 已具备 sessions / sta
 - [ ] （既有）音频看门狗修复后次日数据验证。
 - [ ] （既有）AI 日报 23:50 实际跑一次确认邮件含 weiTrack 信号节。
 
+
+## 2026-08-24：QQ 对话上下文改本地持久化（告别内存态）
+### 背景
+QQ 前端此前上下文只存内存：graph.py 默认 MemorySaver()（内存 checkpointer）+ qq.py 的 `_user_threads` dict + `_thread_ids` dict，bot 一重启，所有用户对话历史全部清空，跨天/断线后续不聊。
+### 已完成
+- `src/gacore/frontends/qq.py`：build_config 改用 `AsyncSqliteSaver.from_conn_string(root/data/gacore_chat.db)` 作为持久化 checkpointer（跨重启存活）；`_user_threads` 落盘 `data/qq_user_threads.json`（启动加载、变更即存、损坏降级 {}）；新增 `_user_threads_file()/_load_user_threads()/_save_user_threads()` 三个 helper（对齐既有 `_card_state_*` 风格）；`_thread_for(user, group)` 线程键；`delete_thread`/`get_state` 调用点转 `await`（注意：同步 delete_thread 在主线程抛 InvalidStateError，必须用异步接口）；main 改 `async _boot` 经 `asyncio.run(_boot())` 启动。
+- `start.py`：`await build_config()`。
+- `pyproject.toml`：新增依赖 `langgraph-checkpoint-sqlite`。
+### 验证
+- 冒烟（独立临时库）：写 2 条消息 → 关闭连接（模拟重启）→ 重开读回 2 条一致 ✓；`adelete_thread` 删除 ✓（SMOKE PASS）。
+- qq.py 模块导入冒烟 PASS：`_user_threads` 启动加载 {}，helpers 就绪，build_config 为协程函数；持久化 DB 落点 `data/gacore_chat.db` 确认。
+- `py_compile src/gacore/frontends/qq.py start.py` 退出码 0。
+### 待办更新
+- [x] QQ 对话上下文持久化（AsyncSqliteSaver + user_threads.json）。
+- [ ] 部署环境需按 pyproject 重装依赖：`pip install -e .`（本地 venv 已装 langgraph-checkpoint-sqlite）。
+- [ ] 本地未装 qq-botpy：启动 QQ 前端前需 `pip install qq-botpy`。
+- [ ]（后续可选）跨天会话上升为分层记忆（工作记忆 + 每日归档 + 画像注入），参考既有 langTrack.db 方案。
+
+## 2026-08-24：QQ 跨天记忆自动翻篇 + 次日开局注入昨日记忆
+### 背景
+QQ 对话上下文已持久化（上一节），但 thread 会无限累积、跨天记忆无法延续——新的一天仍接着旧 thread 聊，上下文越滚越长。本改造引入「每日翻篇」：23:50 daily-report 跑完后尾随导出记忆包，次日用户首条消息到达时把旧 thread 归档（保留 checkpoint）、切新 thread 并静默注入最近 3 天日报摘要 + 长期画像。
+### 设计
+- 设计文档：[`qq-crossday-rollover-design.md`](../output/qq-crossday-rollover-design.md)（user workspace output 目录）。
+- 数据流：`scheduler.run_job`（daily-report 成功）→ 尾随导出 `data/onboard_pack.json`（date=日报所属日期、created_at、source_job、prev_thread_id 取自 `data/qq_user_threads.json`、payload={daily_summary_md 最近 N 天日报摘要、long_term_md 长期画像全文或摘要、inject_full、recent_days}）→ `qq.on_message` 入口 `_maybe_rollover(user_id)` → 翻篇（保旧 checkpoint、生成新 thread `qq-{openid}-{uuid8}`、更新 user_threads.json、清理 pack）→ 首轮 state `rollover_context` 注入 system prompt。
+### 已完成
+- `src/gacore/config.py`：新增 `RolloverConfig`（enabled=true / inject_long_term_full=false / keep_old_thread=true / recent_days=3），并入 `Config.rollover`；`from_env` 支持 `GACORE_ROLLOVER_ENABLED` / `GACORE_ROLLOVER_INJECT_LONG_TERM_FULL` / `GACORE_ROLLOVER_KEEP_OLD_THREAD` / `GACORE_ROLLOVER_RECENT_DAYS`。
+- `src/gacore/scheduler.py`：`run_job` 中 daily-report 类 job（name 含 `daily`）**成功后**尾随 `_export_onboard_pack(cfg)`（非新增独立 job）；pack 组装失败仅记日志不阻塞日报。新增 `_onboard_pack_path/_load_active_qq_thread/_long_term_insight/_summarize_long_term/_export_onboard_pack`。
+- `src/gacore/state.py`：`GAState` 新增 `rollover_context` channel（一次性跨天注入，首轮后清除）。
+- `src/gacore/context.py`：`build_system_prompt` 注入 `=== 昨日记忆注入 ===` 节（读 `rollover_context`，空则跳过）。
+- `src/gacore/graph.py`：`cleanup_images` 每轮 END 前把 `rollover_context` 置 None，保证注入仅首轮生效。
+- `src/gacore/frontends/qq.py`：`on_message` 入口 `await self._maybe_rollover(user_id)`；新增 `_maybe_rollover` 实现翻篇+静默注入编排，全程 asyncio 主循环内、任何异常兜底不阻塞聊天；`_run_agent` 首轮消费 `self._pending_rollover[user_id]` 写入 `state["rollover_context"]`。
+### 注入语义与兜底
+- 注入**静默**进行：不向用户展示任何内容，仅在日志记录 `cross-day rollover executed`（old_thread/new_thread/pack_date/injected_chars）。
+- 「仅首轮」保证：`rollover_context` 经 checkpoint 持久化，但 `cleanup_images` 在首个 agent 轮结束即清除，后续轮不再重复注入。
+- 翻篇防重：pack `date >= today` 不动；`prev_thread_id` 与当前 thread 不一致（已翻篇/已 /new）只清 pack 不重复翻篇。
+- 失败降级：无包 / 读失败 / 任何异常 → 跳过注入照常聊天（memory 是加分项，不是单点故障）。
+### 约束遵守
+- 未 kill / 重启 bot；未改动 `.ps1/.bat`；无破坏性删除（旧 checkpoint 完整保留）。
+- 铁律：本记录同步更新 docs/langTrack-roadmap.md 与 docs/langTrack-tech.md（见 tech.md §9.6）。
+### 待办更新
+- [x] 跨天记忆自动翻篇 + 次日注入昨日记忆（本轮）。
+- [ ] 部署后观察首个跨天：确认 23:50 后 pack 生成、次日首条消息触发 rollover 日志且回复包含昨日记忆。
+- [ ]（后续可选）翻篇后旧 thread 的按周归档/清理策略（keep_old_thread 预留位，暂不接删除）。
