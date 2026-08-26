@@ -72,7 +72,7 @@ import uuid
 
 from collections import deque
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from pathlib import Path
 
@@ -94,15 +94,17 @@ from langgraph.types import Command
 
 
 
-from gacore.character import card_name, list_cards
+from gacore.character import card_name, card_prompt, list_cards
 from gacore.config import Config, load_dotenv
 
 from gacore.graph import DEFAULT_RECURSION_LIMIT, build_graph
 
+from gacore.llm import get_llm
 from gacore.jsonl_logger import get_logger
 
 from gacore.state import new_state
 
+from gacore.tools.daily_notes import load_recent_daily_summaries
 from gacore.tools.ocr_tools import ocr_image
 
 
@@ -156,6 +158,36 @@ _LOG_FILE: str = os.environ.get("QQ_LOG_FILE", "").strip()
 
 
 _SPLIT_LIMIT: Final = 4500  # QQ markdown message length safety margin
+
+# --------------------------------------------------------------------------- Phase 1: trivial-input gate
+# Ultra-short / casual words get a light (non-agent) one-liner reply; real questions
+# and tasks flow into the full graph. Conservative by design: anything borderline is
+# let through ("fail open") so no legitimate question is ever short-circuited.
+_TRIVIAL_MAX_LEN: Final = 8  # messages at or below this length are candidate one-liner replies
+_TRIVIAL_WHITELIST: Final = frozenset({
+    "吃饭", "干饭", "饿了", "吃了吗", "吃了么", "早饭", "午饭", "晚饭", "夜宵", "宵夜",
+    "睡觉", "睡了", "困了", "午休", "早安", "晚安", "早上好", "下午好", "晚上好",
+    "你好", "你好呀", "嗨", "哈喽", "在吗", "在么", "骑车", "出门", "溜达", "散心",
+    "无聊", "没事", "没啥", "随便", "好的", "好哦", "知道了", "收到", "嗯嗯", "哈哈",
+    "嘿嘿", "嘻嘻", "嘿嘿嘿", "hhhh", "233",
+})
+# Words that mark a real question/task. Presence forces the message into the full loop.
+_INTENT_WORDS: Final = frozenset({
+    "如何", "怎么", "为什么", "为啥", "为何", "帮我", "推荐", "建议", "方案", "对比",
+    "能否", "能不能", "可不可以", "可以吗", "行不行", "哪个", "哪款", "什么",
+    "多少", "几点", "多少钱", "有没有", "是否有", "分析", "总结", "解释", "评价",
+    "点评", "处理", "搞定", "安排", "决定", "选择", "给个", "帮个忙",
+})
+
+# --------------------------------------------------------------------------- Phase 2: multi-option output
+# Decision-type questions get a 【方案N】-anchored reply that the sender fans out into
+# separate QQ messages.
+_PROPOSAL_KEYWORDS: Final = frozenset({
+    "推荐", "哪个好", "哪款好", "哪家好", "怎么选", "选哪个", "选什么", "选哪",
+    "方案", "对比", "帮我决定", "帮我选", "给个建议", "给点建议", "拿主意", "纠结",
+    "建议", "选择", "定夺", "评价一下",
+})
+_PROPOSAL_RE: Final = re.compile(r"【方案([一二三四五六七八九十百\d]+)】")
 
 _RECONNECT_INITIAL: Final = 5
 
@@ -580,6 +612,66 @@ def _split_text(text: str) -> list[str]:
     return parts or ["..."]
 
 
+_TZ_SH = timezone(timedelta(hours=8))
+_WEEK_CN = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+_MEM_TIMESTAMP_RE = re.compile(r"\d{1,2}[点时]|\d{4}[-/年]\d{1,2}[-/月]\d{1,2}|\d{1,2}月\d{1,2}日")
+
+
+def _stamp_memory_history(seg: str) -> str:
+    """Prefix timestamp-bearing lines with [历史@时间戳] so memory never reads as now."""
+    return "\n".join(
+        f"[历史@时间戳] {line}" if _MEM_TIMESTAMP_RE.search(line) else line
+        for line in seg.splitlines()
+    )
+
+
+def trivial_detect(text: str) -> bool:
+    """Gate for casual one-liner replies (Phase 1, route A).
+
+    Returns True when the message looks like an ultra-short filler, a greeting, a
+    meal/sleep/commute mention or a casual word — AND carries no intent word
+    (如何/怎么/帮我/推荐/...) that would mark it as a real question or task.
+
+    Conservative by design: borderline messages return False and flow into the full
+    agent loop ("fail open") — a legitimate question is never short-circuited.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    if any(w in t for w in _INTENT_WORDS):
+        return False
+    if len(t) <= _TRIVIAL_MAX_LEN:
+        return True
+    return any(w in t for w in _TRIVIAL_WHITELIST)
+
+
+def proposal_detect(text: str) -> bool:
+    """True when the message asks for decision support (multi-option reply)."""
+    return any(w in (text or "") for w in _PROPOSAL_KEYWORDS)
+
+
+def _split_by_proposal(text: str) -> list[str]:
+    """Split a reply into separate QQ messages, one per 【方案N】 group.
+
+    The first piece is any lead-in before the first anchor (typically a "给你三个方案"
+    opener); the trailing piece carries the closing recommendation after the final
+    anchor. Returns [text] unchanged when fewer than two anchors are present.
+    """
+    matches = list(_PROPOSAL_RE.finditer(text or ""))
+    if len(matches) < 2:
+        return [text]
+    parts: list[str] = []
+    start = 0
+    for m in matches:
+        if m.start() > 0 and text[start : m.start()].strip():
+            parts.append(text[start : m.start()].strip())
+        start = m.start()
+    tail = text[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts or [text]
+
+
 
 
 
@@ -896,6 +988,14 @@ class QQApp:
                 return
 
 
+
+            # Phase 1 gate: ultra-short / casual words get a light one-liner reply
+            # without building an agent task or touching the graph. Fail-open.
+            if trivial_detect(content):
+                asyncio.create_task(
+                    self._trivial_reply(chat_id, content, user_id, msg_id=msg_id, is_group=is_group)
+                )
+                return
 
             # 4) Normal agent turn.
 
@@ -1509,6 +1609,12 @@ class QQApp:
         if rollover_text:
             state["rollover_context"] = rollover_text
 
+        # Phase 2: ask the model for a 【方案N】-anchored reply when the user is deciding.
+
+        if proposal_detect(text):
+
+            state["output_mode"] = "proposal"
+
         await self._stream_agent(chat_id, state, config, msg_id=msg_id, is_group=is_group, user_id=user_id)
 
 
@@ -1520,12 +1626,102 @@ class QQApp:
     ) -> None:
 
         """Resume a paused (ask_user) turn with the user's answer."""
-
         await self._stream_agent(
-
             chat_id, Command(resume=answer), config, msg_id=msg_id, is_group=is_group, user_id=user_id
-
         )
+
+    # ------------------------------------------------------- trivial (light) replies
+
+    @staticmethod
+    def _meal_period(hour: int) -> str:
+        """Coarse time-of-day label used to ground a one-liner reply."""
+        if 5 <= hour < 9:
+            return "早餐时间"
+        if 9 <= hour < 11:
+            return "上午"
+        if 11 <= hour < 14:
+            return "午饭时间"
+        if 14 <= hour < 17:
+            return "下午"
+        if 17 <= hour < 21:
+            return "晚饭时间"
+        if 21 <= hour < 23:
+            return "晚上"
+        return "深夜"
+
+    async def _recent_user_voice(self, user_id: str) -> str:
+        """Best-effort: the user's last 1–3 human messages from the persisted thread.
+
+        Used to ground the light reply in the user's actual register. Never raises —
+        any failure degrades to an empty string.
+        """
+        try:
+            thread_id = _user_threads.get(user_id)
+            if not thread_id:
+                return ""
+            config = {"configurable": {"thread_id": thread_id}}
+            state = await self.graph.aget_state(config)
+            messages = (state.values or {}).get("messages") or []
+            voices: list[str] = []
+            for msg in reversed(messages):
+                if isinstance(msg, HumanMessage) and isinstance(msg.content, str):
+                    c = msg.content.strip()
+                    if c:
+                        voices.append(c[:60])
+                    if len(voices) >= 3:
+                        break
+            return " / ".join(reversed(voices))
+        except Exception:  # noqa: BLE001 — never let the gate fail on memory reads
+            return ""
+
+    async def _trivial_reply(
+        self, chat_id: str, text: str, user_id: str, *, msg_id: str | None, is_group: bool
+    ) -> None:
+        """Phase 1 light branch: one ultra-short in-character reply, no agent graph.
+
+        Uses a standalone (unbound) LLM call with high temperature + tiny max_tokens,
+        grounded in the current time / meal period / today's memory / the user's recent
+        register and the user's active character card. No tools, no thread write, no
+        multi-turn. Any failure degrades to a plain acknowledge.
+        """
+        try:
+            llm = get_llm([], bind_tools=False).bind(temperature=1.0, max_tokens=60)
+            cfg = Config.default()
+            now = datetime.now(_TZ_SH)
+            persona = ""
+            card_id = _user_card.get(user_id)
+            if card_id:
+                persona = card_prompt(cfg, card_id) or ""
+            daily = load_recent_daily_summaries(cfg)
+            voice = await self._recent_user_voice(user_id)
+            ctx = (
+                f"当前真实时间 {now.strftime('%Y-%m-%d %H:%M:%S')} {_WEEK_CN[now.weekday()]}"
+                f"（Asia/Shanghai, UTC+8），{self._meal_period(now.hour)}。"
+                "[历史时间禁令] 对方消息或记忆里的任何时间/日期都是旧记录，禁止当作当下；"
+                "报时间必须以上面这行真实时间为准。"
+                + (f"\n今日记忆（以下为历史记录，仅供了解过往，绝不代表当前）：\n{_stamp_memory_history(daily[:400])}" if daily else "")
+                + (f"\n对方最近的口吻：{voice}" if voice else "")
+            )
+            if persona:
+                ctx = f"你是“{card_id}”，以人物的性格与说话风格随口回应。\n{persona}\n\n" + ctx
+            prompt = (
+                "你是一位性格鲜明的聊天搭子。对方刚丢来一句随口话，请你以最像熟人的方式，"
+                "用 1~2 句口语化即兴回应。\n"
+                "铁律：极短（尽量一句话）、口语、贴合情境；绝不用固定模板/套话；"
+                "不复述对方原话；不用 emoji 堆砌。\n\n"
+                f"[情境]\n{ctx}\n\n[对方刚说]\n{text}"
+            )
+            resp = await llm.ainvoke([HumanMessage(content=prompt)])
+            reply = str(getattr(resp, "content", "") or "").strip()
+            if not reply:
+                reply = "嗯，我在。"
+            await self.send_text(chat_id, reply[:200], msg_id=msg_id, is_group=is_group)
+        except Exception:  # noqa: BLE001 — degrade, never crash the message loop
+            logger.error("QQ trivial reply failed", stack_trace=traceback.format_exc())
+            try:
+                await self.send_text(chat_id, "嗯，我在。", msg_id=msg_id, is_group=is_group)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 
@@ -1568,6 +1764,22 @@ class QQApp:
         reply_parts: list[str] = []
 
         rendered: set[str] = _rendered_msg_ids.setdefault(user_id, set()) if user_id is not None else set()
+
+        # Seed the dedupe set with every message id already persisted in this thread's
+        # checkpoint BEFORE this turn starts. Otherwise, after a process restart the
+        # RAM-only rendered set is empty and the cleanup_images node (which returns the
+        # FULL message list) would replay previously delivered AIMessages into reply_parts,
+        # gluing whole past answers onto the current reply. Best-effort: any failure just
+        # leaves the set empty (history replay guard degraded, same as before).
+        if user_id is not None:
+            try:
+                prior = await self.graph.aget_state(config)
+                for msg in (prior.values or {}).get("messages") or []:
+                    mid = getattr(msg, "id", None)
+                    if mid:
+                        rendered.add(mid)
+            except Exception:  # noqa: BLE001 — checkpoint read is a nicety, never block the turn
+                logger.debug("failed to seed rendered ids from checkpoint", user_id=user_id)
 
         current_task = asyncio.current_task()
 
@@ -1729,7 +1941,13 @@ class QQApp:
 
                     if final_text.strip():
 
-                        await self.send_text(chat_id, final_text, is_group=is_group)
+                        # Phase 2: fan out 【方案N】 anchors into separate QQ messages.
+                        segments = _split_by_proposal(final_text)
+                        if len(segments) > 1:
+                            for seg in segments:
+                                await self.send_text(chat_id, seg, is_group=is_group)
+                        else:
+                            await self.send_text(chat_id, final_text, is_group=is_group)
 
 
 

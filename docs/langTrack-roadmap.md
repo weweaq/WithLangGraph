@@ -1,4 +1,15 @@
 ---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 74fca65fe87f9b5d6900c56ec5512fbd_2e7dcf2ea09211f1a413525400287e28
+    ReservedCode1: GOvDpPJbfoNkuP/Jz1z68yKV+joCPNYMNKIeRvteFSBBFuhMQvBS24gdWwu8Wjb6TW7wGmaYIiC4cf7NBcWwD6W6Uo7dBqZElJIMT7X+Zwmxi01a84u8M+bdYBKSPBqSZk5GGK9Fg19Q7uSn5oAVQoA298/SpkQachSZOwaYR3ovxeT8wQUarZowPA0=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 74fca65fe87f9b5d6900c56ec5512fbd_2e7dcf2ea09211f1a413525400287e28
+    ReservedCode2: GOvDpPJbfoNkuP/Jz1z68yKV+joCPNYMNKIeRvteFSBBFuhMQvBS24gdWwu8Wjb6TW7wGmaYIiC4cf7NBcWwD6W6Uo7dBqZElJIMT7X+Zwmxi01a84u8M+bdYBKSPBqSZk5GGK9Fg19Q7uSn5oAVQoA298/SpkQachSZOwaYR3ovxeT8wQUarZowPA0=
+---
+
+---
 
 
 AIGC:
@@ -1542,3 +1553,126 @@ QQ 对话上下文已持久化（上一节），但 thread 会无限累积、跨
 - [x] 跨天记忆自动翻篇 + 次日注入昨日记忆（本轮）。
 - [ ] 部署后观察首个跨天：确认 23:50 后 pack 生成、次日首条消息触发 rollover 日志且回复包含昨日记忆。
 - [ ]（后续可选）翻篇后旧 thread 的按周归档/清理策略（keep_old_thread 预留位，暂不接删除）。
+
+## 2026-08-25：QQ 去人机味改造（入口分级闸门 + 真问题多方案输出）
+### 背景
+QQ 机器人「韩立」已有完整 agent 回路，但面对随口话（“吃饭吃饭”“早安”“嗯”）也会走完整多轮 graph、调工具、长篇输出，人机味重、成本高。真问题（“推荐…”“怎么选…”）又只给单向结论，缺少对比。本改造按设计文档 `qq-chat-multi-answer-research-20260824.md` 之方案 A+B 落地：随口话走极短即兴轻回应（不建 agent、不调工具）；真决策问题注入多方案输出指令并按【方案N】拆条发送。成本几乎不涨。
+### 已完成
+**Phase 1 · 入口分级闸门（方案 A）**
+- `src/gacore/frontends/qq.py`：
+  - 新增 `trivial_detect(text)`：极短（≤8 字）或命中白名单词（问候/吃饭/睡觉/骑车/早安/晚安/语气词/表情/口语虚词），且无意图词（如何/怎么/为什么/帮我/推荐/方案/对比/能否等）→ True。设计为 fail-open：边界情形一律放行进正常 agent 回路，绝不误杀正经问题。
+  - `on_message` 第 4 步前插入轻回应分支：命中 `trivial_detect` → `_trivial_reply`，不建 agent 任务、不碰 graph。
+  - 新增 `_trivial_reply`：独立无工具 LLM 生成（`get_llm([], bind_tools=False).bind(temperature=1.0, max_tokens=60)`），专用轻量 prompt 注入变量（当前时间/饭点/当日画像/用户最近口吻/人物卡），1~2 句即兴口语，无固定模板；异常降级为一句极简回应。
+  - 新增 `_meal_period(hour)`、`_recent_user_voice(user_id)`（读 thread 最近 1~3 条用户消息，失败降级空串）。
+- `src/gacore/context.py`：`build_system_prompt` 追加 `[回应分层铁律]`（`_RESPONSE_LAYER_RULES`）：随口话/情绪话/简短问候 → 一句带过（20 字内，不调工具不展开）；明确提问/任务 → 全力作答。A0 提示层兜底，防漏网随口话。
+- `src/gacore/state.py`：`GAState` 新增 `output_mode` channel（一次性多方案模式标记，首轮后清除）。
+**Phase 2 · 真问题多方案出口（方案 B）**
+- `src/gacore/frontends/qq.py`：
+  - 新增 `proposal_detect(text)`：命中决策类关键词（推荐/哪个好/怎么选/方案/对比/帮我决定/建议/选择等）→ True。
+  - `_run_agent` 首轮 `proposal_detect(text)` 命中 → `state["output_mode"]="proposal"`。
+  - `context.py` 在 `output_mode=="proposal"` 时注入 `=== 多方案输出模式 ===`（`_PROPOSAL_HEADER/_PROPOSAL_RULE`）：要求回复显式分段为【方案一】【方案二】【方案三】（至多 3 个）+ 一句“我建议选…”收尾。
+  - 新增 `_split_by_proposal(text)`：按 `【方案N】` 正则锚点把一条回复拆成多条（首段为开场、末段为收尾建议），`_stream_agent` 发送端复用 `_SPLIT_LIMIT` 基建逐条发送；锚点不足 2 个时原样发送。
+  - `graph.py::cleanup_images` 返回值补 `"output_mode": None`，保证多方案模式仅首轮生效不泄漏到后续轮。
+### 验证
+- `py_compile` 四文件退出码 0（qq.py / context.py / state.py / graph.py）。
+- venv import qq.py 模块 PASS；冒烟单测全过：`trivial_detect` 17 例、`proposal_detect` 7 例、`_split_by_proposal` 3 例（含首段/收尾切分、<2 锚点原样返回）。
+- 约束遵守：未 kill/重启 bot；未触碰 `.ps1/.bat`；无破坏性操作；git 工作区从干净起点改码。
+### 待办更新
+- [x] 入口分级闸门（随口话极短即兴回、正经问题全力答）。
+- [x] 真问题多方案结构化输出并按【方案N】拆条发送。
+- [ ] 部署后观察线上：随口话走轻回应（无“思考中…”），推荐类问题出现多条【方案N】消息。
+- [ ]（后续可选）白名单/意图词按真实语料微调；轻回应温度与 max_tokens 可用配置暴露。
+
+## 2026-08-25：QQ 聊天护栏补全（注入勿念 / 禁复述与断言 / 时间权威）
+### 背景
+去人机味改造上线后，韩立仍有三个毛病：①跨天记忆/日报被整段背出当开场白（话痨复读）；②逐条复述用户原话、断言用户“重复提问”（幻觉重灾区），且把时间推算/纠错思考过程说出来；③拿用户消息、图片 OCR 里的时间数字当“当下”推断，产生时间幻觉。本改动纯 prompt/context 层补三条护栏，不动 graph 拓扑。
+### 已完成
+- `src/gacore/context.py`（仅此一个文件，改动 3 处）：
+  - 新增 `_MEMORY_BG_RULE`（记忆背景铁律）：注入的记忆只是谈话背景，不主动背诵/复述/整段念出，不当开场白照搬，仅在对方问起或话题自然关联时引用一句。挂载点：`DAILY_HEADER` 日报注入后 + `ROLLOVER_HEADER` 昨日记忆注入后（两处共用）。
+  - `_RESPONSE_LAYER_RULES`（回应分层铁律）追加硬规则三条：禁止逐条复述对方原话；禁止断言对方“重复提问”（无依据提这个即幻觉，一句不许说）；时间推算/纠错/查漏等脑内步骤不必宣之于口，直接给结论。
+  - 新增 `_TIME_AUTHORITY_RULE`（时间铁律）：当前时刻以 system 注入的 `[Current time]` 为唯一依据，用户消息/图片 OCR/描述里的时间日期一律是内容陈述不作数，绝不据此推断“当下”，不解释推算过程。挂载点：`[Current time: …]` 之后恒注入。
+### 验证
+- `py_compile src/gacore/context.py` 退出码 0。
+- venv 行为冒烟 PASS：构建 system prompt 后校验——[时间铁律]/[记忆背景铁律]/禁止逐条复述/禁止断言对方/思考过程不外说 5 组断言全部命中；本机日报存在时记忆铁律正确挂在日报注入后；无注入时该节不出现。
+- 约束遵守：未 kill/重启 bot；未改 `.ps1/.bat`；无破坏性删除。
+### 待办更新
+- [x] 三条聊天护栏（注入勿念 / 禁复述·禁断言重复提问 / 时间权威）补全（本轮，纯 context 层）。
+
+## 2026-08-25：上下文滑动窗口（根治开场复读一大段）
+### 背景
+唯一 thread 在 `gacore_chat.db` 已累计 236 个 checkpoint，`context.py::build_turn_prompt`（原第 211 行 `return [SystemMessage(content=prompt), *messages]`）把折叠摘要之外的**全量原始历史 messages** 原样发给模型，长会话下模型被前文惯性带跑、每轮开场先复读回顾一大段、token 成本持续膨胀。要求模型输入只保留最近几轮，更早靠折叠摘要兜底。
+### 已完成
+- `src/gacore/context.py`（仅此一个文件）：
+  - 新增常量 `_KEEP_ROUNDS = 6`（保留最近 6 轮对话）。
+  - 新增纯函数 `trim_messages(messages, keep_rounds=_KEEP_ROUNDS)`：从尾部按 `HumanMessage` 为轮次边界扫描，保留最近 `keep_rounds` 轮完整消息（其间 AIMessage/ToolMessage 配对一并保留），窗口起点恒为 HumanMessage、窗口内无孤儿 ToolMessage；短历史（≤keep_rounds 轮）原样返回；空 / 无 Human 列表安全返回空；不改入参（纯函数）。
+  - `build_turn_prompt` 返回改为 `[SystemMessage(content=prompt), *trim_messages(messages)]`；`fold_history` 折叠摘要仍进 system prompt，不动。
+  - 纯函数、不改 state、不动存储层——checkpoint 仍全量持久化（236 个 checkpoint 一个不删），仅「入模型时」截窗口。
+### 验证
+- `py_compile context.py` 退出码 0；miniconda py12 解释器（`D:\softwares\miniconda\envs\py12\python.exe`）`import gacore.context` 冒烟 OK（`_KEEP_ROUNDS=6`、`trim_messages` 存在）。
+- 行为自测 PASS：
+  - a) 20 轮 Human/AI/Tool 混合 47 条 → 截后 14 条、恰好 6 轮、首条为 HumanMessage、最近一轮 Human(Q19) 必在、输入未被修改（纯函数）、窗口内无孤儿 ToolMessage；
+  - b) 短历史（<6 轮）原样返回；空列表 / 全 AI 列表安全处理；
+  - c) `build_turn_prompt` 输出 = SystemMessage + 裁剪后消息（1+14），折叠摘要 `=== Earlier context ===` 仍在 system 中。
+### 待办更新
+- [x] 上下文滑动窗口：`build_turn_prompt` 只投最近 6 轮，更早靠折叠摘要兜底。
+- [ ] 部署后观察线上：开场不再复读一大段历史；必要时把 `_KEEP_ROUNDS` 提为可配置项（config 侧）。
+*（内容由AI生成，仅供参考）*
+
+## 2026-08-25：发送端去重基准持久化（根治"回答叠一块"复读）
+### 背景
+用户发图反馈韩立"还是把回答都叠在一块发给我了"。链路：包装图 process→cleanup_images→END，`cleanup_images` 返回全量 messages（graph.py:165 的 `return {"messages": cleaned,...}`），发送层 `_stream_agent` 靠纯 RAM 的 `_rendered_msg_ids` 做"每条只发一次"去重。今天进程重启 4 次（20:47→21:50→22:11→22:34），内存集合被清空，重启后首个 turn 会把 checkpointer 中所有历史已发过的 AIMessage 重放进 `reply_parts`，与当轮回复 `\n\n` 拼成一条长消息发出（截图 = 上一轮"夜骑南京眼"方案回复 + 本轮"会错意"招呼，叠成一条）。
+### 已完成
+- `src/gacore/frontends/qq.py`（仅此一处）：
+  - `_stream_agent` 开头先用 `graph.aget_state(config)` 读取本 thread checkpoint 中已存在的消息 id，批量播进 `_rendered_msg_ids[user_id]` 去重集作为基线；此后 `cleanup_images` 重放全量历史时，已发消息 id 命中基线直接跳过。
+  - 纯增量：发送逻辑、【方案N】拆条逻辑、RAM 去重语义均不变；checkpoint 读取失败时降级为原行为，不阻塞聊天。
+### 验证
+- `py_compile qq.py` 退出码 0；
+- 新 bot pid 2132（conda py12 + PYTHONPATH=src）23:29:52 ready："QQ bot ready: 韩立"，恢复单实例；旧 pid 13280 已停。
+### 待办更新
+- [x] 发送前播入 checkpoint 基线 id，杜绝进程重启后重放历史消息。
+- [ ] 线上观察：下一条消息不再出现"历史回复 + 当轮回复"叠发。
+*（内容由AI生成，仅供参考）*
+
+## 2026-08-26：时间铁律升级为硬约束 + 新增 get_time 工具（焊死时间幻觉）
+### 背景
+上一轮 `_TIME_AUTHORITY_RULE`（时间铁律）为 prompt 级软约束：只认 `[Current time]` 为唯一依据，但未强制"涉及时间必须调工具"。模型仍可能凭记忆/上下文猜当下几点几分，时间幻觉难以根绝。本轮把铁律升级为"禁止"语气硬约束，并给 bot 挂一个权威时钟工具 `get_time`，让时间答案必须走系统时钟，杜绝凭记忆瞎猜当下时刻。
+### 已完成
+- `src/gacore/context.py`：升级 `_TIME_AUTHORITY_RULE`（时间铁律）文案——
+  - 明确时间只允许两个权威来源：①已调用 `get_time` 工具返回的系统时间；②系统注入的 `[Current time]`。
+  - 新增"禁止"语句：未经调用时间工具、也未读到系统注入时间时，**禁止**在回复里断言任何具体时钟读数（几点几分）。
+  - 需回答"现在几点、今天几号、星期几、过了多久"等时间问题，**必须先调用 `get_time` 拿系统时间再作答**；工具不可用时以 `[Current time]` 为准。
+  - 保留原约束：对方消息/图片 OCR/描述里的时间只是内容陈述不作数；不要解释推算过程、不展示推算步骤。
+- `src/gacore/tools/get_time.py`（新增）：`@tool` 纯函数工具，返回当前系统时间（`YYYY-MM-DD 星期N HH:MM:SS (Asia/Shanghai, UTC+8)`），时区东八区 `timezone(timedelta(hours=8))`，无 I/O、无副作用、多行 docstring 面向模型说明"需要时间必须先调本工具"。
+- `src/gacore/tools/__init__.py`：完成注册——import `get_time`、`TOOL_NAMES` 首位加 `"get_time"`、`_TOOLS` 首位加 `get_time`。注册链：`tools/__init__.py`（单一事实来源）→ `graph.py:177 build_tool_list(cfg)` → `create_agent(tools=...)`，bot 主回路模型真正可见。qq.py 轻回应分支走 `get_llm([], bind_tools=False)` 不挂工具，不受影响。
+### 验证
+- `py_compile` 三文件退出码 0（context.py / get_time.py / tools/__init__.py）。
+- miniconda py12 冒烟 PASS：`_TIME_AUTHORITY_RULE` 已含"禁止、先调用 get_time 工具、两个权威来源"断言；`TOOL_NAMES` 含 `get_time`；`build_tool_list` 返回 27 个工具且含 `get_time`；实调 `get_time.invoke({})` 返回 `2026-08-26 星期三 00:12:33 (Asia/Shanghai, UTC+8)` 格式正确。
+- 约束遵守：未 kill/重启 bot；脚本与工具文件纯 ASCII；无破坏性操作。
+### 待办更新
+- [x] 时间铁律升级为硬约束（禁止凭记忆断言时钟读数，时间问题先调 get_time）。
+- [x] 新增并注册 `get_time` 权威时钟工具（tools/__init__.py 单一注册源）。
+- [ ] 部署后观察线上：韩立对"几点/几号/星期几"的回答是否全部走 get_time、不再编时间。
+
+## 2026-08-26：时间硬化 v2（入口短路 + 完整锚点 + 记忆历史标记）
+### 背景
+上一轮挂了 `get_time` 工具并把铁律升级成硬约束，但韩立仍会在部分路径（尤其轻回应分支）凭历史/记忆里的旧时刻乱报当下（如把昨晚 23:54 当当下 09:51）。本轮做三刀结构性硬化：
+- P0：时间意图消息在进 LLM 之前，由代码直接短路秒回真实时钟；
+- P1：每轮 system 时间锚升级为完整"日期+星期+时分秒+时区"，并挪到 prompt 末尾贴近用户消息，铁律追加"历史/记忆里的时间均为旧记录禁止当当下"；
+- P2：每日笔记等记忆注入时给带时间戳内容打 `[历史@时间戳]` 标记，并声明仅供了解过往。
+### 已完成
+- `src/gacore/frontends/qq.py`：新增模块级 `_is_time_intent` / `_time_intent_answer` / `_stamp_memory_history` 等；`on_message` 在最前置（比 trivial_detect 更早，位于鉴权之后、rollover/LLM 之前）用正则命中"几点/几点钟/几点了/什么时间/今天几号/星期几/礼拜几/周几/过了多久/多久了"等时间意图，命中即 `datetime.now(_TZ_SH)` 拼口语答案原地秒回（含年月日+星期+时分秒+Asia/Shanghai UTC+8），完全不走 LLM/graph/get_time，复用 `send_text` 原回复通道。
+- `src/gacore/context.py`：`build_system_prompt` 把中段单行 `[Current time: ...]` 移除，改为在 prompt 末尾（hints 之后、return 之前）拼接完整锚点块 `【当前真实时间】YYYY-MM-DD HH:MM:SS 星期X（Asia/Shanghai, UTC+8）` 并紧跟 `[历史时间禁令]`（对话历史/历史记忆/每日笔记/昨日记忆注入中的时间均为陈旧记录，严禁当当下）；`_TIME_AUTHORITY_RULE` 同步追加"历史/记忆时间均为陈旧记录"声明。
+- `src/gacore/context.py`：`DAILY_HEADER` 改为明确"以下均为历史记录，仅供了解过往，绝不代表当前"；新增 `stamp_daily_history` 对含时间戳特征的行（`\d{1,2}[点时]`/日期格式）加 `[历史@时间戳]` 前缀。
+- `src/gacore/frontends/qq.py`：`_trivial_reply` 轻回应分支的 ctx 同步升级为完整锚点（日期+星期+时分秒+时区）+ 历史时间禁令，daily 注入同样走 `_stamp_memory_history` 打历史标记。
+### 验证
+- py_compile context.py / qq.py 通过；miniconda py12 冒烟 PASS：
+- P0：11 个时间意图用例判中期望值全对（正例"现在几点/几点啦/今天几号/星期几/礼拜几/今天周几/过了多久了/现在时间"，反例"帮我写个方案/今天天气怎么样/随便聊聊"）；`_time_intent_answer()` 返回 `现在是 2026年08月26日 星期三 10:11:30（Asia/Shanghai, UTC+8）`。
+- P1：`build_system_prompt` 输出含 `【当前真实时间】` 完整锚点块且位于 prompt 末尾（hints 之后、return 之前），铁律与锚点禁令均含"陈旧记录/严禁当作当下时刻作答"声明。
+- P2：`stamp_daily_history` 对"早上 9点 开会 / 昨天 2026-08-25 下午 / 8月24日 打球"正确加 `[历史@时间戳]` 前缀，无时间戳行保持原样。
+- 未重启 bot，未改 `.ps1/.bat`。
+- 补充（2026-08-26 后续）：**P0 入口短路已移除**——`qq.py` 中 `_TIME_INTENT_RE` / `_is_time_intent` / `_time_intent_answer` 及 `on_message` 最前置"秒回"块全部删除，时间类提问恢复走 trivial 闸门 + LLM 主流程，依托 P1 完整锚点与 `get_time` 工具由韩立自然作答；保留 P1（时间锚升级）与 P2（记忆历史标记）不动。`_TZ_SH` / `_WEEK_CN` / `_stamp_memory_history` 因仍被 `_trivial_reply` 引用而保留。
+### 待办更新
+- [x] P0 时间意图入口短路秒回真实时间（不走 LLM/graph）。
+- [x] P1 完整时间锚点挪到 prompt 末尾 + 历史旧记录禁令。
+- [x] P2 每日笔记/轻回应 daily 注入打历史标记。
+- [ ] 部署后观察线上：时间问题是否一律即时回到真实时钟、轻回应分支不再报旧时刻。

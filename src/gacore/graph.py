@@ -160,8 +160,9 @@ def cleanup_images(state: GAState) -> dict:
         else:
             cleaned.append(msg)
     # rollover_context is a one-shot injection: clear it here so it only appears in
-    # the first turn's system prompt (see context.build_system_prompt).
-    return {"messages": cleaned, "pending_images": [], "rollover_context": None}
+    # the first turn's system prompt (see context.build_system_prompt). output_mode
+    # is the same one-shot: proposal mode must never leak into later turns.
+    return {"messages": cleaned, "pending_images": [], "rollover_context": None, "output_mode": None}
 
 
 # --------------------------------------------------------------------------- graph assembly

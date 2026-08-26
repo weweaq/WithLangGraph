@@ -19,6 +19,7 @@ from .code_run import code_run
 from .daily_notes import edit_daily, read_daily, search_daily
 from .email_tools import send_email
 from .file_tools import file_patch, file_read, file_write
+from .get_time import get_time
 from .memory_tools import start_long_term_update, update_working_checkpoint
 from .ncm_tools import (
     ncm_login,
@@ -37,6 +38,7 @@ from .langTrack_tools import langTrack_stats
 __all__ = ["TOOL_NAMES", "build_tool_list"]
 
 TOOL_NAMES: tuple[str, ...] = (
+    "get_time",
     "code_run",
     "file_read",
     "file_patch",
@@ -66,6 +68,7 @@ TOOL_NAMES: tuple[str, ...] = (
 )
 
 _TOOLS: tuple[BaseTool, ...] = (
+    get_time,
     code_run,
     file_read,
     file_patch,

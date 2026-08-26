@@ -1,3 +1,14 @@
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 74fca65fe87f9b5d6900c56ec5512fbd_2fc5b252a09211f1a65b525400826444
+    ReservedCode1: Q8evqcX6LxLq3rS5BCQELYwxLf5grR6XuOWAf1jpzyAXK1YS0g0cXmA3XrYW3KBU02hyUFoCPs5aw0YhC/zUlJ3gLyLjbrDXdClhzIoU+jkp0i3IkvNPIiUQjdmZwq8MS6Z/HeCMaHt28OZE++DIW3NSNCPZocwZYSoHTIsCMSfSFgyh0cbcEs6egPk=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 74fca65fe87f9b5d6900c56ec5512fbd_2fc5b252a09211f1a65b525400826444
+    ReservedCode2: Q8evqcX6LxLq3rS5BCQELYwxLf5grR6XuOWAf1jpzyAXK1YS0g0cXmA3XrYW3KBU02hyUFoCPs5aw0YhC/zUlJ3gLyLjbrDXdClhzIoU+jkp0i3IkvNPIiUQjdmZwq8MS6Z/HeCMaHt28OZE++DIW3NSNCPZocwZYSoHTIsCMSfSFgyh0cbcEs6egPk=
+---
+
 # langTrack 技术实现参考（接口 · 实体 · 数据库 · 数据流）
 
 > 本文是 langTrack 服务端的**代码级技术参考**，所有字段/接口/阈值均对照源码（标注 `文件:行号`）。
@@ -485,3 +496,163 @@ sequenceDiagram
 **兜底铁律**：`_maybe_rollover` 整体 try/except，任一失败仅记 `rollover skipped (safe fallback to normal chat)`，聊天永不阻塞。注入对用户完全静默，仅日志留痕（`cross-day rollover executed` 含 old/new thread、pack_date、injected_chars）。
 
 **已知边界**：翻篇发生在 asyncio 主循环 on_message 入口；若首条是纯图片/命令消息，stage 可能在首个真实文本轮才被消费（`_run_agent`）；`rollover_context` 在 wait_for_text 中断后 resume 时仍在 state（cleanup_images 尚未跑），会在 resume 轮注入后清除——行为可接受。
+
+## 9.7 QQ 去人机味改造：入口分级闸门 + 真问题多方案输出
+
+**目标**：随口话不再走完整多轮 graph（省成本、去人机味），真决策问题给出多方案结构化对比并按条发送。设计文档 `output/qq-chat-multi-answer-research-20260824.md`（方案 A + B）。
+
+**核心思想**：消息入口按「随口话 / 真问题」分流。随口话（极短或白名单词、且无意图词）→ 独立轻量 LLM 直接生成 1~2 句即兴回应（不建 agent、不调工具、不跑 graph、不写线程）；真问题 → 正常 agent 回路，决策类问题另注入多方案输出指令，发送端按【方案N】锚点拆多条消息。所有判定 fail-open：边界情形一律放行进完整回路，绝不误杀正经问题。
+
+**Phase 1 分流时序**：
+
+```mermaid
+flowchart LR
+    M[on_message 文本] --> G{trivial_detect}
+    G -- 命中(≤8字或白名单词, 无意图词) --> T[_trivial_reply]
+    G -- 未命中 --> R[_run_agent 正常回路]
+    T --> L[get_llm 无工具 bind temp=1.0 max_tokens=60]
+    L --> P[prompt: 时间/饭点/今日画像/口吻/人物卡]
+    P --> S[发送 1~2 句]
+```
+
+**关键位置**：
+
+| 职责 | 位置 | 说明 |
+|---|---|---|
+| 随口话判定 | `qq.py:trivial_detect` | ≤`_TRIVIAL_MAX_LEN`(8) 字或命中 `_TRIVIAL_WHITELIST`，且不含 `_INTENT_WORDS`（如何/怎么/为什么/帮我/推荐/方案/对比/能否…）→ True；`any(w in t for w in _INTENT_WORDS)` 优先短路放行 |
+| 轻回应入口 | `qq.py:on_message` 第 4 步前 | `asyncio.create_task(self._trivial_reply(...))` 后 return，不进入停顿图/中断/正常轮 |
+| 轻回应实现 | `qq.py:_trivial_reply` | `get_llm([], bind_tools=False).bind(temperature=1.0, max_tokens=60)`；注入 `_meal_period(now.hour)`/`load_recent_daily_summaries(cfg)`/`_recent_user_voice(user_id)`/人物卡 `card_prompt`；无固定模板；异常降级 `"嗯，我在。"` |
+| 口吻采样 | `qq.py:_recent_user_voice` | `graph.aget_state` 读 thread 最近 1~3 条 HumanMessage.content，失败降级空串 |
+| A0 提示兜底 | `context.py:_RESPONSE_LAYER_RULES` | `build_system_prompt` 恒注入 `[回应分层铁律]`：随口话/情绪话/简短问候 → 一句话带过（20 字内，不调工具不展开）；明确提问/任务 → 全力作答；无法确定一律按正经问题。防漏网随口话仍长篇 |
+| 决策类判定 | `qq.py:proposal_detect` | 命中 `_PROPOSAL_KEYWORDS`（推荐/哪个好/怎么选/方案/对比/帮我决定/建议/选择…）→ True |
+| 模式注入 | `qq.py:_run_agent` → `state["output_mode"]="proposal"` | 仅首轮；`context.py` 在 `output_mode=="proposal"` 时追加 `=== 多方案输出模式 ===`（`_PROPOSAL_HEADER/_PROPOSAL_RULE`）：【方案一】..【方案三】至多 3 个 + “我建议选…”收尾 |
+| 拆条发送 | `qq.py:_split_by_proposal` + `_stream_agent` 尾部 | 按 `_PROPOSAL_RE`(`【方案N】`) 锚点分段，首段=开场、末段=收尾建议；复用 `_SPLIT_LIMIT` 基建逐条发送；锚点 <2 原样整条发送 |
+| 一次性语义 | `state.py:GAState.output_mode` / `graph.py:cleanup_images` | `output_mode: str | None` 注解；`cleanup_images` 返回 `output_mode: None` 首轮后清除不泄漏 |
+
+**兜底铁律**：
+
+- `trivial_detect` 未命中 → 一律放行完整回路；轻回应任一环节失败仅降级极简句，绝不抛错阻塞消息循环。
+- 分诊只影响「回复方式」，不触碰 checkpoint/线程映射；`_recent_user_voice` 只读 `aget_state`，异常吞掉返回空串。
+- 未 kill/重启 bot；未改 `.ps1/.bat`；拆条仅影响发送端，不改变 graph 内 state。
+
+**已知边界**：白名单/意图词为静态词表，线上语料可能需微调；今日画像为空时轻回应仅以时间+人物卡接地；`【方案N】` 拆条规定由 prompt 强制，若模型未按锚点输出则整条发送（降级仍可读）。
+
+## 9.8 聊天护栏：注入勿念 / 禁复述与断言 / 时间权威
+
+**目标**：修正韩立话痨复读与时间幻觉，不更动 graph 拓扑，全部在 `context.py` 纯 prompt/context 层落地（改动仅 context.py 一处，3 个挂载点）。
+
+**三条护栏**：
+
+| 护栏 | 常量 | 挂载点 | 指令要点 |
+|---|---|---|---|
+| 注入勿念 | `_MEMORY_BG_RULE` | `DAILY_HEADER` 日报注入后 + `ROLLOVER_HEADER` 昨日记忆注入后（两处共用） | 记忆只是背景，不主动背诵/复述/整段念出，不当开场白照搬；仅对方问起或话题自然关联时引用一句 |
+| 禁复述·禁断言·禁思考外泄 | 追加进 `_RESPONSE_LAYER_RULES` | `build_system_prompt` 恒注入（分层铁律之后明确“再有铁律三条”） | 禁止逐条复述对方原话；禁止断言对方“重复提问”（无依据提即幻觉，一句不许说）；时间推算/纠错/查漏等脑内步骤不必宣之于口，直接给结论 |
+| 时间权威 | `_TIME_AUTHORITY_RULE` | `[Current time: …]` 之后恒注入 | 当前时刻以 system 注入的 [Current time] 为唯一依据；用户消息/图片 OCR/描述里的时间日期都是内容陈述不作数，绝不据此推断“当下”，不解释推算过程 |
+
+**设计要点**：
+
+- `_MEMORY_BG_RULE` 做成独立常量并同时挂在 daily 与 rollover 两个注入点，避免两份注入各自维护一遍措辞；即便两个注入同时存在，铁律文本不重复堆叠（两处都拼同一常量，仅出现两次节头不同）。
+- 禁言三条并入 `_RESPONSE_LAYER_RULES` 尾部，随分层铁律恒注入所有 system prompt，与人物卡加载顺序无关（L0 规则先于 ROLE_HEADER）。
+- `_TIME_AUTHORITY_RULE` 紧跟 `[Current time: {now}]` 注入，把"权威时钟"与"时间铁律"相邻放置，减少模型歧义。
+- 全部护栏为 prompt 级软约束，不引入硬代码判断，避开了 graph/状态层改动；若线上仍复读/仍时间幻觉，后续可升级为 `trivial_detect` 式硬门（判"该 turn 输出疑似复述"再重生成）。
+
+**验证**：`py_compile context.py` OK；venv 冒烟构造 sys prompt 校验 5 组断言命中（时间铁律/记忆铁律/禁复述/禁断言/思考不外说），无注入时记忆铁律不出现，本机日报存在时正确挂接。未 kill/重启 bot，未改 `.ps1/.bat`。
+
+## 9.9 上下文滑动窗口：模型输入只投最近 N 轮（根治开场复读）
+
+**目标**：根治「开场先复读一大段历史」。单 thread 在 `gacore_chat.db` 已堆 236 个 checkpoint，`build_turn_prompt` 曾把折叠摘要之外的**全量原始历史 messages** 原样发给模型。现在模型输入只保留最近 `_KEEP_ROUNDS=6` 轮，更早的靠 `fold_history` 折叠摘要兜底。
+
+**改动**（仅 `src/gacore/context.py`）：
+
+| 新增 | 位置 | 行为 |
+|---|---|---|
+| `_KEEP_ROUNDS = 6` | 模块常量区 | 窗口轮数，注释用途 |
+| `trim_messages(messages, keep_rounds=_KEEP_ROUNDS)` | 新增纯函数 | 从尾部按 `HumanMessage` 为轮次边界，保留最近 `keep_rounds` 轮完整消息；窗口起点恒为 Human，其间 AI/Tool 配对一并保留，无孤儿 ToolMessage；短历史原样返回；不改入参/state |
+| `build_turn_prompt` 返回值 | 第 233 行附近 | `return [SystemMessage(content=prompt), *trim_messages(messages)]`（原 `*messages`） |
+
+**数据流**（mermaid）：
+
+```mermaid
+flowchart LR
+    A["state.messages<br/>全量（236 checkpoint 一个不删）"] -->|fold_history| B["折叠摘要 → system prompt<br/>=== Earlier context ==="]
+    A -->|trim_messages keep_rounds=6| C["最近 6 轮原始消息<br/>起点为 Human、无孤儿 ToolMessage"]
+    B --> D["模型输入"]
+    C --> D
+```
+
+**要点**：
+
+- **纯函数、不动存储**：checkpoint 仍全量持久化，滑动窗口只发生在「入模型」时；`trim_messages` 不改 state、不改入参。
+- **轮次边界语义**：以 `HumanMessage` 为轮界，窗口起点必是 Human，从尾部数第 `keep_rounds` 个 Human 起保留，杜绝把 ToolMessage 单独截出来制造孤儿。
+- **折叠摘要仍进 system**：`fold_history` 与 `_KEEP_ROUNDS` 分工——更早历史由折叠摘要提供粗粒度背景，最近 6 轮提供全量细节。
+
+**验证**：`py_compile context.py` 退出码 0；miniconda py12（`D:\softwares\miniconda\envs\py12\python.exe`）`import gacore.context` 冒烟 OK。行为自测：20 轮 Human/AI/Tool 混合 47 条 → 14 条/6 轮、首条 Human、最近 Human 必在、输入不变、窗口内无孤儿 ToolMessage；短历史原样返回；`build_turn_prompt` = SystemMessage + 裁剪消息且折叠摘要仍在。未 kill/重启 bot，未改 `.ps1/.bat`。
+*（内容由AI生成，仅供参考）*
+
+## 2026-08-25：QQ 发送端去重基线持久化（修复"叠发"）
+### 现象与定位
+QQ 截图显示一条消息内同时出现"上一轮方案回复"与"本轮会错意招呼"，语义跳脱。定位到发送层 `src/gacore/frontends/qq.py::_stream_agent`：
+- 包装图 `process → cleanup_images → END`，`cleanup_images`（graph.py:146）对 `state["messages"]` 做标记清洗后 `return {"messages": cleaned, ...}`，`stream_mode="updates"` 会让 **全量历史消息** 在每次 turn 的最后一个 chunk 再次出现；
+- `_stream_agent` 用 `_rendered_msg_ids`（模块级 dict，纯 RAM）做已发送去重，设计上允许同一消息被多 chunk 命中；
+- 只要进程重启，RAM 集合清空，当前 turn 的 `cleanup_images` 全量 chunk 就会把历史已发 AIMessage 重新 append 进 `reply_parts`，最终 `final_text = "
+
+".join(reply_parts)` 整体作为一条消息发出 → 表现为"把回答都叠在一块"。
+### 修复
+在 `_stream_agent` 抵达 astream 之前，先 `await self.graph.aget_state(config)` 读出本 thread checkpoint 中已持久化的消息 id，逐一 `rendered.add(mid)` 作为基线。因 checkpointer 持久化在 SQLite，即使进程重启，"历史已发"依然可判定，杜绝重放。基线读取为 best-effort，失败时保持原行为。
+### 关联改动
+- 本次未动：`context.py::trim_messages`（入模窗口，另条链路已治"开场复读"）；`_split_by_proposal`（发送期方案拆条，逻辑不变）。
+### 部署
+- 语法通过；bot 404→ pid 2132 @23:29:52 ready，脚本以 `conda py12 -u frontends/qq.py` 且需 `PYTHONPATH=D:\AAAmyPrj\github\myrepos\WithLangGraph\src` 启动（直接 Start-Process 不带该变量会 ModuleNotFoundError: No module named 'gacore'）。
+*（内容由AI生成，仅供参考）*
+
+## 9.10 时间铁律升级为硬约束 + 新增 get_time 权威时钟工具（2026-08-26）
+
+**目标**：焊死时间幻觉。此前 `_TIME_AUTHORITY_RULE` 只认 `[Current time]` 为唯一依据但未强制"必须调工具"，模型仍可能凭记忆/上下文猜"当下几点几分"。本轮升级为"禁止"语气硬约束，并新增 `get_time` 工具，让时间答案必须走系统时钟。
+
+**改动清单**：
+
+| 文件 | 改动 |
+|---|---|
+| `src/gacore/context.py` | 升级 `_TIME_AUTHORITY_RULE`：时间只允许两个权威来源（①`get_time` 工具返回值；②system 注入的 `[Current time]`）；未经调用时间工具/未读到注入时间时**禁止**断言任何具体时钟读数；时间问题**必须先调用 `get_time` 再作答**，工具不可用时以 `[Current time]` 为准；保留原约束（用户消息/OCR 里的时间只是内容陈述不作数、不解释推算过程） |
+| `src/gacore/tools/get_time.py`（新增） | `@tool` 纯函数工具，返回 `YYYY-MM-DD 星期N HH:MM:SS (Asia/Shanghai, UTC+8)`，时区 `timezone(timedelta(hours=8))`；docstring 告知模型"需要时间必须先调本工具"；无 I/O、无副作用 |
+| `src/gacore/tools/__init__.py` | 注册：import `get_time`、`TOOL_NAMES` 与 `_TOOLS` 首位追加 `get_time`（顺序首位，更易被模型优先调用） |
+
+**工具注册链**（单一事实源 → graph 装配 → 模型可见）：
+
+```mermaid
+flowchart LR
+    A["tools/__init__.py<br/>TOOL_NAMES + _TOOLS + build_tool_list()"] -->|build_tool_list(cfg)| B["graph.py:177<br/>_build_core_agent tool_list"]
+    B -->|create_agent(tools=tool_list)| C["模型绑定全部工具<br/>含 get_time"]
+    C -->|涉及时间问题| D["get_time 返回系统时钟<br/>盖章为唯一权威来源"]
+```
+
+**设计要点**：
+
+- `get_time` 登在 `TOOL_NAMES` 首位：绑定顺序影响工具选择，把"时钟"放最前提高调用概率。
+- 铁律措辞用"禁止/必须先调用"，从"建议"升级为"硬约束"；同时给模型留降级兜底（工具不可用时 `[Current time]`），避免无工具环境空转。
+- 纯函数工具无副作用、无需 `cfg`，`build_tool_list` 无需配置即可导出；qq.py 轻回应分支（`get_llm([], bind_tools=False)`）不挂工具，不受影响。
+- `get_time` 返回东八区字符串直接可读，不要求模型再从时间戳换算，杜绝二次推算。
+
+**验证**：`py_compile` 三文件退出码 0；miniconda py12 冒烟——铁律含"禁止/先调用"断言 PASS；`TOOL_NAMES` 与 `build_tool_list()`（27 个工具）均含 `get_time`；实调 `get_time.invoke({})` 返回 `2026-08-26 星期三 00:12:33 (Asia/Shanghai, UTC+8)`。未 kill/重启 bot，未改 `.ps1/.bat`。
+
+## 9.11 时间硬化 v2：入口短路 + 完整锚点 + 记忆历史标记（2026-08-26）
+
+**目标**：堵死"韩立凭历史/记忆旧时间报当下"。`get_time` 工具 + 铁律虽已挂上，但模型仍可能走轻回应分支或直接引用记忆里的旧时刻（如把昨晚 23:54 当当下 09:51）。本轮做三层结构性硬化：入口代码短路（P0）、完整时间锚点置底（P1）、记忆注入打历史标记（P2）。
+
+**改动清单**：
+
+| 文件 | 改动 |
+|---|---|
+| `src/gacore/frontends/qq.py` | P0：新增模块级 `_TZ_SH` / `_WEEK_CN` / `_TIME_INTENT_RE` / `_is_time_intent` / `_time_intent_answer`（`datetime.now(_TZ_SH)` 拼"年月日 星期 时分秒（Asia/Shanghai, UTC+8）"）；`on_message` 在鉴权之后、`_record_known_user` / `_maybe_rollover` / `trivial_detect` 之前插入短路——正则命中"几点/几点钟/几点了/什么时间/今天几号/星期几/礼拜几/周几/过了多久/多久了"等即 `send_text` 原地秒回，不进 LLM / graph / get_time。P2：`_trivial_reply` 的 ctx 升级为完整锚点 + `[历史时间禁令]`，daily 注入走 `_stamp_memory_history` |
+| `src/gacore/context.py` | P1：`build_system_prompt` 移除中段单行 `[Current time]`，改为 prompt 末尾（hints 后、return 前）拼完整锚点块 `【当前真实时间】YYYY-MM-DD HH:MM:SS 星期X（Asia/Shanghai, UTC+8）` + `[历史时间禁令]` 声明；`_TIME_AUTHORITY_RULE` 追加"历史/记忆里时间均为陈旧记录禁止当当下"。P2：`DAILY_HEADER` 改历史声明文案，新增 `stamp_daily_history` 给含时间戳行加 `[历史@时间戳]` 前缀 |
+
+**设计要点**：
+
+- P0 闸门放在所有记忆 / LLM 副作用之前：时间问题不触发 rollover、不写记忆、不进 graph，纯函数拼字符串秒回，时区显式东八区。
+- P1 锚点块每轮用 `datetime.now(_TZ)` 重建并 pin 在 prompt 最末（hints 之后、return 之前），离用户消息最近；锚点自带 `[历史时间禁令]`，与铁律 `_TIME_AUTHORITY_RULE` 双写一致性声明——历史注入（每日笔记 / 昨日记忆 / 对话历史）中的任何时间一律视为陈旧记录。
+- P2 时间戳行识别用 `\d{1,2}[点时]` 或日期格式正则，命中即加 `[历史@时间戳]` 前缀，明确"供了解过往、绝不代表当前"；轻回应分支同款处理，避免双路径不一致。
+- 与 `get_time` 工具双轨：P0 短路覆盖"纯问时间"的最常见路径，其余时间相关问题仍由工具 + 锚点兜底。
+
+**验证**：`py_compile` context.py / qq.py 通过；py12 冒烟——P0 11 用例判中全对、`_time_intent_answer()` 返回 `现在是 2026年08月26日 星期三 10:11:30（Asia/Shanghai, UTC+8）`；P1 `build_system_prompt` 锚点完整且位于末尾、含"陈旧记录 / 严禁当作当下时刻作答"；P2 `stamp_daily_history` 时间戳行正确打标。未重启 bot。
+
+**后续变更（2026-08-26）**：P0 入口短路已整体移除——`qq.py` 中 `_TIME_INTENT_RE` / `_is_time_intent` / `_time_intent_answer` 及 `on_message` 内最前置"秒回"块全部删除，时间类提问恢复走原链路（trivial 闸门 + LLM 主流程，依托 P1 完整锚点与 `get_time` 工具自然作答）；P1 / P2 保留不变；`_TZ_SH` / `_WEEK_CN` / `_stamp_memory_history` 仍被 `_trivial_reply` 引用故一并保留。

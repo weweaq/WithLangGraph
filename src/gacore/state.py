@@ -37,6 +37,7 @@ class GAState(AgentState[Any], total=False):
     pending_images: list[str]  # accumulated image paths for multi-image processing
     active_card: str | None  # active character-card id for this conversation; declared so the graph channel does not drop it
     rollover_context: str | None  # one-shot cross-day memory injection (from onboard_pack.json); cleared after first turn
+    output_mode: str | None  # per-turn output formatting mode ("proposal" = multi-option reply); cleared by cleanup_images after the turn
 
 
 def new_state(user_input: str, cfg: Config, active_card: str | None = None) -> GAState:
