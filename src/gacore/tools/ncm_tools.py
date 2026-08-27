@@ -139,6 +139,7 @@ def _run_cli(args: list[str]) -> subprocess.CompletedProcess[str]:
         encoding="utf-8",
         errors="replace",
         timeout=_TIMEOUT_SECONDS,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         check=False,  # callers inspect returncode / JSON payload
     )
 

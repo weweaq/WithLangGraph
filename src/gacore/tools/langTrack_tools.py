@@ -93,6 +93,8 @@ def _ensure_etl() -> bool:
 
             timeout=_ETL_TIMEOUT_SECONDS,
 
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+
             check=False,
 
         )

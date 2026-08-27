@@ -81,6 +81,7 @@ def _run_cli(args: list[str]) -> subprocess.CompletedProcess[str]:
         errors="replace",
         timeout=_TIMEOUT_SECONDS,
         env=_ENV,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         check=False,  # callers inspect returncode / JSON payload
     )
 
