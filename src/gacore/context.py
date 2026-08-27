@@ -142,6 +142,19 @@ def trim_messages(messages: list[BaseMessage], keep_rounds: int = _KEEP_ROUNDS) 
 _TIMESTAMP_LINE_RE: Final = re.compile(r"\d{1,2}[点时]|\d{4}[-/年]\d{1,2}[-/月]\d{1,2}|\d{1,2}月\d{1,2}日")
 
 
+def stamp_history_lines(lines: list[str]) -> list[str]:
+    """Prefix every timestamp-bearing history line with [历史@时间戳].
+
+    Applied to the folded "Earlier context" block so any time/date in past
+    conversation is physically marked as historical and can never be read as
+    the present moment.
+    """
+    return [
+        f"[历史@时间戳] {line}" if _TIMESTAMP_LINE_RE.search(line) else line
+        for line in lines
+    ]
+
+
 def stamp_daily_history(daily: str) -> str:
     """Prefix every timestamp-bearing line of injected daily notes with [历史@时间戳]."""
     return "\n".join(
@@ -272,5 +285,7 @@ def build_turn_prompt(state: GAState, cfg: Config) -> list[BaseMessage]:
     prompt = build_system_prompt(state, cfg)
     folded = fold_history(messages)
     if folded:
+        # 历史时间标记：进图前把历史对话中所有时间戳扫一遍加上 [历史@时间戳]，不当作当下时刻。
+        folded = stamp_history_lines(folded)
         prompt += f"\n\n{EARLIER_HEADER}\n" + "\n".join(folded)
     return [SystemMessage(content=prompt), *trim_messages(messages)]

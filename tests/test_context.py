@@ -14,7 +14,7 @@ import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from gacore.config import Config
-from gacore.context import build_system_prompt, build_turn_prompt, extract_summaries, fold_history, periodic_hints
+from gacore.context import build_system_prompt, build_turn_prompt, extract_summaries, fold_history, periodic_hints, stamp_history_lines
 
 _PROJECT_ROOT: Final = Path(__file__).resolve().parents[1]
 
@@ -220,3 +220,21 @@ def test_build_turn_prompt_with_empty_messages_returns_single_system_message(cfg
     assert len(result) == 1
     assert isinstance(result[0], SystemMessage)
     assert "=== Earlier context ===" not in result[0].content
+
+
+def test_stamp_history_lines_marks_timestamp_lines() -> None:
+    """History lines carrying an explicit time/date get a [历史@时间戳] prefix."""
+    lines = ["[USER] 昨天3点开会", "[Agent] 好的，8月24日见", "[USER] 好的"]
+    stamped = stamp_history_lines(lines)
+    assert stamped[0].startswith("[历史@时间戳] ")
+    assert stamped[1].startswith("[历史@时间戳] ")
+    assert stamped[2] == "[USER] 好的"
+
+
+def test_build_turn_prompt_marks_old_history_timestamps(cfg_with_assets: Config) -> None:
+    """Past conversation timestamps are physically marked as historical inside the system prompt."""
+    messages = [HumanMessage(content="8月1日 我们约过面基"), AIMessage(content="好的，到时见")]
+    prompt = build_turn_prompt(_state(messages), cfg_with_assets)
+    sys_msg = prompt[0]
+    assert isinstance(sys_msg, SystemMessage)
+    assert "[历史@时间戳] [USER] 8月1日 我们约过面基" in sys_msg.content

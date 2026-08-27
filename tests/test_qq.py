@@ -360,3 +360,23 @@ async def test_role_command_off_clears_card():
     assert "user-1" not in qq._user_card
     out = app.send_text.call_args.args[1]
     assert "已退出角色扮演" in out
+
+
+def test_with_message_timestamp_prefixes_current_time() -> None:
+    """Every user message gains an authoritative current-clock prefix before entering the graph."""
+    text = "帮我看看今天几号"
+    stamped = qq._with_message_timestamp(text)
+    assert "[本条消息真实时间" in stamped
+    assert "UTC+8" in stamped
+    assert text in stamped
+
+
+@pytest.mark.parametrize(
+    "msg",
+    ["今天几号", "现在几点", "当前", "日期", "星期几", "周几", "几点了"],
+)
+def test_time_intent_words_fail_open_full_graph(msg: str) -> None:
+    """Time-intent words must never be short-circuited by the trivial one-liner gate."""
+    from gacore.frontends.qq import trivial_detect
+
+    assert trivial_detect(msg) is False

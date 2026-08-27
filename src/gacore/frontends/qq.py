@@ -177,6 +177,10 @@ _INTENT_WORDS: Final = frozenset({
     "能否", "能不能", "可不可以", "可以吗", "行不行", "哪个", "哪款", "什么",
     "多少", "几点", "多少钱", "有没有", "是否有", "分析", "总结", "解释", "评价",
     "点评", "处理", "搞定", "安排", "决定", "选择", "给个", "帮个忙",
+    # 时间意图词扩充：凡问“几号/几月/星期几/周几/当前/日期/时间”都算真实问题，
+    # 强制进完整图走 get_time，避免被 trivial 短消息门槛一句带过。
+    "几号", "几月", "几号了", "星期", "周几", "礼拜", "当前", "日期", "时间",
+    "现在几点", "今天几号", "哪一天", "几点了",
 })
 
 # --------------------------------------------------------------------------- Phase 2: multi-option output
@@ -623,6 +627,20 @@ def _stamp_memory_history(seg: str) -> str:
         f"[历史@时间戳] {line}" if _MEM_TIMESTAMP_RE.search(line) else line
         for line in seg.splitlines()
     )
+
+
+def _with_message_timestamp(text: str) -> str:
+    """Prefix user text with the authoritative current-clock anchor (UTC+8).
+
+    Every user message enters the graph stamped with the real system time, so the
+    "now" the model sees next to the message is unambiguous and can never be confused
+    with a time/date quoted inside the content. Pure string transform, always applied
+    at every user-message ingress (_run_agent / _resume_agent / image batching).
+    """
+    now = datetime.now(_TZ_SH)
+    ts = now.strftime("%Y-%m-%d %H:%M:%S")
+    wk = _WEEK_CN[now.weekday()]
+    return f"[本条消息真实时间 {ts} {wk} (UTC+8)]\n{text}"
 
 
 def trivial_detect(text: str) -> bool:
@@ -1544,7 +1562,7 @@ class QQApp:
 
                     "pending_images": all_images,
 
-                    "messages": [HumanMessage(content="\n".join(parts))],
+                    "messages": [HumanMessage(content=_with_message_timestamp("\n".join(parts)))],  # 图片消息同样贴当前真实时间
 
                 }
 
@@ -1602,7 +1620,7 @@ class QQApp:
 
         config = {"configurable": {"thread_id": thread_id}, "recursion_limit": DEFAULT_RECURSION_LIMIT}
 
-        state = new_state(text, Config.default(), active_card=_user_card.get(user_id))
+        state = new_state(_with_message_timestamp(text), Config.default(), active_card=_user_card.get(user_id))  # 进入图前贴上当前真实时间
 
         # Consume the staged cross-day rollover injection on this first turn.
         rollover_text = self._pending_rollover.pop(user_id, None)
@@ -1627,7 +1645,7 @@ class QQApp:
 
         """Resume a paused (ask_user) turn with the user's answer."""
         await self._stream_agent(
-            chat_id, Command(resume=answer), config, msg_id=msg_id, is_group=is_group, user_id=user_id
+            chat_id, Command(resume=_with_message_timestamp(answer)), config, msg_id=msg_id, is_group=is_group, user_id=user_id
         )
 
     # ------------------------------------------------------- trivial (light) replies
