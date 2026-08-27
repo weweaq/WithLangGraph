@@ -2,6 +2,28 @@
 AIGC:
     Label: "1"
     ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 74fca65fe87f9b5d6900c56ec5512fbd_af20f100a1ca11f193c6525400f8a581
+    ReservedCode1: rql6zwY3dwnCqhMmahCUF/xWuuLChvsn0bxA3nOwrYjWNIzB5fgd5eqlFmtwLr2A3Q5/L4pQm8lfmDdVBQKunQ443jAoppWB5VQOzKWQTGwIRZDuZORyDZWbyDAFKaSecQQ72Xj/qidS8pMVJK585EYgbqkGWv8PAdKMtXmQD0Xoub52EFeDPh5KxnE=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 74fca65fe87f9b5d6900c56ec5512fbd_af20f100a1ca11f193c6525400f8a581
+    ReservedCode2: rql6zwY3dwnCqhMmahCUF/xWuuLChvsn0bxA3nOwrYjWNIzB5fgd5eqlFmtwLr2A3Q5/L4pQm8lfmDdVBQKunQ443jAoppWB5VQOzKWQTGwIRZDuZORyDZWbyDAFKaSecQQ72Xj/qidS8pMVJK585EYgbqkGWv8PAdKMtXmQD0Xoub52EFeDPh5KxnE=
+---
+
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 74fca65fe87f9b5d6900c56ec5512fbd_1b684e9da1bd11f1a413525400287e28
+    ReservedCode1: j9epkje1bF1gV8xwktcFG3dCK57A/mxz8dM3RZ9dMfzpW4CMJa7OJ0h1aQcRwdprDav6UUo4w4nLlJrg3fQrgrmChwvMXIOt8gLvh1dOZDL6OgWOBfu40CXDDNBjMuHlNtMpFwjx7aUfZdMv02rIENajiZiI6bZteXDvqvlrCfyYvnduYQ7a2iTMnYA=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 74fca65fe87f9b5d6900c56ec5512fbd_1b684e9da1bd11f1a413525400287e28
+    ReservedCode2: j9epkje1bF1gV8xwktcFG3dCK57A/mxz8dM3RZ9dMfzpW4CMJa7OJ0h1aQcRwdprDav6UUo4w4nLlJrg3fQrgrmChwvMXIOt8gLvh1dOZDL6OgWOBfu40CXDDNBjMuHlNtMpFwjx7aUfZdMv02rIENajiZiI6bZteXDvqvlrCfyYvnduYQ7a2iTMnYA=
+---
+
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
     ProduceID: 74fca65fe87f9b5d6900c56ec5512fbd_2fc5b252a09211f1a65b525400826444
     ReservedCode1: Q8evqcX6LxLq3rS5BCQELYwxLf5grR6XuOWAf1jpzyAXK1YS0g0cXmA3XrYW3KBU02hyUFoCPs5aw0YhC/zUlJ3gLyLjbrDXdClhzIoU+jkp0i3IkvNPIiUQjdmZwq8MS6Z/HeCMaHt28OZE++DIW3NSNCPZocwZYSoHTIsCMSfSFgyh0cbcEs6egPk=
     ContentPropagator: 001191440300708461136T1XGW3
@@ -656,3 +678,41 @@ flowchart LR
 **验证**：`py_compile` context.py / qq.py 通过；py12 冒烟——P0 11 用例判中全对、`_time_intent_answer()` 返回 `现在是 2026年08月26日 星期三 10:11:30（Asia/Shanghai, UTC+8）`；P1 `build_system_prompt` 锚点完整且位于末尾、含"陈旧记录 / 严禁当作当下时刻作答"；P2 `stamp_daily_history` 时间戳行正确打标。未重启 bot。
 
 **后续变更（2026-08-26）**：P0 入口短路已整体移除——`qq.py` 中 `_TIME_INTENT_RE` / `_is_time_intent` / `_time_intent_answer` 及 `on_message` 内最前置"秒回"块全部删除，时间类提问恢复走原链路（trivial 闸门 + LLM 主流程，依托 P1 完整锚点与 `get_time` 工具自然作答）；P1 / P2 保留不变；`_TZ_SH` / `_WEEK_CN` / `_stamp_memory_history` 仍被 `_trivial_reply` 引用故一并保留。
+
+
+## 9.12 daily-report prompt 升级：人物速写（2026-08-26）
+- 位置：config/schedule.json → jobs[0].prompt（daily-report，deliver_to=email）。
+- 产出从"归档+画像增量"扩为三层，新增「人物速写」：以 file_read 读 memory/global_mem_insight.txt + global_mem.txt 建立长期脉络，search_daily 近 2-3 天做昨日对比；速写要点 = 一句话状态 + 兴趣连线(加深/新苗头/翻篇) + 微变化/苗头。
+- 最终回复（邮件正文）= 人物速写为主体；详细版写 daily note。
+- 注意：agent 无读 long-term 专用工具，靠 file_read 读文件，路径相对项目根；global_mem 文件由 start_long_term_update 写。
+- 依赖：工具 file_read / search_daily / langTrack_stats / bili_history / code_run 均已注册（TOOL_NAMES）。
+
+## 9.13 时间约束强化 + LLM 请求体日志（2026-08-27）
+**目标**：①把时间铁律从"时间问题的统一出处"推广到"凡涉及时间概念先看真实时间"；②核验既有硬化 prompt 是否真被装配生效；③给真实 LLM 调用增加完整请求体日志，便于日后排查。
+### 强化点（`context.py` / `frontends/qq.py`）
+| 位置 | 改动 |
+| --- | --- |
+| `context.py:_TIME_AUTHORITY_RULE`（:42） | 扩写为"凡是回答里会用当前时间概念（几点几分/几号/星期/时段/距某时刻多久/工作日周末/班次上下班/今天昨天明天/日期推算）必须先调 `get_time` 拿系统时钟，严禁用历史/记忆/注入文本推算当下"；原"只认 get_time 返回值与 [Current time] 两个权威源"保留 |
+| `context.py:build_system_prompt`（:197） | 末尾锚点块追加"凡涉及当前时间/日期/星期/时段/班次/剩余时长的问题，先调用 get_time 工具以官方时钟作答" |
+| `frontends/qq.py:_trivial_reply`（:1698） | 轻回应 ctx 真实时间注入行后追加硬声明"凡涉及现在几点/几号/星期几/还剩多久/班次判断等时间问题，一律按上面这行真实时间作答"（该分支无 get_time，注入时间为唯一依据） |
+### 生效链路（既有项核实，均有代码引用证据）
+- P1 锚点：`context.py:197-198` → `middleware.py:83 GAPromptMiddleware.modify_model_request` → `graph.py:179-184 build_tool_list + create_agent`（首轮 system prompt）。
+- P2 记忆标记：`context.py:170`（DAILY_HEADER + `stamp_daily_history`）；`qq.py:1703`（`_stamp_memory_history` 对 daily 时间戳行加 `[历史@时间戳]`）。
+- `get_time` 工具：`tools/__init__.py:22/41/71`（import / TOOL_NAMES 首位 / _TOOLS 首位）→ `graph.py:177 build_tool_list` → `create_agent(tools=...)`。
+- daily-report 三层：`config/schedule.json` jobs[0].prompt → `scheduler.py:run_job`（23:50）→ `logs/scheduled/daily-report_<ts>.md`；运行证据见 `daily-report_20260827_000050.md`（摘要"三层产出完成"，Reply 以人物速写为主体）。
+### LLM 请求体日志（`llm.py` + 新增 `src/gacore/llm_request_log.py`）
+- 配置：`get_llm`（`src/gacore/llm.py`）返回实例前统一 `install_llm_logging(llm, provider)`——单挂点覆盖主 agent graph / scheduler job / qq trivial 三路，不侵入各调用点。
+- 机制：`install_llm_logging` 对模型实例 monkey-patch `invoke/ainvoke/stream/astream/bind_tools`，capture 后原样转发；`bind_tools` 把工具定义暂存到实例（`_gacore_bound_tools`），后续调用随记录写入；调用前拦截任意方法拼完整记录（messages / tools / params / provider / model / run_kind / timestamp / thread?）。
+- 落盘：`logs/{YYYY-MM-DD}/llm_requests.jsonl`，JSONL 追加写，`ensure_ascii=False`，utf-8。
+- 脱敏：递归遍历结构，键名命中 `api_key|access_token|Authorization|secret|token`（大小写不敏感）的值 → `***`；超长字符串（>2000 字符）截断；`messages` 内 image 内容只记元数据不记 base64。
+- 兜底：登录全程 try/except，失败仅 best-effort 静默（不阻断模型调用）；线程安全借 `threading.Lock`。
+- 验证（桩 FakeModel，不联网）：invoke/ainvoke/astream/stream 四 run_kind 全部写盘；绑 tools 后记录含 ntools=2；params 含 temperature/model_kwargs；api_key 掩码 `***` 且原文未泄漏；py_compile 四文件 EXIT=0。
+### 修复：pydantic v2 不兼容导致启动崩溃（2026-08-27）
+- **现象**：重启 bot 时 `get_llm → install_llm_logging` 抛 `ValueError: "ChatOpenAI" object has no field "invoke"`，start.py 初始化失败。
+- **根因**：旧实现直接实例动态属性赋值（`llm.invoke = _invoke` 等）；新版 langchain `ChatOpenAI` 是 pydantic v2 `BaseModel`，`__setattr__` 拒绝未声明字段赋值。
+- **规避**（选用 `object.__setattr__` 而非实例包装，理由见下）：新增 `_patch_instance(obj, name, fn)`，内部 `object.__setattr__(obj, name, fn)` 绕过字段校验直接写实例 `__dict__`；属性查找仍走实例 dict（类上无同名 data descriptor），所有既有调用点透明无改动。
+  - 为何不用包装/代理：包装类需透传全部 pydantic 字段与方法、破坏 `isinstance(llm, ChatOpenAI)` 及 `.bind_tools()` 链式返回、并让 `llm.dump_model()`/序列化等内部行为失效，侵入面远大于一次性绕过 setattr；且本项目已在实例层 patch 五个方法 + 两个标记，逐方法包装会与 langchain 内部对实例方法的引用割裂。
+- **验证**：真实 `ChatOpenAI(api_key=哑key)` install/idempotent/bind_tools(`_ChatModelBinding`)/工具定义捕获全过；`FakeMessagesListChatModel`（pydantic v2）四 run_kind 写盘、工具定义（name/description/args）序列化正确、`api_key` → `***` 掩码且原文未落盘；py_compile 四文件 EXIT=0。冒烟脚本（temp 目录）与临时测试日志已说明。
+*（内容由AI生成，仅供参考）*
+
+*（内容由AI生成，仅供参考）*

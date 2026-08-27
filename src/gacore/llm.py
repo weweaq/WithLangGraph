@@ -16,6 +16,7 @@ from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
 
 from gacore.config import ConfigError
+from gacore.llm_request_log import install_llm_logging
 
 _SUPPORTED_PROVIDERS: Final = ("openai", "anthropic", "deepseek")
 _DEFAULT_OPENAI_MODEL: Final = "gpt-4o"
@@ -87,4 +88,8 @@ def get_llm(
             )
         case _:
             raise ConfigError(f"LLM_PROVIDER must be one of {_SUPPORTED_PROVIDERS}, got {provider!r}")
-    return llm.bind_tools(list(tool_list)) if bind_tools else llm
+    # Attach request-body logging at the single get_llm choke point: every model built
+    # here (main agent graph, scheduled jobs, QQ trivial-reply branch) is intercepted
+    # so the full payload sent to the LLM lands in logs/<YYYY-MM-DD>/llm_requests.jsonl.
+    _tracked = install_llm_logging(llm, provider)
+    return _tracked.bind_tools(list(tool_list)) if bind_tools else _tracked

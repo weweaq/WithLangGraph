@@ -1698,6 +1698,7 @@ class QQApp:
                 f"当前真实时间 {now.strftime('%Y-%m-%d %H:%M:%S')} {_WEEK_CN[now.weekday()]}"
                 f"（Asia/Shanghai, UTC+8），{self._meal_period(now.hour)}。"
                 "[历史时间禁令] 对方消息或记忆里的任何时间/日期都是旧记录，禁止当作当下；"
+                "凡涉及现在几点/几号/星期几/还剩多久/班次判断等时间问题，一律直接按上面这行真实时间作答，"
                 "报时间必须以上面这行真实时间为准。"
                 + (f"\n今日记忆（以下为历史记录，仅供了解过往，绝不代表当前）：\n{_stamp_memory_history(daily[:400])}" if daily else "")
                 + (f"\n对方最近的口吻：{voice}" if voice else "")

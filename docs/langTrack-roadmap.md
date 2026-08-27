@@ -2,6 +2,28 @@
 AIGC:
     Label: "1"
     ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 74fca65fe87f9b5d6900c56ec5512fbd_ae083d5fa1ca11f1a413525400287e28
+    ReservedCode1: 3OSccOuMn33HUaFSO8Cc00E8etZa00yUmo8LCBwFE9WGValA0WAY5gkg+VSmaDfRuGCFIPnF+5wboRNY/uAfNOBWzNHf6AHf866EBlbqkSQ2+BsguNwamE34ZX19AjFmxGFHzJK76sg3pJZjCCxgAtlYemfaYaJJizdEKON4rWUBmFbILcwZWxXb7uM=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 74fca65fe87f9b5d6900c56ec5512fbd_ae083d5fa1ca11f1a413525400287e28
+    ReservedCode2: 3OSccOuMn33HUaFSO8Cc00E8etZa00yUmo8LCBwFE9WGValA0WAY5gkg+VSmaDfRuGCFIPnF+5wboRNY/uAfNOBWzNHf6AHf866EBlbqkSQ2+BsguNwamE34ZX19AjFmxGFHzJK76sg3pJZjCCxgAtlYemfaYaJJizdEKON4rWUBmFbILcwZWxXb7uM=
+---
+
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 74fca65fe87f9b5d6900c56ec5512fbd_19f927f7a1bd11f1a238525400e6dd8f
+    ReservedCode1: ZF6XKnSn19mjrMxqZbxqwKiSKIhc3cmNkg7lhTcGTPvFzi0dlAvasKalJm5eLo8gNQfN94knTiDeqIZjCTJAXqdNPcjvnPXJY0HjGNsjDygXVl5He2uAFL0iDbxUUUnD0S57F+R/yyv6PDhQEevih7BtmeMsiHV+Z/Q5XWl4jbPBb6FxNATaeuMVnHY=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 74fca65fe87f9b5d6900c56ec5512fbd_19f927f7a1bd11f1a238525400e6dd8f
+    ReservedCode2: ZF6XKnSn19mjrMxqZbxqwKiSKIhc3cmNkg7lhTcGTPvFzi0dlAvasKalJm5eLo8gNQfN94knTiDeqIZjCTJAXqdNPcjvnPXJY0HjGNsjDygXVl5He2uAFL0iDbxUUUnD0S57F+R/yyv6PDhQEevih7BtmeMsiHV+Z/Q5XWl4jbPBb6FxNATaeuMVnHY=
+---
+
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
     ProduceID: 74fca65fe87f9b5d6900c56ec5512fbd_2e7dcf2ea09211f1a413525400287e28
     ReservedCode1: GOvDpPJbfoNkuP/Jz1z68yKV+joCPNYMNKIeRvteFSBBFuhMQvBS24gdWwu8Wjb6TW7wGmaYIiC4cf7NBcWwD6W6Uo7dBqZElJIMT7X+Zwmxi01a84u8M+bdYBKSPBqSZk5GGK9Fg19Q7uSn5oAVQoA298/SpkQachSZOwaYR3ovxeT8wQUarZowPA0=
     ContentPropagator: 001191440300708461136T1XGW3
@@ -1676,3 +1698,59 @@ QQ 机器人「韩立」已有完整 agent 回路，但面对随口话（“吃�
 - [x] P1 完整时间锚点挪到 prompt 末尾 + 历史旧记录禁令。
 - [x] P2 每日笔记/轻回应 daily 注入打历史标记。
 - [ ] 部署后观察线上：时间问题是否一律即时回到真实时钟、轻回应分支不再报旧时刻。
+
+
+## 2026-08-26：daily-report 升级「人物速写」（日报从记账→读人）
+### 背景
+用户反馈：日报明明有大量数据（B站观看轨迹、git 提交节奏、langTrack 手机画像、global_mem 长期画像），却只做账单式罗列（工几条/看几条/障碍几条），没有把"这个人"读出来。要求日报能刻画人物。
+### 已完成
+- config/schedule.json 中 daily-report prompt 全面升级（旧 prompt 已备份至会话 temp 目录，可随时回退）：
+  - 目标从"双层产出"扩为"三层产出"：归档 + 画像增量 + 人物速写
+  - 步骤新增"先读底子"：file_read 读 memory/global_mem_insight.txt 与 memory/global_mem.txt，建立长期画像脉络；search_daily 拉近 2-3 天笔记做昨日对比基准
+  - 观看记录增加"时间轴"维度（几点在刷什么），作为读人线索
+  - git 提交记录看提交时刻（深夜/白天精力段）
+  - daily note 新增「## 人物速写」板块：一句话状态总览 + 兴趣连线（接进长期画像哪条脉络：加深/新苗头/翻篇）+ 微变化与留意苗头，3-6 句，不流水账不肉麻，允许一句有锐度的判断
+  - langTrack 信号解读并入人物速写，不再单列
+  - 最终回复（邮件正文）以人物速写为主体，让用户直观看到"今天这个人"。
+- weekly-summary 任务未动。
+### 验证
+- schedule.json 修改后 json.load 校验通过（jobs 两条均在，prompt 含"人物速写"）。
+- 未重启调度器：当前无进程在跑 scheduler（8/24-8/26 日报断更根因），需拉起 `python -m gacore.scheduler` 或 `python start.py` 后 23:50 生效。
+### 待办更新
+- 拉起调度器进程并跑一次日报，实测人物速写输出效果（是否"不硬凑、有洞察"）。
+- 仍缺 8/24-8/26 三份日报：按既有机制（missed 不补齐）不追更，如需可手动补跑。
+
+
+## 2026-08-27：时间约束强化 + 既有 prompt 生效核实 + LLM 请求体日志
+### 背景
+用户反馈截图（韩立已正确按班次规则判周四需工作到晚 10 点），并提三点：①prompt 加"凡涉及时间相关概念先看当前时间"；②质疑此前时间硬化 / 人物速写等 prompt 是否真生效；③把发给 LLM 的请求体也记入日志。
+### 已完成
+1. **强化时间铁律**（`context.py` + `frontends/qq.py`）
+   - `_TIME_AUTHORITY_RULE` 扩写：凡回答里会用"当前时间"概念（几点几分 / 几号 / 星期几 / 时段 / 距离某时刻多久 / 工作日周末 / 班次上下班 / 今天昨天明天/日期推算），必须先调用 `get_time` 拿到系统时钟再作答，严禁用对话历史、消息时间、记忆或任何注入文本推算当下；原"仅认 get_time 与 [Current time] 两权威源"保留。
+   - `build_system_prompt` 末尾锚点块追加一句"凡涉及当前时间/日期/星期/时段/班次/剩余时长的问题，先调用 get_time 工具以官方时钟作答"。
+   - `qq.py:_trivial_reply` 的 ctx 历史时间禁令追加"凡涉及现在几点/几号/星期几/还剩多久/班次判断等时间问题，一律直接按上面这行真实时间作答"（该分支无工具，以注入真实时间为唯一依据）。
+2. **既有 prompt 生效核实**（逐项证据见回复）：
+   - P1 锚点：`context.py:197-198` prompt 末尾；经 `middleware.py:83 build_system_prompt` → `graph.py:184 GAPromptMiddleware` → 主 agent。
+   - P2 记忆标记：`context.py:170 DAILY_HEADER+stamp_daily_history`；`qq.py:1703 _stamp_memory_history` 轻回应打标。
+   - `get_time` 工具：`tools/__init__.py:22/41/71` 首位注册 → `graph.py:177 build_tool_list` → `create_agent` 绑定，对模型可见。
+   - `_TIME_AUTHORITY_RULE`：`context.py:42` 定义、`:158` 拼入 system prompt。
+   - daily-report 三层：`config/schedule.json` prompt（归档 + 画像增量 + 人物速写）；运行证据 `logs/scheduled/daily-report_20260827_000050.md` 摘要"三层产出完成"，Reply 以《人物速写》为主体（状态总览 + 兴趣连线引用长期画像 + 微变化 + 明日一句）。
+   - 调度器：`scheduler.py:run_job` 23:50 执行 daily-report，成功后 `_export_onboard_pack` 导出 onboard pack。
+3. **新增 LLM 请求体日志**（`llm.py` + 新增 `llm_request_log.py`）
+   - 新建 `src/gacore/llm_request_log.py`：`install_llm_logging` 在 `get_llm` 单点对模型实例 monkey-patch `invoke/ainvoke/stream/astream/bind_tools`，每次真实 LLM 调用把完整请求体（system/user/ai/tool 消息、工具定义、请求参数）以 JSONL 落盘 `logs/YYYY-MM-DD/llm_requests.jsonl`；敏感字段（api_key 等）递归掩码 `***`，超长串截断，记录失败静默不阻断模型调用。
+   - `llm.py:get_llm` 返回前统一 `install_llm_logging(llm, provider)`，单点覆盖主 agent graph / 调度 job / qq 轻回应三路调用。
+### 验证
+- `py_compile` 四文件（context/qq/llm/llm_request_log）退出码 0。
+- 桩验证（不联网 FakeModel）：4 种 run_kind（invoke/ainvoke/astream/stream）全部写盘；`bind_tools` 捕获工具定义（ntools=2）；参数含 temperature/model_kwargs；`api_key` 掩码为 `***`（secret_leaked=False）；测试记录已清理，未污染真实日志。
+- 生效核实证据（代码引用位置 + 运行产物 + 进程状态）见回复。
+### Bug 修复（2026-08-27 启动崩溃）
+- **现象**：重启 bot 加载新代码时，`build_config → frontends/qq.py → graph.py → llm.py:94 get_llm → install_llm_logging` 抛 `ValueError: "ChatOpenAI" object has no field "invoke"`，start.py 初始化直接崩溃，QQ Bot 前端与 Scheduler 均未能拉起（失败进程 12456 已清理）。
+- **根因**：`install_llm_logging` 用实例动态属性赋值（`llm.invoke = _invoke`）挂载包装函数；新版 langchain ChatOpenAI 为 pydantic v2 `BaseModel`，其 `__setattr__` 拒绝给未声明字段赋值。
+- **修复**：`llm_request_log.py` 新增 `_patch_instance(obj, name, fn)` 辅助函数，改用 `object.__setattr__` 绕过 pydantic v2 字段校验，所有动态挂载（`invoke/ainvoke/stream/astream/bind_tools` + `_gacore_llm_log_installed/_gacore_bound_tools`）统一走该函数；属性仍经实例 `__dict__` 正常解析，调用点行为不变，`install_llm_logging` 依旧返回原实例（向后兼容 `llm.py:95` 的 `.bind_tools()` 链式调用）。
+- **验证**（真实 pydantic v2 模型冒烟）：真实 `ChatOpenAI(api_key=哑key)` install 不抛错、幂等、`bind_tools` 返回 `_ChatModelBinding` 且 `_gacore_bound_tools` 正确捕获工具定义（t_add）；`FakeMessagesListChatModel`（同为 pydantic v2）四 run_kind（invoke/ainvoke/astream/stream）全部落盘 `logs/2026-08-27/llm_requests.jsonl`、工具定义序列化（name/description/args）准确、`model_kwargs.api_key` 掩码为 `***` 且密文未泄漏；fake 自身不支持 bind_tools（NotImplementedError）为原模型行为，透传正常。
+### 待办更新
+- [x] 拉起调度器并实测人物速写：`logs/scheduled/daily-report_20260827_000050.md` 已生成（0:00:50，三层产出完成）。
+- [x] 修复重启崩溃 bug（pydantic v2 动态属性赋值 ValueError），`src/gacore/llm_request_log.py` 已改，py_compile + pydantic v2 冒烟通过。
+- [ ] 重启 bot 进程加载新代码后，`llm_requests.jsonl` 随真实对话/日报开始写入，观察一天的日志量级与脱敏效果。
+*（内容由AI生成，仅供参考）*
+*（内容由AI生成，仅供参考）*
