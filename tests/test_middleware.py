@@ -11,7 +11,9 @@ Two layers are covered:
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from unittest.mock import patch
 
 from conftest import BindableFakeMessagesListChatModel
 from langchain.agents import create_agent
@@ -23,9 +25,13 @@ from gacore.config import Config
 from gacore.middleware import (
     GAPromptMiddleware,
     GATurnLogicMiddleware,
+    check_reply_time_assertions,
     format_agent_error,
 )
 from gacore.state import GAState, new_state
+
+_TZ8: timezone = timezone(timedelta(hours=8))
+_REAL_DT: datetime = datetime(2026, 8, 27, 16, 0, tzinfo=_TZ8)  # 2026-08-27 周四 16:00
 
 _EMPTY_PROMPT: str = "[Empty response. Please respond or call a tool.]"
 _CALL: dict[str, object] = {
@@ -152,6 +158,102 @@ def test_after_model_completes_task(tmp_cfg: Config) -> None:
         _state(messages=[HumanMessage(content="x"), AIMessage(content="the answer")]),
         None,  # type: ignore[arg-type]
     )
+
+    assert update == {"exit_reason": "CURRENT_TASK_DONE", "retry_count": 0}
+
+
+# ------------------------------------------------- time guard: check_reply_time_assertions
+
+
+def test_time_guard_clean_clock_assertions_pass() -> None:
+    """Given clock/date assertions that match the real time, no violation must be found."""
+    assert check_reply_time_assertions("现在是3点半。", _REAL_DT) == []  # gap 30min
+    assert check_reply_time_assertions("现在三点半。", _REAL_DT) == []
+    assert check_reply_time_assertions("现在15:30。", _REAL_DT) == []  # 15:30 vs 16:00
+    assert check_reply_time_assertions("现在是3点10分。", _REAL_DT) == []  # 15:10 vs 16:00
+    assert check_reply_time_assertions("今天是8月27日。", _REAL_DT) == []
+    assert check_reply_time_assertions("", _REAL_DT) == []
+
+
+def test_time_guard_catches_wrong_clock() -> None:
+    """Given an hour that is >=1h off the real clock, the guard must flag it."""
+    hits = check_reply_time_assertions("现在是3点。", _REAL_DT)
+    assert hits and "现在3点" in hits[0] and "16:00" in hits[0]
+
+    hits2 = check_reply_time_assertions("现在三点。", _REAL_DT)
+    assert hits2 and "现在三点" in hits2[0]
+
+    hits3 = check_reply_time_assertions("现在是8点10分。", _REAL_DT)
+    assert hits3  # 20:10 vs 16:00, gap >= 1h
+
+
+def test_time_guard_negation_is_not_an_assertion() -> None:
+    """Given negated phrasing, the guard must not trip on a denial."""
+    assert check_reply_time_assertions("现在不是3点。", _REAL_DT) == []
+    assert check_reply_time_assertions("现在没到3点。", _REAL_DT) == []
+    assert check_reply_time_assertions("今天不是星期三。", _REAL_DT) == []  # real day is 周四
+    assert check_reply_time_assertions("今天不是8月27日。", _REAL_DT) == []
+
+
+def test_time_guard_catches_wrong_weekday_and_date() -> None:
+    """Given an anchored weekday/date that contradicts the real one, the guard must flag it."""
+    hits = check_reply_time_assertions("今天是星期三。", _REAL_DT)
+    assert hits and "星期三" in hits[0] and "星期四" in hits[0]
+
+    hits2 = check_reply_time_assertions("今天是9月1日。", _REAL_DT)
+    assert hits2
+
+
+# ------------------------------------------------- time guard: after_model branch
+
+
+def test_after_model_time_guard_retries_with_corrective_prompt(tmp_cfg: Config) -> None:
+    """Given a time guarding hit within budget, after_model must loop back with a corrective prompt."""
+    mw = GATurnLogicMiddleware()
+    state = _state(
+        messages=[HumanMessage(content="x"), AIMessage(content="现在是9点。")],
+        time_guard_retries=1,
+    )
+    with patch(
+        "gacore.middleware.check_reply_time_assertions",
+        return_value=["写了“现在是9点”，真实当前 12:30"],
+    ):
+        update = mw.after_model(state, None)  # type: ignore[arg-type]
+
+    assert update is not None
+    assert update["jump_to"] == "model"
+    assert update["time_guard_retries"] == 2
+    [resp, prompt] = update["messages"]
+    assert resp.content == "现在是9点。"
+    assert isinstance(prompt, HumanMessage)
+    assert "时间守卫" in prompt.content
+    assert "真实当前 12:30" in prompt.content
+
+
+def test_after_model_time_guard_exhausted_exits(tmp_cfg: Config) -> None:
+    """Given the time-guard retry budget exhausted, after_model must exit TIME_GUARD_EXCEEDED."""
+    mw = GATurnLogicMiddleware()
+    state = _state(
+        messages=[HumanMessage(content="x"), AIMessage(content="现在是9点。")],
+        time_guard_retries=2,
+    )
+    with patch(
+        "gacore.middleware.check_reply_time_assertions",
+        return_value=["写了“现在是9点”，真实当前 12:30"],
+    ):
+        update = mw.after_model(state, None)  # type: ignore[arg-type]
+
+    assert update == {"exit_reason": "TIME_GUARD_EXCEEDED", "retry_count": 0}
+
+
+def test_after_model_clean_time_passes(tmp_cfg: Config) -> None:
+    """Given a clean time assertion (guard miss), after_model must complete normally."""
+    mw = GATurnLogicMiddleware()
+    with patch("gacore.middleware.check_reply_time_assertions", return_value=[]):
+        update = mw.after_model(
+            _state(messages=[HumanMessage(content="x"), AIMessage(content="现在是3点半。")]),
+            None,  # type: ignore[arg-type]
+        )
 
     assert update == {"exit_reason": "CURRENT_TASK_DONE", "retry_count": 0}
 

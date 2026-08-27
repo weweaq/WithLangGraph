@@ -85,8 +85,24 @@ def test_working_overwrites_across_invokes(compiled: StateGraph.compile) -> None
 
 def test_exit_reasons_and_defaults() -> None:
     """Given the module constants, EXIT_REASONS and DEFAULT_MAX_TURNS must match the contract."""
-    assert EXIT_REASONS == ("CURRENT_TASK_DONE", "EXITED", "MAX_TURNS_EXCEEDED")
+    assert EXIT_REASONS == (
+        "CURRENT_TASK_DONE",
+        "EXITED",
+        "MAX_TURNS_EXCEEDED",
+        "AGENT_ERROR",
+        "TIME_GUARD_EXCEEDED",
+    )
     assert DEFAULT_MAX_TURNS == 40
+
+
+def test_time_guard_defaults_in_new_state(tmp_path: object) -> None:
+    """Given a fresh state seed, time_guard_retries must start at 0 and exit_reason at None."""
+    cfg = Config.for_tests(tmp_path)  # type: ignore[arg-type]
+
+    state = new_state("hi", cfg)
+
+    assert state["time_guard_retries"] == 0
+    assert state["exit_reason"] is None
 
 
 def test_max_turns_comes_from_cfg(tmp_path: object) -> None:

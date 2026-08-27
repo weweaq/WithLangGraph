@@ -716,3 +716,30 @@ flowchart LR
 *（内容由AI生成，仅供参考）*
 
 *（内容由AI生成，仅供参考）*
+
+## 9.14 输出侧时间守卫 + daily_notes 东八区 + 铁律补强（2026-08-27）
+
+**目标**：给时间约束加「输出侧强制兜底」。此前 `get_time` 工具 / 时间铁律 / 完整锚点均为提示侧，模型仍可能断言错误时刻而无人拦截；同时让 `daily_notes` 相对日期不受服务器时区影响；铁律补「先经 get_time 核实一次」条款。
+
+### 改动清单
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/gacore/middleware.py` | 新增 `_TZ`(UTC+8)、`_MAX_TIME_GUARD_RETRIES=2`、`_TIME_GUARD_PROMPT`（修正指令模板）；新增 `check_reply_time_assertions(reply, now) -> list`——校验「现在N点/中文钟点/N:MM/点半一刻三刻/点Y分」时钟读数（分钟级精度 + 12 小时制双候选）、「今天星期X」、日期格式「X月X日」三类断言，明显偏离才返回违规清单；否定句（含不/没/非）不算断言、直接跳过；`GATurnLogicMiddleware.after_model` 在 AI 产出后置校验：命中 → 向 messages 追加 HumanMessage（`_TIME_GUARD_PROMPT`+真实时钟+违规清单）并 `jump_to=model` 触发重试，`time_guard_retries` 计数超 2 → `exit_reason=TIME_GUARD_EXCEEDED` 硬停 |
+| `src/gacore/state.py` | `GAState.time_guard_retries: int`；`new_state()` 置 0；`EXIT_REASONS` 增 `TIME_GUARD_EXCEEDED="time_guard_exceeded"` |
+| `src/gacore/tools/daily_notes.py` | `datetime.now(UTC)` → 模块常量 `_TZ = timezone(timedelta(hours=8))`；`_resolve_date` / `load_recent_daily_summaries` 用 `datetime.now(_TZ)` 解析 today/yesterday/近期摘要的 day 边界 |
+| `src/gacore/context.py` | `_TIME_AUTHORITY_RULE` 扩写：即使看到注入的【当前真实时间】锚点、回复要引用具体时刻也应优先经 `get_time` 核实一次；凡涉及当前时间概念必先调 get_time，禁止凭记忆/上下文/锚点以外推算直接断言；声明输出侧时间守卫会拦截明显偏离并强制重试 |
+
+### 设计要点
+
+- **仅拦「明显偏离」**：守卫容忍分钟级误差与 12 小时制双候选，避免把"8 点 03 分"误判为偏离"8 点"；无时间断言的回复直接放行，零误伤。
+- **重试复用既有通道**：修正指令以 HumanMessage 追加进 messages 并 `jump_to=model`，复用空响应重试同款跳转通道，驱动模型重新走 get_time，不改变 LangGraph 拓扑；超预算用 `exit_reason=TIME_GUARD_EXCEEDED` 硬停，不与既有 exit_reason / retry 机制冲突，不带病输出错误时间。
+- **返修防误伤（当日 code-review 命中）**：① 否定句不算断言——「今天不是星期三」「现在没到3点」含不/没/非直接跳过，守卫不再拦否认语气；② 半刻钟/刻钟精度——「现在3点半」「3点一刻」折成 30/15 分会话，16:00 实际撞上「3点半」不再误拦；③ 冒号制与「点Y分」显式分钟也纳入分钟级判定。
+- **时区单基准**：daily_notes 统一东八区消除 UTC/服务器本地时区的"今天"漂移，与 get_time 返回值 / system 锚点为同一基准（Asia/Shanghai UTC+8）。
+- **铁律与守卫协同**：铁律要求「先调 get_time 核实」，守卫在输出侧兜底强制重试——双保险，且措辞互相引用不矛盾。
+
+### 验证
+
+- `py_compile` middleware.py / state.py / daily_notes.py / context.py 退出码 0。
+- 自测（temp/self_test_time_guard.py）：守卫 12 例全过（正常时钟 / 12 小时制双候选 / 多违规 / 无断言不误伤 / 星期错 / 日期错等）；`_resolve_date` UTC 服务器场景 `08-26` → `08-27`；`build_system_prompt` 含新增铁律短语。详见 roadmap 对应记录。
+- 未 kill/重启 bot；未改 `.ps1/.bat`。

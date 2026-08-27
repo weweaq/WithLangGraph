@@ -7,6 +7,7 @@ string replacement, keyword search, date shortcuts, and error handling.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from gacore.config import Config
@@ -16,6 +17,10 @@ from gacore.tools.daily_notes import (
     read_daily,
     search_daily,
 )
+
+# Same canonical Asia/Shanghai (UTC+8) clock the tool resolves "today" on, so the
+# test never drifts from the implementation regardless of the runner's local zone.
+_TZ8: timezone = timezone(timedelta(hours=8))
 
 # ---------- edit_daily: creation ----------
 
@@ -171,8 +176,7 @@ def test_search_daily_returns_empty_when_no_matches(tmp_path: Path) -> None:
 def test_load_recent_daily_summaries_returns_bullet_lines(tmp_path: Path) -> None:
     """Given today's note with bullets, When load_recent_daily_summaries, Then bullet headings are returned."""
     cfg = Config.for_tests(tmp_path)
-    from datetime import UTC, datetime
-    today = datetime.now(UTC).astimezone().date().isoformat()
+    today = datetime.now(_TZ8).date().isoformat()
     daily_dir = cfg.memory_dir / "daily"
     daily_dir.mkdir(parents=True, exist_ok=True)
     (daily_dir / f"{today}.md").write_text(

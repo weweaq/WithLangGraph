@@ -1754,3 +1754,42 @@ QQ 机器人「韩立」已有完整 agent 回路，但面对随口话（“吃�
 - [ ] 重启 bot 进程加载新代码后，`llm_requests.jsonl` 随真实对话/日报开始写入，观察一天的日志量级与脱敏效果。
 *（内容由AI生成，仅供参考）*
 *（内容由AI生成，仅供参考）*
+
+## 2026-08-27：时间守卫输出侧校验 + daily_notes 时区东八区 + 铁律补强
+
+### 背景
+此前 get_time 工具、prompt 时间铁律、完整时间锚点均为「输入侧/提示侧」约束——模型若仍断言错误时刻，无强制兜底；`daily_notes` 相对日期仍按系统本地时区或 UTC 换算，服务器时区漂移会导致"今天/昨天"偏差；铁律未强调"即使有注入锚点也应先经 get_time 核实一次"。本轮三项补齐。
+
+### 已完成
+1. **middleware 输出侧时间守卫**（`src/gacore/middleware.py` + `src/gacore/state.py`）
+   - 新增模块常量 `_TZ`（UTC+8）、`_MAX_TIME_GUARD_RETRIES=2`、`_TIME_GUARD_PROMPT`（修正指令模板），新增函数 `check_reply_time_assertions(reply, now) -> list`。
+   - 校验三类时间断言：①「现在 N 点 / 中文钟点 / N:MM / X点半·一刻·三刻 / X点Y分」时钟读数——分钟级精度、12 小时制双候选、否定句（不/没/非）跳过；②「今天星期 X」星期断言；③「今天 X 月 X 日 / 日期格式」月日断言。
+   - 在 `GATurnLogicMiddleware.after_model` 的 AI 产出后置校验：命中明显偏离 → 向 messages 追加一条 `HumanMessage`（内容 = `_TIME_GUARD_PROMPT` + 真实时钟 + 违规清单）并 `jump_to=model`，强制模型先走 get_time 修正；`state["time_guard_retries"]` 计数，超 `_MAX_TIME_GUARD_RETRIES`(=2) 置 `exit_reason=TIME_GUARD_EXCEEDED` 硬停，不带病输出错误时间。
+   - `state.py`：`GAState` 增 `time_guard_retries: int`；`new_state()` 默认 0；`EXIT_REASONS` 扩为五元组（`CURRENT_TASK_DONE`/`EXITED`/`MAX_TURNS_EXCEEDED`/`AGENT_ERROR`/`TIME_GUARD_EXCEEDED`）。
+
+2. **daily_notes 相对日期改东八区**（`src/gacore/tools/daily_notes.py`）
+   - `from datetime import UTC` 改为 `timezone`，新增模块常量 `_TZ = timezone(timedelta(hours=8))`。
+   - `_resolve_date` / `load_recent_daily_summaries` 一律用 `datetime.now(_TZ)` 计算 today/yesterday/近期摘要的 day 边界。
+   - 改动前后对比：UTC 服务器场景下"今天"由 `08-26`（UTC 晚 8 小时）修正为 `08-27`（东八区）。
+
+3. **context.py 时间铁律补充**（`src/gacore/context.py`）
+   - `_TIME_AUTHORITY_RULE` 追加：即使看到系统注入的【当前真实时间】锚点，若回复要引用具体时刻也应优先经 `get_time` 核实一次；凡涉及当前时间概念必先调 get_time，禁止凭记忆/上下文/锚点以外的推算直接断言；并声明输出侧时间守卫会拦截明显偏离并强制重试，请勿硬编时间。
+   - 与中间件新守卫措辞协同，无重复矛盾。
+
+### 验证
+- `py_compile` middleware.py / state.py / daily_notes.py / context.py 退出码 0。
+- 自测（temp/self_test_time_guard.py，venv）：Part1 守卫 12 项用例全 PASS（含 12 小时制双候选边界、多违规命中、无时间断言不误伤）；Part2 `_resolve_date` 对齐 UTC+8，UTC 服务器场景由 `08-26` → `08-27`；Part3 `build_system_prompt` 输出含全部新增铁律短语。
+- 约束遵守：未 kill/重启 bot；未改 `.ps1/.bat`；无破坏性操作。
+
+### 待办更新
+- [x] middleware 输出侧时间守卫（命中强制重试，超预算 exit_reason 兜底）。
+- [x] daily_notes 相对日期统一东八区。
+- [x] context.py 时间铁律补「调 get_time 核实 + 守卫兜底」条款。
+- [ ] 部署后观察线上：韩立回复中不再出现与真实时钟明显偏离的时间断言。
+
+### 当日返修（code-review 命中，2026-08-27）
+- ① 否定句恒误伤：断言片段含 `不/没/非`（如「今天不是星期三」「现在没到3点」）直接跳过，守卫不再拦否认语气。
+- ② 半刻钟精度丢失：「现在3点半 / 3点一刻 / 3点三刻」折 30/15/45 分钟判定；「现在X点Y分」「N:MM」冒号制纳入分钟级判定——16:00 实际说「3点半」不再误拦。
+- ③ 补单测：`check_reply_time_assertions` 12 组边界直测（固定 2026-08-27 16:00 周四时钟）+ after_model 守卫分支 3 测（未超预算跳 model / 超预算硬停 / 无命中完成）；`test_state` 同步五元组 EXIT_REASONS；`daily_notes` 的 today 计算对齐东八 `_TZ8` 消除跨时区 flaky。
+- ④ 文档校准：`_MAX_TIME_GUARD_RETRIES` 实际为 2（原文档误记 1）；重试实现为追加 HumanMessage + `jump_to=model`（原文档误记为 ToolMessage 替换 last_ai）。
+- 验证：`pytest tests/test_middleware.py tests/test_state.py tests/test_tools_daily_notes.py` 全绿（30+18）；全量 355 收集 343 通过，其余 12 个为 pre-existing 环境缺 `pygraphviz`（与守卫无关）。未提交、未重启进程。

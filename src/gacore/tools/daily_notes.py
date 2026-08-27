@@ -17,7 +17,7 @@ Three tools mirror the strategy learned from another agent:
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Final
 
@@ -28,6 +28,13 @@ from gacore.config import Config
 _DAILY_SUBDIR: Final = "daily"
 _DATE_RE: Final = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _MAX_SEARCH_RESULTS: Final = 50
+
+# Asia/Shanghai (UTC+8): the same canonical timezone the get_time tool, the
+# middleware time guard and the [Current time] prompt anchor all use. Relative-date
+# shortcuts ("today"/"yesterday") MUST be computed on this clock so a note written for
+# the user's local (East-8) day never lands on the wrong date due to a server that
+# runs UTC or another timezone.
+_TZ: Final = timezone(timedelta(hours=8))
 
 
 def _daily_dir(cfg: Config) -> Path:
@@ -185,8 +192,13 @@ def search_daily(
 
 
 def _resolve_date(date: str) -> str:
-    """Resolve date shortcuts: 'today' / 'yesterday' to ISO date strings."""
-    now = datetime.now(UTC).astimezone()
+    """Resolve date shortcuts: 'today' / 'yesterday' to ISO date strings.
+
+    Computed on the fixed Asia/Shanghai (UTC+8) clock so the resolved date always
+    matches the East-8 user's perception of "now", regardless of the server's local
+    timezone or UTC.
+    """
+    now = datetime.now(_TZ)
     if date == "today":
         return now.date().isoformat()
     if date == "yesterday":
@@ -213,7 +225,7 @@ def load_recent_daily_summaries(cfg: Config, days: int = 2) -> str:
     if not daily_dir.is_dir():
         return ""
 
-    now = datetime.now(UTC).astimezone()
+    now = datetime.now(_TZ)
     blocks: list[str] = []
     for offset in range(days):
         date = (now - timedelta(days=offset)).date().isoformat()

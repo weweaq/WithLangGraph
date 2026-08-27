@@ -16,7 +16,13 @@ from langchain_core.messages import HumanMessage
 
 from gacore.config import Config
 
-EXIT_REASONS: Final = ("CURRENT_TASK_DONE", "EXITED", "MAX_TURNS_EXCEEDED")
+EXIT_REASONS: Final = (
+    "CURRENT_TASK_DONE",
+    "EXITED",
+    "MAX_TURNS_EXCEEDED",
+    "AGENT_ERROR",
+    "TIME_GUARD_EXCEEDED",
+)
 DEFAULT_MAX_TURNS: Final = 40
 
 
@@ -33,6 +39,7 @@ class GAState(AgentState[Any], total=False):
     max_turns: int
     done_hooks: list[str]
     retry_count: int
+    time_guard_retries: int  # output-side time-guard retry budget (see middleware.py)
     exit_reason: str | None
     pending_images: list[str]  # accumulated image paths for multi-image processing
     active_card: str | None  # active character-card id for this conversation; declared so the graph channel does not drop it
@@ -49,6 +56,7 @@ def new_state(user_input: str, cfg: Config, active_card: str | None = None) -> G
         max_turns=cfg.max_turns,
         done_hooks=[],
         retry_count=0,
+        time_guard_retries=0,
         exit_reason=None,
         active_card=active_card,
         pending_images=[],
