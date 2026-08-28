@@ -101,6 +101,7 @@ from gacore.graph import DEFAULT_RECURSION_LIMIT, build_graph
 
 from gacore.llm import get_llm
 from gacore.jsonl_logger import get_logger
+from gacore.proactive import record_last_active
 
 from gacore.state import new_state
 
@@ -918,6 +919,7 @@ class QQApp:
             # Record the user's openid so qq_push.py can reach them proactively.
 
             _record_known_user(user_id)
+            record_last_active(user_id)
 
             # Cross-day rollover: on the first message of a new day, swap to a fresh
             # thread and stage yesterday's memory pack for silent first-turn injection.

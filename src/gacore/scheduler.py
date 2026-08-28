@@ -35,6 +35,7 @@ from typing import Final
 
 from gacore.config import Config, load_dotenv
 from gacore.jsonl_logger import get_logger
+from gacore.proactive import PROACTIVE_POOL, proactive_due, run_proactive_job
 
 logger = get_logger("scheduler")
 
@@ -56,6 +57,12 @@ class Job:
     file + daily note, "email" additionally sends it via send_email; unknown values fall
     back to "file". email_to is the optional explicit recipient for the email channel —
     when empty the SMTP_TO / SMTP_USER env vars are used in that order.
+
+    type == "proactive" marks a proactive-outreach job: run_loop dispatches it to the
+    single-worker PROACTIVE_POOL instead of the blocking run_job path. window
+    ("HH:MM-HH:MM", optional) restricts firing to that time-of-day window; an empty
+    window means no restriction. cooldown_minutes (optional, 0 = off) enforces a
+    minimum gap between consecutive triggers.
     """
 
     name: str
@@ -65,6 +72,10 @@ class Job:
     deliver_to: str = "file"
     email_to: str = ""
     max_turns: int = 20
+    type: str = "job"
+    window: str = ""
+    cooldown_minutes: int = 0
+    scene: str = ""  # proactive scene key (morning/night/idle/...); empty = derive from name
 
 
 @dataclass(slots=True)
@@ -87,6 +98,25 @@ class ScheduleResult:
     reply: str = ""
 
 
+def _to_int(value: object, default: int = 0) -> int:
+    """Parse an int config value, falling back to default on invalid input."""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _log_proactive_failure(fut: object) -> None:
+    """Log a top-level exception from a proactive worker (L1: never swallow)."""
+    exc = fut.exception() if hasattr(fut, "exception") else None  # type: ignore[attr-defined]
+    if exc is not None:
+        logger.error(
+            "proactive job raised top-level exception",
+            error_type=type(exc).__name__,
+            stack_trace=str(exc),
+        )
+
+
 def load_jobs(cfg: Config) -> list[Job]:
     """Load enabled jobs from config/schedule.json; return empty list when missing or invalid."""
     path = cfg.asset_dir.parent / _SCHEDULE_FILE
@@ -103,15 +133,28 @@ def load_jobs(cfg: Config) -> list[Job]:
         if not isinstance(item, dict):
             continue
         try:
+            kind = item.get("type", "job")
+            if kind == "proactive":
+                # M2: proactive jobs are scene-driven, so a missing prompt is allowed and
+                # falls back to the scene-derived default inside build_proactive_prompt.
+                prompt = item.get("prompt", "")
+            else:
+                # Non-proactive jobs keep the required-prompt contract: a malformed entry
+                # (missing prompt) is still skipped below via KeyError.
+                prompt = item["prompt"]
             jobs.append(
                 Job(
                     name=item["name"],
                     schedule=item["schedule"],
-                    prompt=item["prompt"],
+                    prompt=prompt,
                     enabled=item.get("enabled", True),
                     deliver_to=item.get("deliver_to", "file"),
                     email_to=item.get("email_to", ""),
                     max_turns=item.get("max_turns", 20),
+                    type=kind,
+                    window=item.get("window", ""),
+                    cooldown_minutes=_to_int(item.get("cooldown_minutes", 0)),
+                    scene=item.get("scene", ""),
                 )
             )
         except (KeyError, TypeError) as e:
@@ -541,6 +584,35 @@ def run_loop(
         for job in jobs:
             state = states.get(job.name, JobState())
             if not is_due(job, state, now):
+                continue
+            if job.type == "proactive":
+                # Proactive jobs: extra window/cooldown gate, then dispatch to the
+                # single-worker PROACTIVE_POOL so the poll loop is never blocked by
+                # LLM generation or QQ network I/O.
+                if not proactive_due(job, state, now):
+                    continue
+                future = PROACTIVE_POOL.submit(run_proactive_job, job, resolved_cfg)
+                if future is None:
+                    logger.warning(
+                        "proactive pool queue full, skipping this tick",
+                        job=job.name,
+                        schedule=job.schedule,
+                    )
+                    continue
+                # L1: surface worker exceptions instead of letting the future die silently.
+                future.add_done_callback(_log_proactive_failure)
+                logger.info(
+                    "Proactive job dispatched",
+                    job=job.name,
+                    schedule=job.schedule,
+                    now=now.isoformat(timespec="seconds"),
+                )
+                states[job.name] = JobState(
+                    last_run=now.isoformat(timespec="seconds"),
+                    run_count=state.run_count + 1,
+                )
+                save_state(resolved_cfg, states)
+                jobs_run += 1
                 continue
             logger.info("Job due, firing", job=job.name, schedule=job.schedule, now=now.isoformat(timespec="seconds"))
             run_job(job, resolved_cfg, graph_runner=graph_runner)

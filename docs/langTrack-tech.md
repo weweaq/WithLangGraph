@@ -743,3 +743,30 @@ flowchart LR
 - `py_compile` middleware.py / state.py / daily_notes.py / context.py 退出码 0。
 - 自测（temp/self_test_time_guard.py）：守卫 12 例全过（正常时钟 / 12 小时制双候选 / 多违规 / 无断言不误伤 / 星期错 / 日期错等）；`_resolve_date` UTC 服务器场景 `08-26` → `08-27`；`build_system_prompt` 含新增铁律短语。详见 roadmap 对应记录。
 - 未 kill/重启 bot；未改 `.ps1/.bat`。
+
+
+## 9.15 P0 主动外呼管道（proactive job，v0.2，2026-08-29）
+
+- **目标**：按《韩立主动交互-技术实现文档》打通 P0 主动外呼：不新增发送通道，复用既有调度器 + `qq_push` @tool，由单 worker 有界线程池异步外呼，绝不阻塞调度轮询。
+- **调度入口**：`scheduler.py` 的 `Job` 新增 `type`（默认 `"job"`）、`window`（`"HH:MM-HH:MM"` 或空=全天）、`cooldown_minutes`（int，默认 0=不限制）、`scene`（proactive 场景键，空=按 name 推断）四字段，旧配置缺省兼容；`load_jobs` 解析四字段（cooldown 兼容字符串数字）。**prompt 契约（修订 M2）**：`type=="proactive"` 的 job 允许缺省 prompt（`item.get("prompt","")`，缺省时由 `build_proactive_prompt` 按 scene 兜底生成），**非 proactive 保持 `prompt` 必填**、缺 prompt 条目照旧按 malformed 跳过。`run_loop` 对 `type=="proactive"` 先经 `proactive_due`（window + cooldown 双闸）判定，命中才 `PROACTIVE_POOL.submit(run_proactive_job, ...)`；池满返回 `None` → 本 tick 跳过并 warning，不阻塞、不丢任务语义（下个 tick 自然再判）。每个派发 future 挂 `add_done_callback(_log_proactive_failure)`（修订 L1：worker 顶层异常记日志，绝不静默吞掉）。
+- **线程池**：模块级 `PROACTIVE_POOL`（`src/gacore/proactive.py`）= `ThreadPoolExecutor(max_workers=1)` + 自研 `_BoundedExecutor` 有界队列，maxsize=2（**含运行中任务**，即 1 运行 + 1 排队即满）；统一 `_state_lock` 保证状态单写者。
+- **Job Guard**（`job_guard_allows`，每用户判定）：日上限 `_MAX_PER_DAY=2`；热聊冷却 `_HOT_CHAT_MINUTES=30`（30 分钟内活跃过 → 不发）；失联阈值 `_IDLE_HOURS=24`（idle 场景 last_active 距今 ≤24h → 不发）+ **单调守卫**（idle 已外呼过且用户未重新活跃 → 不重复打扰）。
+- **执行管线**（`run_proactive_job`，worker 线程内）：目标用户 = `data/qq_known_users.json` 全部已知 openid → 逐个过 Job Guard → `_headless_run` 复用 headless agent（`build_graph` + MemorySaver，**不碰主线程 AsyncSqliteSaver checkpointer**）按 `build_proactive_prompt` 生成问候 → prompt 强约束 LLM 必须调用既有 `qq_push` @tool 直发（修订 M5：prompt 注入「目标收件人 openid」并强约束 `qq_push` 的 `to` 参数原样填入该 openid，逐用户隔离、避免多用户内容错配）→ 每用户独立 try/except，单用户失败不阻断其余 → 结果原子写 `data/proactive_state.json`（tmp+rename，key=`job:user`，幂等，东八区时间戳）。发送成功判定用 `_qq_push_sent`（修订 M4：`json.loads` 解析工具返回后校验 `parsed["status"]=="sent"`，解析失败/非 sent 一律按失败处理）。发送失败走 M3 失败态：写 `last_failed`/`failed_count`，超 `_MAX_FAIL_RETRIES=3` 上限后当次窗口内不再重呼。
+- **窗口判定（修订 M1）**：`in_window` 一律先 `_as_east8(now)` 归一化再取 `hour`/`minute` 计算分钟序号，与部署机器时区无关（补了非东八区 UTC 输入单测）。
+- **last_active 输入**：`qq.py::on_message` 在 `_record_known_user` 后调 `record_last_active(user_id)` 写 proactive_state.json，驱动热聊冷却 / 失联判定。
+- **数据语义**：外呼 prompt 显式标记消息为「主动问候、非用户事实」，避免被误当作主人真实陈述沉淀进长期记忆（记忆只从 HumanMessage 抽取）。
+- **线程安全红线**：worker 线程只做「生成 + 调工具发送 + 写自己的状态文件」，不回写主线程 / 不碰共享 checkpointer，规避跨 loop 并发写库。
+
+### 验证
+
+- 新增 `tests/test_proactive.py`（38 用例初版 + 修订后 **97 用例**）：window 判定（含跨午夜 / 无 window=全天 / cooldown 到期）、Job Guard（日上限 / 热聊 / 失联 / 单调 / 无状态兜底）、`_BoundedExecutor` 满拒绝与释放、`load_jobs` 新字段与缺 prompt 跳过、`run_loop` 分发（命中 / 窗口外 / 池满跳过 / done-callback 注册）、`run_proactive_job`（多用户全发 / LLM 未推不计数 / 发送失败计入失败态 / 守卫拦截不调 headless / 无已知用户 / 单用户异常不阻断）。修订新增覆盖：M1 非东八区（UTC）窗口归一化、M2 proactive 缺 prompt 保留并走 scene 兜底、M3 失败上限后当次窗口不再重呼 + 成功后重置、M4 结构化 sent 判定（含解析失败）、M5 prompt 注入目标 openid、L1 done-callback 注册。
+- 全量 `pytest tests/` = **409 passed / 12 failed**，12 失败均为既有问题（test_cli 11 个 pygraphviz 环境缺失 + test_qq 1 个 MagicMock 无法 await `adelete_thread`，均经 git stash 还原验证非本次引入，与本修订无交集）。
+- `ruff check` 新增/改动文件全过；qq.py 其余 7 项 lint 为既有问题，未扩大改动面。
+- 未 kill/重启 bot；未改 `.ps1/.bat`；未执行 git 提交。
+
+### 修订记录（审核后）
+
+- **P0 必改**：M1 `in_window` 东八区归一化（`_as_east8(now)` 后再取 hour/minute）+ 非东八区单测；M2 proactive 类 job prompt 缺省兼容（`item.get("prompt","")`，非 proactive 保持必填）+ 缺 prompt 走 scene 兜底单测；M3 `push_failed` 写 `last_failed`/`failed_count` + `_MAX_FAIL_RETRIES=3` 失败上限，避免窗口内无限重试。
+- **P1**：M4 `_qq_push_sent` 用 `json.loads` 校验 `status=="sent"`，解析失败按失败处理；M5 `build_proactive_prompt` 注入目标 openid 并约束 `qq_push.to`；M6 对齐设计文档 §7（send_c2c 单次发送不重试，失败由 M3 兜底，修正原稿"3 次重试"误记）；L1 `future.add_done_callback(_log_proactive_failure)` 记录顶层异常。
+- **新增**：`Job.scene` 字段 + `build_proactive_prompt` 缺 prompt 时按 scene 兜底。
+- 同步更新设计文档《韩立主动交互-技术实现文档.md》§7 与本文档、roadmap 2026-08-29 P0 段。
