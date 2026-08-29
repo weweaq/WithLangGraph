@@ -1844,3 +1844,45 @@ QQ 机器人「韩立」已有完整 agent 回路，但面对随口话（“吃�
   - L1 `run_loop` 派发 proactive future 加 `add_done_callback(_log_proactive_failure)` 记录 worker 顶层异常，不静默吞掉。
 - **新增**：`Job.scene` 字段（proactive 场景键，空=按 name 推断），`build_proactive_prompt` 缺 prompt 时按 scene 兜底。
 - **复测**：`pytest tests/test_proactive.py tests/test_scheduler.py` = **97 passed**；全量 `pytest tests/` = **409 passed / 12 failed**，12 失败与基线一致（test_cli 11 个 pygraphviz 环境缺失 + test_qq 1 个 MagicMock await，均经 git stash 还原验证为既有问题，非本次新增）。lint 新增/改动文件全过。未 git 提交。
+
+## 2026-08-29：P1 主动外呼增强（Topic Recall + jitter 抖动，proactive.py）
+
+按《韩立主动交互-技术实现文档》§5.3/§5.4/§9 实现 P1，未 git 提交：
+
+### 已完成
+1. **config/proactive.json**（新增）：`enabled` + `guard`（idle_hours=24 / max_per_day=2 / hot_chat_minutes=30 / **jitter_minutes=30**）。`load_guard_config(cfg)` 读 `config/proactive.json` 的 `guard` 段，文件缺失/损坏/非 dict 一律回落空 dict（P0 常量默认值兜底）。
+2. **Topic Recall（只读主 thread 并发方案）**：
+   - `_thread_id_of`：读 `data/qq_user_threads.json`（存在则用）拿用户 thread_id，损坏/缺失回落空串。
+   - `_read_thread_messages(cfg, thread_id)`：**worker 线程内新建独立 `sqlite3.connect(uri="file:...?mode=ro")` 只读连接**，包 `SqliteSaver` 走同步 `get_tuple` 读最近 checkpoint，随用随关。规避评审 H3 的坑——与主 asyncio loop 的单连接隔离，只读不写、无锁竞争、无连接跨线程复用。缺库/无 checkpoint 返回空列表，异常记日志不吞。
+   - `_open_question_from(messages)`：轻量规则——最后一条 human 消息非 trivial（`_is_trivial` 过滤"嗯/好的/晚安"等 ≤2 字+高重复词）且其后无 ai 应答（tool 尾消息仍视为未闭环）→ 判为 open question；否则空。
+   - `recall_topic(cfg, uid, now)`：有 open question → `{"kind":"open_question","text":...}`；否则 → `_yesterday_daily_text`（`onboard_pack.json` 昨日 `daily_summary_md` 优先，其次 `gacore.tools.daily_notes.load_recent_daily_summaries(cfg, days=2)` 截昨日块）→ `{"kind":"daily_note",...}`；两者皆无 → `{"kind":"none"}`。
+   - `build_proactive_prompt` 新增 `topic`/`insight` 参数：open question 注入「最近话题」段，daily-note 注入「昨日画像线索」段，均只作谈话背景（含记忆铁律：不背诵、不整段念出）。
+3. **jitter 抖动随机化**：
+   - `_jitter_minutes(guard)`：`guard.jitter_minutes`（默认 0，config 缺省时关闭，P0 行为不变）。
+   - `jitter_allows(job, jitter_minutes, rng)`：`random.random() <= 60/(60+jitter)` 概率放行（±30min 等效），不中返回 `("", "jitter_skip")`——HH:MM 准点 job 由 Job Guard 概率放行（设计文档 §5.3）。
+   - `job_guard_allows(..., guard=...)` 支持从 guard dict 覆盖 `max_per_day`/`hot_chat_minutes`（原 P0 常量成为默认值）。
+4. **run_proactive_job 接线**：新增 `rng` 参数（默认 `random.random`，可注入测试）；`jitter_minutes>0` 时先过 `jitter_allows`，未放行则整轮 skip（记 `skipped`，不调 headless、不触碰状态）；逐用户调 `recall_topic` 并把 `topic`/`insight` 传进 `build_proactive_prompt`。
+5. **文档同步**：设计文档 §5.4（只读方案改为"独立只读 sqlite 连接 + 同步 get_tuple"，并移除 P0 延后注记）、§9（P1 验收描述）、tech.md §9.15、roadmap 本节。
+
+### 验证
+- 新增单测 `tests/test_proactive_p1.py`（47 用例）：guard 配置读取/损坏兜底、jitter 概率门（0 关闭/roll 全过/roll 高跳过）、guard 覆盖（日上限/热聊阈值）、trivial 过滤、open-question 提取（含 dict 消息/尾 tool 消息）、recall_topic 三态、真实 SqliteSaver 只读 DB 读写（含 answered/open/缺库/空 thread_id）、昨日画像（onboard_pack 昨日/今日忽略/损坏兜底/daily_notes 回落）、run_proactive_job（jitter 跳过整轮/放行正常发/无 config 保持 P0/话题与画像注入 prompt）。
+- 回归：`pytest tests/test_proactive.py tests/test_proactive_p1.py tests/test_scheduler.py` = **144 passed**；全量 `pytest tests/` = **456 passed / 12 failed**，12 失败与既有基线一致（pygraphviz 环境缺失 + test_qq MagicMock await，非本次引入）。
+- lint：`ruff check src/gacore/proactive.py tests/test_proactive_p1.py` 全过。
+- 未 kill/重启 bot；未改 `.ps1/.bat`；未执行 git 提交。
+
+### 审核修订（P1 审核清单修订，2026-08-29 同日）
+
+按代码审核报告修订 P1 实现并补/改单测，未 git 提交：
+
+- **M1 必改**（`proactive.py::_is_trivial`）：意图词检查前先**精确命中 `_TRIVIAL_WORDS`**（容忍尾部标点 `？！!?。~～`），修复"在吗"/"嗯呢"因含宽泛意图词"吗"/"呢"被误判为 open question 的问题；同时把"嗯呢"补入 `_TRIVIAL_WORDS`；长句仅提及寒暄词仍 fail-open（非 trivial）。
+- **L2**：设计文档 §5.3 补实现注记——代码级缺省 `jitter_minutes=0`（关闭抖动、P0 确定性，保护性 fallback），交付 `config/proactive.json` 值 30。
+- **L3**：设计文档 §9 明示统计特性——HH:MM 准点 job 每天仅 1 tick、`jitter_minutes=30` 时放行概率 2/3，即约 1/3 概率当日不发（"概率放行"设计语义，非丢消息，日志记 `jittered off`）。
+- **L4**（`proactive.py::_msg_type`）：类名兜底分支改 startswith 前缀匹配（HumanMessage→human / AIMessage→ai / ToolMessage→tool / SystemMessage→system）。
+- **L1（admin-1 无 thread 映射）保留不处理**；**L5（per-user jitter）不改**。
+
+### 验证
+
+- 单测追加：`tests/test_proactive_p1.py` **46 → 51 用例**（`TestIsTrivial` +2：`test_filler_with_intent_chars_is_trivial` / `test_filler_with_real_content_fails_open`；`TestOpenQuestion` +3：`test_filler_last_human_not_open` / `test_real_question_last_human_still_open`）。
+- 回归：`pytest tests/test_proactive.py tests/test_proactive_p1.py tests/test_scheduler.py` = **148 passed**；全量 `pytest tests/` = **460 passed / 12 failed**，12 失败与既有基线一致（pygraphviz 环境缺失 + test_qq MagicMock await，非本次引入）。
+- lint：`ruff check src/gacore/proactive.py tests/test_proactive_p1.py` 全过。
+- 未 kill/重启 bot；未改 `.ps1/.bat`；未执行 git 提交。

@@ -770,3 +770,26 @@ flowchart LR
 - **P1**：M4 `_qq_push_sent` 用 `json.loads` 校验 `status=="sent"`，解析失败按失败处理；M5 `build_proactive_prompt` 注入目标 openid 并约束 `qq_push.to`；M6 对齐设计文档 §7（send_c2c 单次发送不重试，失败由 M3 兜底，修正原稿"3 次重试"误记）；L1 `future.add_done_callback(_log_proactive_failure)` 记录顶层异常。
 - **新增**：`Job.scene` 字段 + `build_proactive_prompt` 缺 prompt 时按 scene 兜底。
 - 同步更新设计文档《韩立主动交互-技术实现文档.md》§7 与本文档、roadmap 2026-08-29 P0 段。
+
+## 9.16 P1 Topic Recall + jitter 抖动（proactive.py，2026-08-29）
+
+按设计文档 §5.3/§5.4/§9 在 P0 管道之上实现 P1，复用既有管线不改发送通道：
+
+- **guard 配置**：新增 `config/proactive.json`（`enabled` + `guard`：idle_hours=24 / max_per_day=2 / hot_chat_minutes=30 / jitter_minutes=30）。`load_guard_config(cfg)` 读该文件 `guard` 段，文件缺失 / JSON 损坏 / guard 非 dict 一律回落空 dict（P0 常量默认值兜底）；`_jitter_minutes(guard)` 取 `jitter_minutes`，缺省 0 = 抖动关闭（P0 行为不变）。
+- **jitter 抖动**：`jitter_allows(job, jitter_minutes, rng)` 按 `random.random() <= 60/(60+jitter_minutes)` 概率放行（±30min 等效，均值近似原准点）；不中返回 `("", "jitter_skip")`。HH:MM 准点 job 无法表达随机偏移，由 Job Guard 概率放行（设计文档 §5.3 方案）。`job_guard_allows(..., guard=...)` 支持 guard dict 覆盖 `max_per_day` / `hot_chat_minutes`，原 P0 常量降级为默认值。
+- **Topic Recall（只读主 thread 并发方案，规避评审 H3）**：worker 线程需读用户主 thread 的最近上下文，但**不复用主 loop 的 asyncio 单连接**（跨 loop 复用同一 sqlite 连接会并发坑）：
+  - `_thread_id_of(cfg, uid)`：读 `data/qq_user_threads.json` 映射拿 thread_id，损坏 / 缺失回落空串；
+  - `_read_thread_messages(cfg, thread_id)`：worker 线程内**新建独立只读连接** `sqlite3.connect(uri="file:<db>?mode=ro")`，包 `SqliteSaver` 走同步 `get_tuple` 读最近 checkpoint（`checkpoint_ns=""`），随用随关——只读不写、无锁竞争、连接不复用、不碰主 loop 对象；缺库 / 无 checkpoint 返回空列表，异常记日志不吞；
+  - `_open_question_from(messages)`：轻量规则——最后一条 human 消息非 trivial（`_is_trivial`：空 / **精确命中寒暄词优先**（如"在吗""嗯呢"，容忍尾部标点，2026-08-29 审核 M1 修复） / 含意图词非 trivial / ≤8 字 filler / 其余寒暄词）且其后无 ai 应答（尾随 tool 消息仍视为未闭环）→ open question；
+  - `recall_topic(cfg, uid, now)`：open question → `{"kind":"open_question","text":...}`；否则 `_yesterday_daily_text`（`data/onboard_pack.json` 昨日 `daily_summary_md` 优先，其次 `gacore.tools.daily_notes.load_recent_daily_summaries(cfg, days=2)` 截昨日块）→ `{"kind":"daily_note",...}`；皆无 → `{"kind":"none"}`。
+- **prompt 注入**：`build_proactive_prompt` 新增 `topic` / `insight` 参数——open question 注入「最近话题」段（"上次聊到…还没说完"），daily-note 注入「昨日画像线索」段（"昨天看到你在忙 XX"）；两者都只作谈话背景，附记忆铁律（不背诵 / 不整段念出 / 不沉淀为用户事实）。
+- **run_proactive_job 接线**：新增 `rng` 参数（默认 `random.random`，可注入）；`jitter_minutes>0` 且 `jitter_allows` 未放行 → 整轮 skip（记 `skipped`，不调 headless、不触碰状态文件）；放行后逐用户 `recall_topic` 并把 `topic` / `insight` 传入 `build_proactive_prompt`。
+
+### 验证
+
+- 新增 `tests/test_proactive_p1.py`（**47 用例**）：guard 配置读取 / 损坏兜底、`_jitter_minutes` 缺省与读取、jitter 概率门（0 关闭 / roll 0 全过 / roll 高跳过 / 极小 jitter 高 roll 仍跳过）、guard 覆盖（日上限 / 热聊阈值 / 默认值放行）、`_is_trivial` 过滤、open-question 提取（空 / 单 human / 最后 human 优先 / ai 已答 / 尾 tool 仍开放 / 纯 ai / trivial 不开放 / dict 消息两种形态）、`recall_topic` 三态、**真实 SqliteSaver 只读 DB 读写**（answered / open / 缺库 / 空 thread_id）、`_thread_id_of` 映射与损坏兜底、昨日画像（onboard_pack 昨日命中 / 今日忽略 / 损坏兜底 / daily_notes 回落 / 无昨日块空）、`run_proactive_job`（jitter 跳过整轮 / 放行正常发 / 无 config 保持 P0 行为 / 话题与画像注入 prompt）。
+- 回归：`pytest tests/test_proactive.py tests/test_proactive_p1.py tests/test_scheduler.py` = **144 passed**；全量 `pytest tests/` = **456 passed / 12 failed**，12 失败与既有基线一致（pygraphviz 环境缺失 + test_qq MagicMock await，非本次引入）。
+- `ruff check src/gacore/proactive.py tests/test_proactive_p1.py` 全过。
+- 未 kill/重启 bot；未改 `.ps1/.bat`；未执行 git 提交。同步更新设计文档 §5.4 / §9 与 roadmap 2026-08-29 P1 段。
+
+**审核修订（2026-08-29 同日）**：`_is_trivial` 增加"精确命中 `_TRIVIAL_WORDS` 优先于意图词"逻辑（修复"在吗""嗯呢"因含宽泛意图词"吗""呢"被误判 open question，容忍尾部标点 `？！!?。~～`，并把"嗯呢"补入 `_TRIVIAL_WORDS`，长句仍 fail-open）；`_msg_type` 类名兜底分支改 startswith 前缀匹配（HumanMessage→human / AIMessage→ai / ToolMessage→tool / SystemMessage→system）。`tests/test_proactive_p1.py` **46 → 51 用例**；回归 `test_proactive + test_proactive_p1 + test_scheduler` = **148 passed**；全量 **460 passed / 12 failed**（既有基线，非本次引入）。设计文档 §5.3 补 jitter 缺省 0 注记、§9 补 HH:MM 准点 job 约 1/3 概率当日不发的统计特性。
