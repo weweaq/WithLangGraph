@@ -590,6 +590,15 @@ def run_loop(
                 # single-worker PROACTIVE_POOL so the poll loop is never blocked by
                 # LLM generation or QQ network I/O.
                 if not proactive_due(job, state, now):
+                    # Debug level on purpose: is_due stays true while the job waits for
+                    # its window/cooldown, so this branch runs on every poll tick and an
+                    # info log would flood the log with "not yet due" noise.
+                    logger.debug(
+                        "proactive job not due: window miss or cooldown",
+                        job=job.name,
+                        schedule=job.schedule,
+                        now=now.isoformat(timespec="seconds"),
+                    )
                     continue
                 future = PROACTIVE_POOL.submit(run_proactive_job, job, resolved_cfg)
                 if future is None:

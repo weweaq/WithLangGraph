@@ -2,6 +2,17 @@
 AIGC:
     Label: "1"
     ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 74fca65fe87f9b5d6900c56ec5512fbd_db9dbeb9a36111f1abe1525400e6dd8f
+    ReservedCode1: eFggaz7CdZoePclrVjQ70F+k+f2zSoUNzl5qxPCPAsF7U+6d7n9Hc0dfSVVNuXeU/LONR+uCAhMLu0xrjVb0j486VaXbN5XUrtxpPjAJuulPsB8921tcfYVvg6Rd4e/kuXqhEZT20L5de+VtzFtGq+MQk4zbane5MtasBAqEbndgttxjpx5q1FBsLNs=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 74fca65fe87f9b5d6900c56ec5512fbd_db9dbeb9a36111f1abe1525400e6dd8f
+    ReservedCode2: eFggaz7CdZoePclrVjQ70F+k+f2zSoUNzl5qxPCPAsF7U+6d7n9Hc0dfSVVNuXeU/LONR+uCAhMLu0xrjVb0j486VaXbN5XUrtxpPjAJuulPsB8921tcfYVvg6Rd4e/kuXqhEZT20L5de+VtzFtGq+MQk4zbane5MtasBAqEbndgttxjpx5q1FBsLNs=
+---
+
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
     ProduceID: 74fca65fe87f9b5d6900c56ec5512fbd_af20f100a1ca11f193c6525400f8a581
     ReservedCode1: rql6zwY3dwnCqhMmahCUF/xWuuLChvsn0bxA3nOwrYjWNIzB5fgd5eqlFmtwLr2A3Q5/L4pQm8lfmDdVBQKunQ443jAoppWB5VQOzKWQTGwIRZDuZORyDZWbyDAFKaSecQQ72Xj/qidS8pMVJK585EYgbqkGWv8PAdKMtXmQD0Xoub52EFeDPh5KxnE=
     ContentPropagator: 001191440300708461136T1XGW3
@@ -815,3 +826,32 @@ flowchart LR
 - 回归：`pytest tests/test_proactive_p2.py tests/test_proactive_p1.py tests/test_proactive.py tests/test_tools_qq_push.py` = **141 passed**；全量 `pytest tests/` = **486 passed / 12 failed**，12 失败与既有基线一致（test_cli 11 个 pygraphviz 环境缺失 + test_qq 1 个 MagicMock await，非本次引入）。
 - `ruff check src/gacore/proactive.py tests/test_proactive_p2.py` 全过；qq.py / qq_tools.py 的既有 8 项 lint（import 排序 / noqa / DTZ / S110）均在本次未改动区，未纳入本次范围。
 - 未 kill/重启 bot；未改 `.ps1/.bat`；未执行 git 提交。同步更新设计文档 §5.4/§9 与 roadmap 2026-08-29 P2 段。
+*（内容由AI生成，仅供参考）*
+
+## 9.18 P0/P1/P2 主动交互管道日志补充（proactive.py / scheduler.py，2026-08-29）
+
+**目标**：审查主动外呼管道日志现状，从日志可还原"为什么发/为什么不发"、状态变化有迹可循、异常不吞、不刷屏。审查范围：`proactive.py` 主体、`scheduler.py` 的 proactive 接线、`qq.py` 的 record_last_active/record_user_emotion 调用、`qq_tools.py` 截断。
+
+**审查发现的缺口**：
+
+| 位置 | 缺口 | 后果 |
+|---|---|---|
+| `run_proactive_job` 的 job guard 拒绝分支 | 仅 append 到 `result["skipped"]`，无日志 | 无法区分 daily_cap / hot_chat / not_idle / idle_already_sent 为何不发 |
+| `run_proactive_job` 的 `_failure_exhausted` 拦截 | 无日志 | M3 重试上限拦截不可审计 |
+| `run_proactive_job` 的 concern 决策 | 无日志 | 无法区分"情绪关切注入" vs "24h cooldown 内不重复关切" |
+| `_mark_concerned` / `_mark_topic_answered` / `_mark_sent` / `_mark_failed` | 状态文件更新无日志 | last_concern / answered_topics / daily_count / failed_count 变化不可追踪 |
+| `record_user_emotion` | 每次消息都更新 emotion 无日志 | 情绪何时从 normal→down/tired 不可审计 |
+| `load_state` | 文件损坏/非 dict 静默返回 {} | 状态被吞无告警 |
+| `scheduler.py` `proactive_due` 不通过 | silent continue | 窗口/cooldown 跳过不可审计 |
+
+**实施明细**：
+
+- **决策点（info，低频）**：
+  - `run_proactive_job`：job guard 拒绝 → `info` `"proactive: user skipped by job guard"`，字段 `user`/`reason`/`max_per_day`/`hot_chat_minutes`/`idle_hours`；`_failure_exhausted` 拦截 → `info` `"proactive: user skipped, delivery-failure retries exhausted"`，字段 `failed_count`/`max_fail_retries`；`emotion != normal` → `info` `"proactive: emotion tag considered for outreach"`，字段 `emotion`/`concern_due`。
+- **状态变化**：`_mark_concerned` → `info` `"proactive: concern recorded"`（user/emotion/last_concern）；`_mark_topic_answered` → `debug` `"proactive: topic marked answered"`（fingerprint/size），LRU 裁剪时另发 `debug` `"proactive: answered_topics LRU trimmed"`（trimmed/max_entries/size）；`_mark_sent`/`_mark_failed` → `debug` 带 `daily_count`/`failed_count`。
+- **情绪标签变化（防刷屏）**：`record_user_emotion` 的 `_mutate` 内比较旧值，`prev != label` 才发 `info` `"proactive: emotion tag changed"`（from_emotion/to_emotion/ts）；同标签连续消息不打。
+- **状态异常**：`load_state` 损坏/非 dict → `warning` `"proactive_state.json … falling back to empty state"`（path/error_type）；缺失文件静默（正常首启）。
+- **scheduler 窗口/cooldown 跳过（debug，避免每 tick 刷屏）**：`proactive_due` 不通过 → `debug` `"proactive job not due: window miss or cooldown"`（job/schedule/now）。**要点**：`is_due` 在窗口外保持 true，此分支每 poll tick 都执行，若 info 会刷屏，故用 debug。
+- **不补（噪声）**：`record_last_active`（每条消息高频）、`save_state`/`_with_state` 写入、scheduler 每 tick `is_due` 未到期。
+
+**测试**：`tests/test_proactive_p2.py` 新增 `TestProactiveLogging` 8 用例。因 `jsonl_logger.Logger` 用 `__slots__` 无法单方法替换，测试用 `_LogRecorder`（实现 debug/info/warning/error 记录）+ `_swap_logger` 整体替换 `proactive.logger` 后断言结构化字段。全量 `pytest tests/` = **504 passed / 12 failed**（原 496 + 新增 8；12 失败与基线一致，非本次引入）。`ruff check src/gacore/proactive.py src/gacore/scheduler.py tests/test_proactive_p2.py` 全过。未 kill/重启 bot；未执行 git 提交。

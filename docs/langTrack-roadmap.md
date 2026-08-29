@@ -2,6 +2,17 @@
 AIGC:
     Label: "1"
     ContentProducer: 001191440300708461136T1XGW3
+    ProduceID: 74fca65fe87f9b5d6900c56ec5512fbd_da45fa7ba36111f1bc17525400826444
+    ReservedCode1: R0kmrl4dbZye6/+7qx1sW8CTZfK7lW7kWu56VtK5DxfKPd1Hzynf6xLVsBWsbrV9TOckIKBEQDa2GuEgU4dOXQ2lgEFV5pSDm5c8QIjSZJ7fewnGulgiCEuXpl4XA03yKE+KQ1q1HlCsGCXR0Wbpq/gPIcb0fHaZCBGStW7r4HLfZn6fBlMKDIBMxIU=
+    ContentPropagator: 001191440300708461136T1XGW3
+    PropagateID: 74fca65fe87f9b5d6900c56ec5512fbd_da45fa7ba36111f1bc17525400826444
+    ReservedCode2: R0kmrl4dbZye6/+7qx1sW8CTZfK7lW7kWu56VtK5DxfKPd1Hzynf6xLVsBWsbrV9TOckIKBEQDa2GuEgU4dOXQ2lgEFV5pSDm5c8QIjSZJ7fewnGulgiCEuXpl4XA03yKE+KQ1q1HlCsGCXR0Wbpq/gPIcb0fHaZCBGStW7r4HLfZn6fBlMKDIBMxIU=
+---
+
+---
+AIGC:
+    Label: "1"
+    ContentProducer: 001191440300708461136T1XGW3
     ProduceID: 74fca65fe87f9b5d6900c56ec5512fbd_ae083d5fa1ca11f1a413525400287e28
     ReservedCode1: 3OSccOuMn33HUaFSO8Cc00E8etZa00yUmo8LCBwFE9WGValA0WAY5gkg+VSmaDfRuGCFIPnF+5wboRNY/uAfNOBWzNHf6AHf866EBlbqkSQ2+BsguNwamE34ZX19AjFmxGFHzJK76sg3pJZjCCxgAtlYemfaYaJJizdEKON4rWUBmFbILcwZWxXb7uM=
     ContentPropagator: 001191440300708461136T1XGW3
@@ -1904,3 +1915,18 @@ QQ 机器人「韩立」已有完整 agent 回路，但面对随口话（“吃�
 6. **单测**：新增 `tests/test_proactive_p2.py`（26 用例）：classify_emotion（空/闲聊 normal、down/tired 关键词、down 优先）、record_user_emotion（写 emotion+时间戳/更新既有 entry/未知用户忽略/异常内容不抛）、话题指纹与已答标记（空白归一/截断/跨空参数）、关切 cooldown（normal 不发/无 last_concern 可发/24h 内不重发/超 24h 再发/坏时间戳 fail-open）、prompt 注入（无 emotion 不注入/未知 emotion 忽略/down/tired 措辞）、run_proactive_job（关切未到期跳过不调 headless/到期注入+标记/已答话题不追发/新话题注入+标记）。
 7. **回归**：`pytest tests/test_proactive_p2.py tests/test_proactive_p1.py tests/test_proactive.py tests/test_tools_qq_push.py` = **141 passed**；全量 `pytest tests/` = **486 passed / 12 failed**，12 失败与既有基线一致（test_cli 11 个 pygraphviz 环境缺失 + test_qq 1 个 MagicMock await，非本次引入）。ruff：proactive.py / test_proactive_p2.py 全过；qq.py / qq_tools.py 既有 8 项 lint 问题均在未改动区。
 8. 未 kill/重启 bot；未改 `.ps1/.bat`；未执行 git 提交。同步更新设计文档 §5.4/§9 与 `langTrack-tech.md` 9.17。
+*（内容由AI生成，仅供参考）*
+
+## 2026-08-29：P0/P1/P2 主动交互管道日志补充（proactive.py / scheduler.py，可审计性/可测试性）
+
+审查 P0/P1/P2 主动外呼管道日志现状后补日志，目标：从日志可还原"为什么发/为什么不发"、状态变化有迹可循、异常不吞、不刷屏。覆盖 `proactive.py`（主体）、`scheduler.py`（proactive 接线）、`qq.py`（record_last_active / record_user_emotion 调用）、`qq_tools.py`（截断）。
+
+1. **补的关键决策点日志**（原缺口：Job Guard 拒绝、失败重试上限、情绪关切命中决策均无日志）：
+   - `run_proactive_job`：job guard 拒绝 → `info`「user skipped by job guard」带 reason + 阈值（max_per_day/hot_chat_minutes/idle_hours）；`_failure_exhausted` 拦截 → `info`「delivery-failure retries exhausted」带 failed_count/max_fail_retries；`emotion != normal` → `info`「emotion tag considered for outreach」带 emotion/concern_due。
+   - `scheduler.py`：`proactive_due` 不通过（窗口未命中/cooldown）→ `debug`「proactive job not due」（**debug 而非 info**：is_due 保持 true 期间每 poll tick 都走此分支，info 会刷屏）。
+2. **补的状态变化日志**：`_mark_concerned` → `info`「concern recorded」；`_mark_topic_answered` → `debug`「topic marked answered」+ LRU 裁剪时 `debug`「answered_topics LRU trimmed」；`_mark_sent`/`_mark_failed` → `debug` 带 daily_count/failed_count；`record_user_emotion` → 仅情绪标签实际变化时 `info`「emotion tag changed」（from/to），同标签连续消息不重复打（防刷屏）。
+3. **补的异常/状态异常**：`load_state` 状态文件损坏/非 dict → `warning`「falling back to empty state」带 path/error_type（缺失文件仍静默，属正常首启）；原有 `_log_proactive_failure` error、record_last_active/record_user_emotion 异常 error、qq_push 截断 warning 维持不变。
+4. **未补（避免噪声）**：`record_last_active`（每条消息高频调用）、`save_state`/`_with_state` 写入、scheduler 每 tick `is_due` 未到期。
+5. **单测**：`tests/test_proactive_p2.py` 新增 `TestProactiveLogging` 8 用例（job guard skip 带 reason / failure exhausted 带计数 / emotion considered 带 concern_due / concern recorded / emotion tag change 只在变化时打 / mark_sent+mark_failed debug / load_state 损坏 warning / topic answered debug）。因 `jsonl_logger.Logger` 用 `__slots__` 无法单方法 monkeypatch，测试整体替换 `proactive.logger` 对象为记录器（`_LogRecorder` + `_swap_logger`）。
+6. **回归**：全量 `pytest tests/` = **504 passed / 12 failed**，12 失败与既有基线一致（test_cli 11 个 pygraphviz 环境缺失 + test_qq 1 个 MagicMock await，非本次引入；原 496 passed + 新增 8）。`ruff check src/gacore/proactive.py src/gacore/scheduler.py tests/test_proactive_p2.py` 全过。
+7. 未 kill/重启 bot；未改 `.ps1/.bat`；未执行 git 提交。同步更新 `langTrack-tech.md` 9.18。

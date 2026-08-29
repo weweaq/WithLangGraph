@@ -354,3 +354,140 @@ class TestRunProactiveJobP2:
         assert "最近话题" in prompts[0]
         state = proactive.load_state(cfg)["u_u1"]
         assert proactive._topic_answered(state, "上次那个方案改好了吗")
+
+
+# --------------------------------------------------------------------------- logging / auditability
+
+
+class _LogRecorder:
+    """Collect structured log emits so tests can assert key decision points.
+
+    ``gacore.jsonl_logger.Logger`` uses ``__slots__`` so individual methods can't be
+    monkeypatched; instead the whole ``proactive.logger`` object is swapped for this.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+
+    def _emit(self, message: str, fields: dict) -> None:
+        self.calls.append((message, fields))
+
+    def debug(self, message: str, **fields: object) -> None:
+        self._emit(message, fields)
+
+    def info(self, message: str, **fields: object) -> None:
+        self._emit(message, fields)
+
+    def warning(self, message: str, **fields: object) -> None:
+        self._emit(message, fields)
+
+    def error(self, message: str, **fields: object) -> None:
+        self._emit(message, fields)
+
+    def by_msg(self, msg: str) -> list[dict]:
+        return [f for m, f in self.calls if m == msg]
+
+
+def _swap_logger(monkeypatch: pytest.MonkeyPatch) -> _LogRecorder:
+    rec = _LogRecorder()
+    monkeypatch.setattr(proactive, "logger", rec)
+    return rec
+
+
+class TestProactiveLogging:
+    def test_job_guard_skip_logs_reason(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        cfg = Config.for_tests(tmp_path)
+        monkeypatch.setattr(proactive, "load_known_users", lambda: {"u1": {}})
+        # u1 is inside the hot-chat window -> job guard rejects with hot_chat.
+        _seed_entry(cfg, "u1", {"last_active": _dt(2026, 8, 28, 7, 59).isoformat(timespec="seconds")})
+        rec = _swap_logger(monkeypatch)
+        job = Job(name="proactive-morning", schedule="every 1h", prompt="早安", type="proactive")
+        result = proactive.run_proactive_job(job, cfg=cfg, clock=lambda: _dt(2026, 8, 28, 8))
+        assert result["skipped"] == [{"user": "u1", "reason": "hot_chat"}]
+        hits = rec.by_msg("proactive: user skipped by job guard")
+        assert hits and hits[0]["user"] == "u1" and hits[0]["reason"] == "hot_chat"
+        assert hits[0]["hot_chat_minutes"] == proactive._HOT_CHAT_MINUTES
+
+    def test_failure_retry_exhaustion_logs_reason(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        cfg = Config.for_tests(tmp_path)
+        monkeypatch.setattr(proactive, "load_known_users", lambda: {"u1": {}})
+        _seed_entry(
+            cfg,
+            "u1",
+            {
+                "last_active": _dt(2026, 8, 28, 7).isoformat(timespec="seconds"),
+                "failed_count": proactive._MAX_FAIL_RETRIES + 1,
+                "failed_date": "2026-08-28",
+                "last_failed": _dt(2026, 8, 28, 7, 30).isoformat(timespec="seconds"),
+            },
+        )
+        rec = _swap_logger(monkeypatch)
+        job = Job(name="proactive-morning", schedule="every 1h", prompt="早安", type="proactive")
+        result = proactive.run_proactive_job(job, cfg=cfg, clock=lambda: _dt(2026, 8, 28, 8))
+        assert result["skipped"] == [{"user": "u1", "reason": "fail_retries_exhausted"}]
+        hits = rec.by_msg("proactive: user skipped, delivery-failure retries exhausted")
+        assert hits and hits[0]["user"] == "u1"
+        assert hits[0]["failed_count"] == proactive._MAX_FAIL_RETRIES + 1
+        assert hits[0]["max_fail_retries"] == proactive._MAX_FAIL_RETRIES
+
+    def test_emotion_considered_logs_concern_due(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        cfg = Config.for_tests(tmp_path)
+        monkeypatch.setattr(proactive, "load_known_users", lambda: {"u1": {}})
+        _seed_entry(
+            cfg,
+            "u1",
+            {
+                "last_active": _dt(2026, 8, 28, 7).isoformat(timespec="seconds"),
+                "emotion": "down",
+                "emotion_updated_at": _dt(2026, 8, 28, 7, 30).isoformat(timespec="seconds"),
+            },
+        )
+        rec = _swap_logger(monkeypatch)
+        job = Job(name="proactive-morning", schedule="every 1h", prompt="早安", type="proactive")
+        proactive.run_proactive_job(job, cfg=cfg, clock=lambda: _dt(2026, 8, 28, 8))
+        hits = rec.by_msg("proactive: emotion tag considered for outreach")
+        assert hits and hits[0]["user"] == "u1" and hits[0]["emotion"] == "down"
+        assert hits[0]["concern_due"] is True
+
+    def test_mark_concerned_logs_info(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        cfg = Config.for_tests(tmp_path)
+        rec = _swap_logger(monkeypatch)
+        proactive._mark_concerned(cfg, "u1", _dt(2026, 8, 28, 8, 5), "down")
+        hits = rec.by_msg("proactive: concern recorded")
+        assert hits and hits[0]["user"] == "u1" and hits[0]["emotion"] == "down"
+        assert hits[0]["last_concern"] == _dt(2026, 8, 28, 8, 5).isoformat(timespec="seconds")
+
+    def test_emotion_tag_change_logs_only_on_change(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        cfg = Config.for_tests(tmp_path)
+        rec = _swap_logger(monkeypatch)
+        proactive.record_user_emotion("u1", "最近好累，压力很大", cfg=cfg)
+        proactive.record_user_emotion("u1", "最近特别难过，压力好大", cfg=cfg)
+        hits = rec.by_msg("proactive: emotion tag changed")
+        # Two consecutive "down" messages: only the first (normal -> down) transition logs.
+        assert len(hits) == 1
+        assert hits[0]["from_emotion"] == "normal" and hits[0]["to_emotion"] == "down"
+        assert hits[0]["user"] == "u1"
+
+    def test_mark_sent_and_failed_log_debug(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        cfg = Config.for_tests(tmp_path)
+        rec = _swap_logger(monkeypatch)
+        proactive._mark_sent(cfg, "u1", "morning", _dt(2026, 8, 28, 8))
+        proactive._mark_failed(cfg, "u1", "morning", _dt(2026, 8, 28, 8, 5))
+        assert rec.by_msg("proactive: sent bookkeeping updated")[0]["daily_count"] == 1
+        assert rec.by_msg("proactive: failure recorded")[0]["failed_count"] == 1
+
+    def test_load_state_corrupt_warns(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        cfg = Config.for_tests(tmp_path)
+        path = proactive._state_path(cfg)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[not a dict", encoding="utf-8")
+        rec = _swap_logger(monkeypatch)
+        assert proactive.load_state(cfg) == {}
+        assert rec.by_msg("proactive_state.json unreadable, falling back to empty state")
+
+    def test_topic_answered_logs_debug(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        cfg = Config.for_tests(tmp_path)
+        rec = _swap_logger(monkeypatch)
+        proactive._mark_topic_answered(cfg, "u1", "上次那个方案改好了吗", _dt(2026, 8, 28, 8))
+        hits = rec.by_msg("proactive: topic marked answered")
+        assert hits and hits[0]["user"] == "u1" and hits[0]["size"] == 1

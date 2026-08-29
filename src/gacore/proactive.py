@@ -327,14 +327,29 @@ def _state_path(cfg: Config) -> Path:
 
 
 def load_state(cfg: Config) -> dict:
-    """Load proactive_state.json; empty dict when missing or corrupt."""
+    """Load proactive_state.json; empty dict when missing or corrupt.
+
+    A missing file is a normal first boot (silent); a corrupt / non-dict payload is
+    an anomaly worth surfacing (never silently swallow state).
+    """
     path = _state_path(cfg)
     if not path.is_file():
         return {}
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        return raw if isinstance(raw, dict) else {}
-    except (OSError, ValueError):
+        if not isinstance(raw, dict):
+            logger.warning(
+                "proactive_state.json not a dict, falling back to empty state",
+                path=str(path),
+            )
+            return {}
+        return raw
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "proactive_state.json unreadable, falling back to empty state",
+            path=str(path),
+            error_type=type(exc).__name__,
+        )
         return {}
 
 
@@ -431,10 +446,21 @@ def record_user_emotion(
         def _mutate(state: dict) -> None:
             key = f"u_{user_id}"
             entry = state.setdefault(key, {})
+            prev = entry.get("emotion")
             entry["emotion"] = label
             entry["emotion_updated_at"] = ts
             entry["updated_at"] = ts
             entry.setdefault("created_at", ts)
+            # Only emit on an actual tag change — this runs on every incoming message,
+            # so logging every message would flood the log (audit noise rule).
+            if prev != label:
+                logger.info(
+                    "proactive: emotion tag changed",
+                    user=user_id,
+                    from_emotion=prev or _EMOTION_NORMAL,
+                    to_emotion=label,
+                    ts=ts,
+                )
 
         _with_state(resolved_cfg, _mutate)
     except Exception as exc:  # noqa: BLE001 — emotion tracking must never block chat
@@ -470,7 +496,14 @@ def _mark_sent(cfg: Config, user_id: str, scene: str, now: datetime) -> None:
         entry["updated_at"] = ts
         entry.setdefault("created_at", ts)
 
-    _with_state(cfg, _mutate)
+    saved = _with_state(cfg, _mutate)
+    logger.debug(
+        "proactive: sent bookkeeping updated",
+        user=user_id,
+        scene=scene,
+        daily_count=(saved.get(f"u_{user_id}") or {}).get("daily_count"),
+        last_sent=ts,
+    )
 
 
 def _mark_failed(cfg: Config, user_id: str, scene: str, now: datetime) -> None:
@@ -495,7 +528,14 @@ def _mark_failed(cfg: Config, user_id: str, scene: str, now: datetime) -> None:
         entry["updated_at"] = ts
         entry.setdefault("created_at", ts)
 
-    _with_state(cfg, _mutate)
+    saved = _with_state(cfg, _mutate)
+    logger.debug(
+        "proactive: failure recorded",
+        user=user_id,
+        scene=scene,
+        failed_count=(saved.get(f"u_{user_id}") or {}).get("failed_count"),
+        last_failed=ts,
+    )
 
 
 def _failure_exhausted(entry: dict, now: datetime) -> bool:
@@ -845,14 +885,31 @@ def _mark_topic_answered(cfg: Config, user_id: str, text: str, now: datetime) ->
         entry = state.setdefault(f"u_{user_id}", {})
         answered = entry.setdefault("answered_topics", {})
         answered[fp] = ts
+        trimmed = 0
         if len(answered) > _ANSWERED_TOPICS_MAX:
             # ISO8601 timestamps sort lexicographically, so key=answered.get works.
-            for key in sorted(answered, key=answered.get)[: len(answered) - _ANSWERED_TOPICS_MAX]:
+            stale = sorted(answered, key=answered.get)[: len(answered) - _ANSWERED_TOPICS_MAX]
+            for key in stale:
                 del answered[key]
+            trimmed = len(stale)
         entry["updated_at"] = ts
         entry.setdefault("created_at", ts)
+        if trimmed:
+            logger.debug(
+                "proactive: answered_topics LRU trimmed",
+                user=user_id,
+                trimmed=trimmed,
+                max_entries=_ANSWERED_TOPICS_MAX,
+                size=len(answered),
+            )
 
-    _with_state(cfg, _mutate)
+    saved = _with_state(cfg, _mutate)
+    logger.debug(
+        "proactive: topic marked answered",
+        user=user_id,
+        fingerprint=fp,
+        size=len((saved.get(f"u_{user_id}") or {}).get("answered_topics", {})),
+    )
 
 
 def _concern_due(entry: dict, now: datetime) -> bool:
@@ -898,6 +955,12 @@ def _mark_concerned(cfg: Config, user_id: str, now: datetime, emotion: str) -> N
         entry.setdefault("created_at", ts)
 
     _with_state(cfg, _mutate)
+    logger.info(
+        "proactive: concern recorded",
+        user=user_id,
+        emotion=emotion,
+        last_concern=ts,
+    )
 
 
 # --------------------------------------------------------------------------- prompt & headless run
@@ -1097,16 +1160,41 @@ def run_proactive_job(
     for uid in targets:
         allowed, reason = job_guard_allows(uid, job, state, now, guard=guard)
         if not allowed:
+            logger.info(
+                "proactive: user skipped by job guard",
+                job=job.name,
+                user=uid,
+                reason=reason,
+                max_per_day=_guard_int(guard, "max_per_day", _MAX_PER_DAY),
+                hot_chat_minutes=_guard_int(guard, "hot_chat_minutes", _HOT_CHAT_MINUTES),
+                idle_hours=_guard_int(guard, "idle_hours", _IDLE_HOURS),
+            )
             result["skipped"].append({"user": uid, "reason": reason})
             continue
         # M3: delivery-failure retry cap — once this user already failed N times today,
         # stop re-calling them inside the window (guarded skip, not an attempt).
-        if _failure_exhausted(state.get(f"u_{uid}") or {}, now):
+        entry0 = state.get(f"u_{uid}") or {}
+        if _failure_exhausted(entry0, now):
+            logger.info(
+                "proactive: user skipped, delivery-failure retries exhausted",
+                job=job.name,
+                user=uid,
+                failed_count=entry0.get("failed_count") or 0,
+                max_fail_retries=_MAX_FAIL_RETRIES,
+            )
             result["skipped"].append({"user": uid, "reason": "fail_retries_exhausted"})
             continue
         entry = state.get(f"u_{uid}") or {}
         emotion = entry.get("emotion") or _EMOTION_NORMAL
         concern_due = _concern_due(entry, now)
+        if emotion != _EMOTION_NORMAL:
+            logger.info(
+                "proactive: emotion tag considered for outreach",
+                job=job.name,
+                user=uid,
+                emotion=emotion,
+                concern_due=concern_due,
+            )
         # M-1 (audit): the concern cooldown only gates the *concern injection*, never
         # the whole outreach. Morning/night/idle greetings still run for a down/tired
         # user inside the cooldown; they just don't carry a second concern push.
