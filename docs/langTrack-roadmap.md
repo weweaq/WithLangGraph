@@ -1886,3 +1886,21 @@ QQ 机器人「韩立」已有完整 agent 回路，但面对随口话（“吃�
 - 回归：`pytest tests/test_proactive.py tests/test_proactive_p1.py tests/test_scheduler.py` = **148 passed**；全量 `pytest tests/` = **460 passed / 12 failed**，12 失败与既有基线一致（pygraphviz 环境缺失 + test_qq MagicMock await，非本次引入）。
 - lint：`ruff check src/gacore/proactive.py tests/test_proactive_p1.py` 全过。
 - 未 kill/重启 bot；未改 `.ps1/.bat`；未执行 git 提交。
+
+## 2026-08-29：P2 情绪感知关切 + 收尾策略（proactive.py，on_message 情绪标注）
+
+按《韩立主动交互-技术实现文档》§5.4/§9 在 P1 之上实现 P2：情绪感知关切 + 收尾策略（同一 open question / 同一关切点一次外呼后不再打扰）+ 输出侧轻量校验。复用既有管道，不新建发送通道。
+
+1. **情绪感知**（`proactive.py`）：
+   - `classify_emotion(text)`：轻量规则分类，返回 `normal` / `down` / `tired`（down 优先于 tired）；新增 `_EMOTION_DOWN_WORDS`（难过/伤心/崩溃/抑郁/焦虑/压力/烦/心情不好/低落/沮丧 等）与 `_EMOTION_TIRED_WORDS`（累/困/疲惫/没精神/加班 等）。
+   - `record_user_emotion(user_id, content, cfg, now)`：查 `load_known_users`，未知用户忽略；分类结果与 `emotion_updated_at` 原子写入 `proactive_state.json` 的 `entry["emotion"]`，写失败/异常不阻塞消息处理（best-effort，沿用 `_with_state`）。
+   - `qq.py::on_message` 在 `record_last_active` 之后调用 `record_user_emotion(user_id, content)`。
+2. **收尾策略（不追发第二次）**：
+   - open question：`_topic_fingerprint(text)`（空白归一 + 40 字截断）→ `_mark_topic_answered` 在发送成功后记录 `answered_topics`；`_topic_answered` 命中则下次不注入该话题（只发普通问候），`recall_topic` 返回已答话题时置空 topic 不再追发。
+   - 关切点 cooldown：`_concern_due(entry, now)` 按 `emotion != normal && last_concern 距今 >= _CONCERN_COOLDOWN_HOURS=24` 判定可外呼（无 last_concern 视为可外呼；时间解析失败 fail-open 可外呼）；发送成功后 `_mark_concerned` 写 `last_concern`。
+3. **prompt 注入**：`build_proactive_prompt` 新增 `emotion` 参数；非 normal 时注入「主人最近情绪」段（低落/沮丧 → 关心语气，疲惫 → 提醒休息）+ 约束第 6 条（提及情绪但别打探隐私）。
+4. **run_proactive_job 接线**：逐用户计算 `emotion = entry.get("emotion","normal")`；`_concern_due` 未到 → `concern_covered` 跳过并计入 `skipped`；`_topic_answered` 命中 → 置空 topic 只发普通问候；发送成功后 `_mark_topic_answered` + `_mark_concerned`。
+5. **输出侧校验**（`qq_tools.py`）：新增 `_PUSH_MAX_CHARS=200`，`qq_push` 入口对超长 message 截断到 200 字并 warning（不吞异常，不报错中断）。
+6. **单测**：新增 `tests/test_proactive_p2.py`（26 用例）：classify_emotion（空/闲聊 normal、down/tired 关键词、down 优先）、record_user_emotion（写 emotion+时间戳/更新既有 entry/未知用户忽略/异常内容不抛）、话题指纹与已答标记（空白归一/截断/跨空参数）、关切 cooldown（normal 不发/无 last_concern 可发/24h 内不重发/超 24h 再发/坏时间戳 fail-open）、prompt 注入（无 emotion 不注入/未知 emotion 忽略/down/tired 措辞）、run_proactive_job（关切未到期跳过不调 headless/到期注入+标记/已答话题不追发/新话题注入+标记）。
+7. **回归**：`pytest tests/test_proactive_p2.py tests/test_proactive_p1.py tests/test_proactive.py tests/test_tools_qq_push.py` = **141 passed**；全量 `pytest tests/` = **486 passed / 12 failed**，12 失败与既有基线一致（test_cli 11 个 pygraphviz 环境缺失 + test_qq 1 个 MagicMock await，非本次引入）。ruff：proactive.py / test_proactive_p2.py 全过；qq.py / qq_tools.py 既有 8 项 lint 问题均在未改动区。
+8. 未 kill/重启 bot；未改 `.ps1/.bat`；未执行 git 提交。同步更新设计文档 §5.4/§9 与 `langTrack-tech.md` 9.17。

@@ -101,7 +101,7 @@ from gacore.graph import DEFAULT_RECURSION_LIMIT, build_graph
 
 from gacore.llm import get_llm
 from gacore.jsonl_logger import get_logger
-from gacore.proactive import record_last_active
+from gacore.proactive import record_last_active, record_user_emotion
 
 from gacore.state import new_state
 
@@ -920,6 +920,9 @@ class QQApp:
 
             _record_known_user(user_id)
             record_last_active(user_id)
+            # P2: lightweight emotion tag of the latest user message, persisted to the
+            # proactive state so a later outreach can reference it (gentle concern).
+            record_user_emotion(user_id, content)
 
             # Cross-day rollover: on the first message of a new day, swap to a fresh
             # thread and stage yesterday's memory pack for silent first-turn injection.

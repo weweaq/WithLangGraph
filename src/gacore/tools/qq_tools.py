@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from typing import Final, Literal, TypedDict
+from typing import Final, Literal, NotRequired, TypedDict
 
 from langchain_core.tools import tool
 
@@ -27,17 +27,27 @@ logger = get_logger("tools.qq_tools")
 
 _PUSH_TIMEOUT_S: Final = 90
 
+# P2 output-side guard (design doc §5.5 "工具侧再校验一次"): QQ private-message
+# reading is best under ~200 chars; anything longer is truncated before delivery.
+_PUSH_MAX_CHARS: Final = 200
+
 _EXECUTOR: ThreadPoolExecutor | None = None
 
 
 class QqPushResult(TypedDict):
-    """Successful push: how many recipients got it, who, and the platform message ids."""
+    """Successful push: how many recipients got it, who, and the platform message ids.
+
+    ``truncated`` (audit L-1) is only set when the over-length message was cut to
+    ``_PUSH_MAX_CHARS`` before delivery — a signal the caller can surface to the user
+    (e.g. "消息被截断，全文见报告") instead of silently losing the tail.
+    """
 
     status: Literal["sent"]
     ok: int
     to: list[str]
     failures: list[str]
     ids: dict[str, str]
+    truncated: NotRequired[bool]
 
 
 class QqPushError(TypedDict):
@@ -97,6 +107,20 @@ def qq_push(
     推送有频控/策略限制，不要频繁调用。
     """
     targets = [x.strip() for x in (to or "").split(",") if x.strip()]
+    # P2 output-side guard: truncate over-length messages before delivery so the
+    # proactive greeting stays ≤200 chars even if the LLM ignores the prompt rule.
+    # Audit L-1: the truncation is reported back via ``truncated=True`` on success so
+    # callers can tell the user the message was cut instead of failing silently.
+    message = (message or "").strip()
+    truncated = False
+    if len(message) > _PUSH_MAX_CHARS:
+        logger.warning(
+            "qq_push message truncated",
+            before=len(message),
+            max_chars=_PUSH_MAX_CHARS,
+        )
+        message = message[:_PUSH_MAX_CHARS]
+        truncated = True
     if not targets:
         users = load_known_users()
         targets = list(users.keys())
@@ -130,5 +154,14 @@ def qq_push(
         )
 
     delivered = [o for o in targets if o not in failures]
-    logger.info("qq_push sent", ok=ok, failures=failures)
+    logger.info("qq_push sent", ok=ok, failures=failures, truncated=truncated)
+    if truncated:
+        return QqPushResult(
+            status="sent",
+            ok=ok,
+            to=delivered,
+            failures=failures,
+            ids=ids,
+            truncated=True,
+        )
     return QqPushResult(status="sent", ok=ok, to=delivered, failures=failures, ids=ids)

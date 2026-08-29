@@ -140,3 +140,33 @@ def test_push_partial_failure(monkeypatch):
     assert result["ok"] == 1
     assert result["to"] == ["openid_A"]
     assert result["failures"] == ["openid_B"]
+
+
+def test_push_truncates_overlong_message_and_flags(monkeypatch):
+    """L-1: over-length message is cut to _PUSH_MAX_CHARS and flagged truncated=True."""
+    monkeypatch.setattr(qq_tools_mod, "load_known_users", lambda: dict(_USERS))
+    captured: dict = {}
+
+    def fake_send(content, targets, sandbox):
+        captured["content"] = content
+        return {"ok": 2, "failures": [], "errors": {}, "ids": {"openid_A": "id-1", "openid_B": "id-2"}}
+
+    monkeypatch.setattr(qq_tools_mod, "_default_send", fake_send)
+    long_msg = "长" * (qq_tools_mod._PUSH_MAX_CHARS + 50)
+    result = qq_push.invoke({"message": long_msg})
+    assert result["status"] == "sent"
+    assert result["truncated"] is True
+    assert len(captured["content"]) == qq_tools_mod._PUSH_MAX_CHARS
+
+
+def test_push_short_message_not_truncated(monkeypatch):
+    """L-1: a within-limit message is delivered verbatim, no truncated flag set."""
+    monkeypatch.setattr(qq_tools_mod, "load_known_users", lambda: dict(_USERS))
+
+    def fake_send(content, targets, sandbox):
+        return {"ok": 1, "failures": [], "errors": {}, "ids": {"openid_A": "id-A"}}
+
+    monkeypatch.setattr(qq_tools_mod, "_default_send", fake_send)
+    result = qq_push.invoke({"message": "短消息"})
+    assert result["status"] == "sent"
+    assert "truncated" not in result

@@ -77,6 +77,40 @@ _TRIVIAL_WORDS: Final = frozenset({
     "没事", "没事了", "算了", "行", "可以", "666", "赞", "nice", "嗯呢",
 })
 
+# P2 emotion (design doc §5.6): lightweight rule-based tags persisted to the
+# proactive state file and injected into the outreach prompt when the user is down.
+_EMOTION_NORMAL: Final = "normal"
+_EMOTION_DOWN: Final = "down"      # low / upset / anxious / negative
+_EMOTION_TIRED: Final = "tired"    # exhausted / drained
+
+_EMOTION_DOWN_WORDS: Final = frozenset({
+    # Audit L-3: strong / explicit negative-emotion words only. Neutral-context
+    # substrings ("怎么办", "失败", "无聊", "好难", "太难", "没意思", "讨厌",
+    # "倒霉", "气死", single "烦") were dropped to avoid mis-tagging everyday chat.
+    "难过", "伤心", "沮丧", "失望", "失落", "焦虑", "抑郁", "崩溃",
+    "委屈", "哭", "烦躁", "郁闷", "不开心", "心情不好", "emo", "压力",
+    "压力大", "想放弃", "绝望", "害怕", "担心", "孤独", "孤单",
+    # Audit L-4: explicit "低落" added to match the design dictionary.
+    "低落",
+})
+_EMOTION_TIRED_WORDS: Final = frozenset({
+    "好累", "好困", "疲惫", "累死", "没精神", "精疲力尽", "乏", "倦",
+    "吃不消", "熬", "加班好累", "困死了",
+})
+
+# Concern-scene cooldown: after one concern outreach, do not reach out again for the
+# same emotional state before this many hours (design doc §5.7 "no second chase").
+_CONCERN_COOLDOWN_HOURS: Final = 24
+
+# Upper bound on per-user answered_topics fingerprints (audit L-5): when exceeded,
+# the oldest entries are trimmed LRU-style so proactive_state.json cannot grow forever.
+_ANSWERED_TOPICS_MAX: Final = 50
+
+_EMOTION_LABEL_TEXT: Final = {
+    _EMOTION_DOWN: "低落/沮丧（主人最近消息带明显负面情绪）",
+    _EMOTION_TIRED: "疲惫（主人最近消息提到累/没精神）",
+}
+
 _state_lock = threading.Lock()
 
 
@@ -345,6 +379,67 @@ def record_last_active(user_id: str, cfg: Config | None = None, now: datetime | 
     except Exception as exc:  # noqa: BLE001 — activity tracking must never block chat
         logger.error(
             "record_last_active failed",
+            user=user_id,
+            error_type=type(exc).__name__,
+            stack_trace=str(exc),
+        )
+
+
+def classify_emotion(text: str) -> str:
+    """Lightweight rule-based emotion tag for an incoming user message (P2 §5.6).
+
+    Returns one of ``_EMOTION_NORMAL`` / ``_EMOTION_DOWN`` / ``_EMOTION_TIRED``.
+    ``down`` (low / upset / anxious) wins over ``tired`` so "累到崩溃" is treated
+    as the stronger signal; empty or unrecognised text degrades to ``normal``.
+    """
+    t = (text or "").strip()
+    if not t:
+        return _EMOTION_NORMAL
+    if any(w in t for w in _EMOTION_DOWN_WORDS):
+        return _EMOTION_DOWN
+    if any(w in t for w in _EMOTION_TIRED_WORDS):
+        return _EMOTION_TIRED
+    return _EMOTION_NORMAL
+
+
+def record_user_emotion(
+    user_id: str,
+    content: str,
+    cfg: Config | None = None,
+    now: datetime | None = None,
+) -> None:
+    """Classify a user's latest message and persist the tag (P2 §5.6).
+
+    Called from the QQ frontend alongside ``record_last_active``. The emotion tag is
+    stored as ``entry["emotion"]`` in proactive_state.json so a later proactive
+    outreach can reference it (inject a gentle concern, or skip when already covered).
+    Best-effort: a failure is logged, never blocks the chat path.
+
+    Audit L-2: this helper intentionally carries no emotion whitelist of its own — the
+    tag set is produced by ``classify_emotion`` (the single source of truth) and the
+    *caller* is responsible for only invoking this with real user messages. Callers
+    must not pass their own ad-hoc labels; anything not one of the ``_EMOTION_*``
+    constants falls through to ``_EMOTION_NORMAL`` semantics downstream.
+    """
+    if not user_id or user_id in ("unknown", "None"):
+        return
+    try:
+        resolved_cfg = cfg or Config.default()
+        label = classify_emotion(content)
+        ts = (now or _now_east8()).isoformat(timespec="seconds")
+
+        def _mutate(state: dict) -> None:
+            key = f"u_{user_id}"
+            entry = state.setdefault(key, {})
+            entry["emotion"] = label
+            entry["emotion_updated_at"] = ts
+            entry["updated_at"] = ts
+            entry.setdefault("created_at", ts)
+
+        _with_state(resolved_cfg, _mutate)
+    except Exception as exc:  # noqa: BLE001 — emotion tracking must never block chat
+        logger.error(
+            "record_user_emotion failed",
             user=user_id,
             error_type=type(exc).__name__,
             stack_trace=str(exc),
@@ -713,6 +808,98 @@ def recall_topic(cfg: Config, user_id: str, now: datetime) -> dict:
     return {"kind": "none", "text": "", "thread_id": thread_id}
 
 
+# --------------------------------------------------------------------------- P2 closing strategy
+
+
+def _topic_fingerprint(text: str) -> str:
+    """Normalised fingerprint of an open-question text for dedupe (P2 §5.7)."""
+    return re.sub(r"\s+", "", text or "").strip()[:40]
+
+
+def _topic_answered(entry: dict, text: str) -> bool:
+    """True when this open question was already covered by a previous outreach.
+
+    "No second chase" (design doc §5.7): once a proactive message has picked the same
+    open question back up, later ticks must not keep re-reaching out about it — the
+    user is expected to reply or the idle threshold restarts the clock.
+    """
+    if not text:
+        return False
+    answered = entry.get("answered_topics")
+    return isinstance(answered, dict) and _topic_fingerprint(text) in answered
+
+
+def _mark_topic_answered(cfg: Config, user_id: str, text: str, now: datetime) -> None:
+    """Atomically record an open question as already outreach-ed (P2 §5.7).
+
+    ``answered_topics`` is kept bounded (audit L-5): when it exceeds
+    ``_ANSWERED_TOPICS_MAX`` entries, the oldest fingerprints (by write timestamp)
+    are trimmed LRU-style so the state file cannot grow without bound.
+    """
+    if not text:
+        return
+    ts = now.isoformat(timespec="seconds")
+    fp = _topic_fingerprint(text)
+
+    def _mutate(state: dict) -> None:
+        entry = state.setdefault(f"u_{user_id}", {})
+        answered = entry.setdefault("answered_topics", {})
+        answered[fp] = ts
+        if len(answered) > _ANSWERED_TOPICS_MAX:
+            # ISO8601 timestamps sort lexicographically, so key=answered.get works.
+            for key in sorted(answered, key=answered.get)[: len(answered) - _ANSWERED_TOPICS_MAX]:
+                del answered[key]
+        entry["updated_at"] = ts
+        entry.setdefault("created_at", ts)
+
+    _with_state(cfg, _mutate)
+
+
+def _concern_due(entry: dict, now: datetime) -> bool:
+    """True when the user's latest emotion warrants a concern and none was sent lately.
+
+    ``normal`` never triggers concern. Once a concern outreach has been sent, the same
+    emotional state is not chased again within ``_CONCERN_COOLDOWN_HOURS`` (design doc
+    §5.7 "no second chase"); a stale/missing timestamp counts as due.
+
+    Audit M-2: the emotion tag at delivery time is stored alongside the timestamp
+    (``last_concern_emotion``), so a *changed* emotion is a new concern point that
+    resets the cooldown — "累" after "崩溃" is chased once instead of being silently
+    swallowed by the old concern. Legacy entries without ``last_concern_emotion`` are
+    treated as changed (fail-open).
+    """
+    emotion = entry.get("emotion") or _EMOTION_NORMAL
+    if emotion == _EMOTION_NORMAL:
+        return False
+    last = entry.get("last_concern")
+    if not last:
+        return True
+    last_dt = _parse_iso(last)
+    if last_dt is None:
+        return True
+    if entry.get("last_concern_emotion") != emotion:
+        return True
+    return (_as_east8(now) - _as_east8(last_dt)) >= timedelta(hours=_CONCERN_COOLDOWN_HOURS)
+
+
+def _mark_concerned(cfg: Config, user_id: str, now: datetime, emotion: str) -> None:
+    """Atomically record that a concern outreach was delivered (P2 §5.7).
+
+    Stores both the delivery time and the emotion it was for (audit M-2) so a later
+    emotion change resets the ``_CONCERN_COOLDOWN_HOURS`` clock.
+    """
+    ts = now.isoformat(timespec="seconds")
+
+    def _mutate(state: dict) -> None:
+        entry = state.setdefault(f"u_{user_id}", {})
+        entry["last_concern"] = ts
+        entry["last_concern_emotion"] = emotion
+        entry["updated_at"] = ts
+        entry.setdefault("created_at", ts)
+
+    _with_state(cfg, _mutate)
+
+
 # --------------------------------------------------------------------------- prompt & headless run
 
 
@@ -722,6 +909,7 @@ def build_proactive_prompt(
     now: datetime,
     topic: str = "",
     insight: str = "",
+    emotion: str = "",
 ) -> str:
     """Assemble the proactive-outreach prompt for the headless agent.
 
@@ -733,6 +921,9 @@ def build_proactive_prompt(
     ``insight`` (yesterday portrait) are injected as background material so the model
     can pick the conversation back up ("上次聊到…还没说完") or reference what the user
     was busy with yesterday ("昨天看到你在忙 XX").
+
+    P2 emotion (design doc §5.6): a non-``normal`` ``emotion`` tag injects a concern
+    hint so 韩立 can follow the persona and care gently — never prying or lecturing.
     """
     scene = _scene_of(job)
     base = (job.prompt or "").strip()
@@ -744,16 +935,33 @@ def build_proactive_prompt(
         recall_lines.append(f"最近话题（主人上次抛出、还没说完）：{topic}")
     if insight:
         recall_lines.append(f"昨日画像线索（可自然引用\"昨天看到你在忙…\"）：{insight}")
+    if emotion and emotion in _EMOTION_LABEL_TEXT:
+        recall_lines.append(f"主人最近情绪：{_EMOTION_LABEL_TEXT[emotion]}（可温和关心一句，但别打探隐私、别越界开导）")
     recall_block = ""
     if recall_lines:
         recall_block = "\n".join(recall_lines) + "\n"
 
-    topic_note = ""
+    # Constraints are numbered dynamically (audit M-3): hard-coded "4." / "6." / "5."
+    # went out of order or left gaps depending on the topic/emotion combination. Build
+    # the list first, then emit continuous 1..N numbering.
+    constraints: list[str] = [
+        "1. 用真实当前时间作话题依据，拿不准就明确不引用时间；",
+        "2. 不提\"我是机器人/自动消息/定时任务\"；",
+        "3. 结尾自然给用户一个可接话的口子，但别连续追问；",
+    ]
     if topic:
-        topic_note = (
-            "4. 有最近话题时，优先自然地把上次没说完的话题接上，别硬转新话题；"
-            "只有确无话题可接时才另起家常话头；\n"
+        constraints.append(
+            f"{len(constraints) + 1}. 有最近话题时，优先自然地把上次没说完的话题接上，别硬转新话题；"
+            "只有确无话题可接时才另起家常话头；"
         )
+    if emotion and emotion in _EMOTION_LABEL_TEXT:
+        constraints.append(
+            f"{len(constraints) + 1}. 主人情绪低落/疲惫时，开头先用一句自然、克制的关心再进入正题，"
+            "语气像老朋友随口一问，不追问原因、不评判；"
+        )
+    constraints.append(
+        f"{len(constraints) + 1}. 本条为主动问候，不计入用户事实，不得据此沉淀用户画像/作息。"
+    )
 
     return (
         "目标：主动给主人发一条 QQ 私聊消息（≤200字，韩立口吻，克制不啰嗦）。\n"
@@ -765,11 +973,8 @@ def build_proactive_prompt(
         "动作：内容想好后，必须调用 qq_push(message=..., to=<上面的目标 openid>) 工具把这条消息"
         "主动发给主人；不调用工具视为放弃本轮。\n"
         "约束：\n"
-        "1. 用真实当前时间作话题依据，拿不准就明确不引用时间；\n"
-        "2. 不提\"我是机器人/自动消息/定时任务\"；\n"
-        "3. 结尾自然给用户一个可接话的口子，但别连续追问；\n"
-        f"{topic_note}"
-        "5. 本条为主动问候，不计入用户事实，不得据此沉淀用户画像/作息。"
+        + "\n".join(constraints)
+        + "\n"
     )
 
 
@@ -899,12 +1104,28 @@ def run_proactive_job(
         if _failure_exhausted(state.get(f"u_{uid}") or {}, now):
             result["skipped"].append({"user": uid, "reason": "fail_retries_exhausted"})
             continue
+        entry = state.get(f"u_{uid}") or {}
+        emotion = entry.get("emotion") or _EMOTION_NORMAL
+        concern_due = _concern_due(entry, now)
+        # M-1 (audit): the concern cooldown only gates the *concern injection*, never
+        # the whole outreach. Morning/night/idle greetings still run for a down/tired
+        # user inside the cooldown; they just don't carry a second concern push.
         result["attempted"] += 1
         try:
             # P1 Topic Recall: last open question first, yesterday portrait as fallback.
             recall = recall_topic(resolved_cfg, uid, now)
             topic = recall["text"] if recall["kind"] == "open_question" else ""
             insight = recall["text"] if recall["kind"] == "daily_note" else ""
+            # P2 (design doc §5.7): the same open question was already picked up by a
+            # previous outreach — don't chase it again, fall back to a plain greeting.
+            if topic and _topic_answered(entry, topic):
+                logger.info(
+                    "proactive: open question already outreach-ed, no second chase",
+                    job=job.name,
+                    user=uid,
+                    fingerprint=_topic_fingerprint(topic),
+                )
+                topic = ""
             if topic or insight:
                 logger.info(
                     "proactive: topic recall injected",
@@ -913,7 +1134,14 @@ def run_proactive_job(
                     kind=recall["kind"],
                     text=_snippet(topic or insight, 120),
                 )
-            prompt = build_proactive_prompt(job, uid, now, topic=topic, insight=insight)
+            prompt = build_proactive_prompt(
+                job,
+                uid,
+                now,
+                topic=topic,
+                insight=insight,
+                emotion=emotion if concern_due else "",
+            )
             exit_reason, reply, qq_results = _headless_run(job, resolved_cfg, prompt, job.max_turns)
             if not qq_results:
                 logger.info(
@@ -937,6 +1165,12 @@ def run_proactive_job(
                 continue
             _mark_sent(resolved_cfg, uid, scene, now)
             result["sent"] += 1
+            # P2 (design doc §5.7): once delivered, remember this open question and this
+            # concern so the next tick won't chase the same topic/emotion again.
+            if topic:
+                _mark_topic_answered(resolved_cfg, uid, topic, now)
+            if emotion != _EMOTION_NORMAL and concern_due:
+                _mark_concerned(resolved_cfg, uid, now, emotion)
             logger.info(
                 "proactive: pushed",
                 job=job.name,
@@ -960,6 +1194,7 @@ def run_proactive_job(
 __all__ = (
     "PROACTIVE_POOL",
     "build_proactive_prompt",
+    "classify_emotion",
     "cooldown_ok",
     "in_window",
     "jitter_allows",
@@ -970,6 +1205,7 @@ __all__ = (
     "proactive_due",
     "recall_topic",
     "record_last_active",
+    "record_user_emotion",
     "run_proactive_job",
     "save_state",
 )

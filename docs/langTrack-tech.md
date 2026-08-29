@@ -793,3 +793,25 @@ flowchart LR
 - 未 kill/重启 bot；未改 `.ps1/.bat`；未执行 git 提交。同步更新设计文档 §5.4 / §9 与 roadmap 2026-08-29 P1 段。
 
 **审核修订（2026-08-29 同日）**：`_is_trivial` 增加"精确命中 `_TRIVIAL_WORDS` 优先于意图词"逻辑（修复"在吗""嗯呢"因含宽泛意图词"吗""呢"被误判 open question，容忍尾部标点 `？！!?。~～`，并把"嗯呢"补入 `_TRIVIAL_WORDS`，长句仍 fail-open）；`_msg_type` 类名兜底分支改 startswith 前缀匹配（HumanMessage→human / AIMessage→ai / ToolMessage→tool / SystemMessage→system）。`tests/test_proactive_p1.py` **46 → 51 用例**；回归 `test_proactive + test_proactive_p1 + test_scheduler` = **148 passed**；全量 **460 passed / 12 failed**（既有基线，非本次引入）。设计文档 §5.3 补 jitter 缺省 0 注记、§9 补 HH:MM 准点 job 约 1/3 概率当日不发的统计特性。
+
+## 9.17 P2 情绪感知关切 + 收尾策略（proactive.py，on_message 情绪标注，2026-08-29）
+
+按《韩立主动交互-技术实现文档》§5.4/§9 在 P1 之上实现 P2：情绪感知关切 + 收尾策略（同一 open question / 同一关切点一次外呼后不再打扰）+ 输出侧轻量校验。复用既有管道，不新建发送通道。
+
+- **情绪感知**（`proactive.py`）：
+  - `classify_emotion(text)`：轻量规则分类，返回 `normal` / `down` / `tired`（down 优先于 tired）；`_EMOTION_DOWN_WORDS`（难过/伤心/崩溃/抑郁/焦虑/压力/烦/心情不好/低落/沮丧 等）与 `_EMOTION_TIRED_WORDS`（累/困/疲惫/没精神/加班 等），规则在前、不调 LLM。
+  - `record_user_emotion(user_id, content, cfg, now)`：经 `load_known_users` 白名单校验，未知用户忽略；分类结果与 `emotion_updated_at` 通过 `_with_state` 原子写入 `proactive_state.json` 的 `entry["emotion"]`；任何异常仅 warning 不阻塞消息处理（best-effort，不吞异常）。
+  - `qq.py::on_message` 在 `record_last_active` 之后调用 `record_user_emotion(user_id, content)`，情绪随最近活跃一起落盘。
+- **收尾策略（不追发第二次）**：
+  - open question 防重：`_topic_fingerprint(text)`（空白归一 + 40 字截断）作为话题指纹；发送成功后 `_mark_topic_answered` 写 `answered_topics[fingerprint]=ts`；`_topic_answered` 命中 → 下次不再注入该话题（只发普通问候），`run_proactive_job` 对已答话题置空 topic 不追发。
+  - 关切点 cooldown：`_concern_due(entry, now)` 判定 `emotion != normal && last_concern 距今 >= _CONCERN_COOLDOWN_HOURS=24` 才可外呼（无 last_concern 视为可外呼；坏/缺时间戳 fail-open 可外呼，`_as_east8` 统一东八区）；发送成功后 `_mark_concerned` 写 `last_concern`，避免 24h 内重复打扰。
+- **prompt 注入**：`build_proactive_prompt` 新增 `emotion` 参数；非 normal 注入「主人最近情绪」段（低落/沮丧 → 关心语气，疲惫 → 提醒休息）并追加约束第 6 条（可提及情绪但别打探隐私、不追问细节）。
+- **run_proactive_job 接线**：逐用户 `emotion = entry.get("emotion","normal")`；`_concern_due` 未到 → `concern_covered` 跳过并记入 `skipped`；`_topic_answered` 命中 → 置空 topic；发送成功后 `_mark_topic_answered` + `_mark_concerned` 一并落盘。
+- **输出侧校验**（`qq_tools.py`）：`_PUSH_MAX_CHARS=200`，`qq_push` 入口对超长 message 截断到 200 字并 warning（校验在发送前，不报错中断、不吞异常）。
+
+### 验证
+
+- 新增 `tests/test_proactive_p2.py`（**26 用例**）：classify_emotion（空/纯空白/闲聊 normal、down/tired 关键词、down 优先于 tired）、record_user_emotion（写 emotion+时间戳 / 更新既有 entry 保留 created_at / 未知用户忽略 / None 内容不抛）、`_topic_fingerprint`（空白归一 / 40 字截断）、`_topic_answered` / `_mark_topic_answered`（空文本不标记 / 跨空白匹配）、`_concern_due`（normal 不发 / 无 last_concern 可发 / 24h 内不重发 / 超 24h 再发 / 坏时间戳 fail-open）、`_mark_concerned`（保留 created_at）、prompt 注入（无 emotion 不注入 / 未知 emotion 忽略 / down·tired 措辞）、run_proactive_job（关切未到期跳过且不调 headless / 到期注入情绪+标记 last_concern / 已答话题不追发只发普通问候 / 新话题注入+标记）。
+- 回归：`pytest tests/test_proactive_p2.py tests/test_proactive_p1.py tests/test_proactive.py tests/test_tools_qq_push.py` = **141 passed**；全量 `pytest tests/` = **486 passed / 12 failed**，12 失败与既有基线一致（test_cli 11 个 pygraphviz 环境缺失 + test_qq 1 个 MagicMock await，非本次引入）。
+- `ruff check src/gacore/proactive.py tests/test_proactive_p2.py` 全过；qq.py / qq_tools.py 的既有 8 项 lint（import 排序 / noqa / DTZ / S110）均在本次未改动区，未纳入本次范围。
+- 未 kill/重启 bot；未改 `.ps1/.bat`；未执行 git 提交。同步更新设计文档 §5.4/§9 与 roadmap 2026-08-29 P2 段。
