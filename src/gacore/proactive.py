@@ -10,8 +10,11 @@ existing ``qq_push`` tool to actually deliver, and persists every outcome to
 ``data/proactive_state.json`` (atomic write, idempotent, East-8 timestamps).
 
 Design constraints inherited from the v0.2 doc:
-  - No new send tool / no queue consumer / no write-back to the main thread (avoids
-    touching the checkpointer from a worker thread);
+  - No new send tool / no queue consumer;
+  - P3 (post-review): delivered proactive turns ARE written back into the user's main
+    thread checkpoint from the worker thread via a *separate* writable sqlite3
+    connection + synchronous SqliteSaver (never touching the main loop's
+    AsyncSqliteSaver), with an alternation guard so the thread never ends AI,AI;
   - Every time judgment uses East-8 (``_TZ``), aligned with the project time rules;
   - Proactive messages are not user facts: the prompt explicitly marks them as such,
     and memory sedimentation only extracts from HumanMessages anyway.
@@ -1076,6 +1079,115 @@ def _headless_run(job: Job, cfg: Config, prompt: str, max_turns: int) -> tuple[s
     return exit_reason, reply, qq_push_results
 
 
+def _proactive_scene_text(prompt: str) -> str:
+    """Extract a short, user-facing scene label from the outreach prompt.
+
+    The headless prompt embeds the scene as ``场景：...`` or ``场景说明：...``. We reuse
+    that line as the content of the trigger-side HumanMessage written back to the main
+    thread, so the conversation record reads like a natural turn ("【定时任务】晨安问候…")
+    while the full prompt stays in additional_kwargs.proactive_prompt. Falls back to a
+    generic label when the line is missing or empty.
+    """
+    for line in prompt.splitlines():
+        s = line.strip()
+        if s.startswith("场景") and "：" in s:
+            label = s.split("：", 1)[1].strip()
+            if label:
+                return label
+    return "主动问候"
+
+
+def _write_back_proactive(
+    cfg: Config,
+    user_id: str,
+    prompt: str,
+    reply: str,
+) -> bool:
+    """Persist the delivered proactive turn back into the user's main thread (P3).
+
+    After ``qq_push`` confirmed delivery, we append the turn to the user's main-thread
+    checkpoint so that (a) chat records show a complete "定时任务触发 → AI 回复" exchange,
+    and (b) the next time the user replies, 韩立 sees his own proactive message in
+    context instead of going amnesic.
+
+    Concurrency scheme (avoids review H3): this runs in the pool worker thread and opens
+    a *separate, throwaway* writable sqlite3 connection + the synchronous ``SqliteSaver``
+    + a fresh compiled graph sharing that saver. It never touches the main loop's
+    AsyncSqliteSaver instance and never bridges through asyncio, so there is no
+    cross-thread asyncio single-connection hazard. WAL allows concurrent connections.
+
+    Alternation guard: the main thread must never end with AI,AI. If the tail message is
+    not a human turn, we insert a trigger-side HumanMessage first (scene label as
+    content, the full outreach prompt stored in ``additional_kwargs.proactive_prompt``)
+    and then the AIMessage with the actual reply. If the tail is already human, only the
+    AIMessage is appended.
+
+    Best-effort by design: any failure (missing mapping, missing DB, corrupt snapshot,
+    write error) is logged and returns False — a write-back failure must never roll back
+    or block the already-delivered outreach.
+
+    Returns True when the checkpoint was updated.
+    """
+    thread_id = _thread_id_of(cfg, user_id)
+    db = cfg.root / "data" / "gacore_chat.db"
+    if not thread_id or not db.is_file():
+        logger.warning(
+            "proactive write-back skipped: no main thread mapping",
+            user=user_id,
+            has_thread=bool(thread_id),
+        )
+        return False
+    conn = None
+    try:
+        from langchain_core.messages import AIMessage, HumanMessage
+        from langgraph.checkpoint.sqlite import SqliteSaver
+
+        from gacore.graph import build_graph
+
+        conn = sqlite3.connect(str(db))
+        saver = SqliteSaver(conn)
+        graph = build_graph(cfg=cfg, checkpointer=saver)
+        config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        snapshot = graph.get_state(config)
+        messages = snapshot.values.get("messages") or []
+        tail = messages[-1] if messages else None
+        tail_type = _msg_type(tail) if tail is not None else ""
+
+        updates: list = []
+        if tail_type != "human":
+            # Alternation guard: seed a trigger-side HumanMessage before the AI reply so
+            # the main thread never ends with AI,AI. content stays clean (scene label);
+            # the full prompt is archived in additional_kwargs for programmatic review.
+            updates.append(
+                HumanMessage(
+                    content=f"【定时任务】{_proactive_scene_text(prompt)}",
+                    additional_kwargs={"proactive": True, "proactive_prompt": prompt},
+                )
+            )
+        updates.append(
+            AIMessage(content=reply, additional_kwargs={"proactive": True})
+        )
+        graph.update_state(config, {"messages": updates}, as_node="process")
+        logger.info(
+            "proactive write-back: appended to main thread",
+            user=user_id,
+            thread_id=thread_id,
+            appended=len(updates),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — best-effort, never break the outreach
+        logger.error(
+            "proactive write-back failed",
+            user=user_id,
+            error_type=type(exc).__name__,
+            stack_trace=str(exc),
+        )
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def _qq_push_sent(qq_push_results: list[str]) -> bool:
     """True when the latest qq_push tool result reports status "sent" (M4).
 
@@ -1253,6 +1365,11 @@ def run_proactive_job(
                 continue
             _mark_sent(resolved_cfg, uid, scene, now)
             result["sent"] += 1
+            # P3: once delivered, write the turn back into the user's main thread so
+            # 韩立 sees his own proactive message in the next turn's context and chat
+            # records keep a complete "定时任务触发 → AI 回复" alternation. Best-effort:
+            # a write-back failure is logged and never fails the outreach.
+            _write_back_proactive(resolved_cfg, uid, prompt, reply)
             # P2 (design doc §5.7): once delivered, remember this open question and this
             # concern so the next tick won't chase the same topic/emotion again.
             if topic:

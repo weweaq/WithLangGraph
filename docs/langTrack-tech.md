@@ -855,3 +855,32 @@ flowchart LR
 - **不补（噪声）**：`record_last_active`（每条消息高频）、`save_state`/`_with_state` 写入、scheduler 每 tick `is_due` 未到期。
 
 **测试**：`tests/test_proactive_p2.py` 新增 `TestProactiveLogging` 8 用例。因 `jsonl_logger.Logger` 用 `__slots__` 无法单方法替换，测试用 `_LogRecorder`（实现 debug/info/warning/error 记录）+ `_swap_logger` 整体替换 `proactive.logger` 后断言结构化字段。全量 `pytest tests/` = **504 passed / 12 failed**（原 496 + 新增 8；12 失败与基线一致，非本次引入）。`ruff check src/gacore/proactive.py src/gacore/scheduler.py tests/test_proactive_p2.py` 全过。未 kill/重启 bot；未执行 git 提交。
+
+## 9.19 P3 主动消息写回主 thread（proactive.py，2026-08-30）
+
+**目标**：根治"韩立主动发消息后失忆"——主动外呼送达后，把"定时任务触发 → AI 回复"这一轮写回用户主 thread 的 checkpoint，让韩立后续回复时能读到自己主动说过的话，聊天记录也呈现完整交替时间线。保留"定时任务触发 LLM 主动发消息"机制不动，仅补写回。
+
+### 写回方案（`_write_back_proactive`，`src/gacore/proactive.py`）
+
+- **并发隔离（规避评审 H3）**：写回在 `run_proactive_job` 的 pool worker 线程内执行，**不复用主循环的 asyncio 单连接**：
+  - 新建**独立可写 sqlite3 连接**（`sqlite3.connect(db)`，非 ro）+ 同步 `SqliteSaver`；
+  - 用该 saver `build_graph(cfg=cfg, checkpointer=saver)` 编译一个临时图实例；
+  - `graph.get_state(config)` 读主 thread 最近 checkpoint → `graph.update_state(config, {"messages": updates}, as_node="process")` 写回；
+  - 随用随关（`conn.close()`），绝不触碰主循环 `AsyncSqliteSaver`、不经 asyncio 桥接；WAL 允许主 loop 与 worker 多连接并发读写。
+- **交替守卫**：主 thread 永不以 AI,AI 结尾。
+  - 末尾消息非 human → 先插触发侧 `HumanMessage`（content=`【定时任务】{场景标签}`，`additional_kwargs={"proactive": True, "proactive_prompt": <完整外呼prompt原文>}`）再插 `AIMessage`（content=实际回复，`additional_kwargs={"proactive": True}`）；
+  - 末尾已是 human → 仅追加 `AIMessage`。
+- **场景标签（`_proactive_scene_text(prompt)`）**：从外呼 prompt 提取 `场景：...` / `场景说明：...` 行作为触发侧 content（缺省回落"主动问候"）；完整 prompt 原文归档在 `additional_kwargs.proactive_prompt`，不污染对话上下文、可程序化审计。
+- **best-effort 语义**：无 thread 映射（`_thread_id_of` 读 `data/qq_user_threads.json`）或缺库 → warning 返回 False；写回异常 → error 返回 False；绝不回滚、绝不阻塞已送达的外呼（`run_proactive_job` 中 `_mark_sent` 之后调用，失败不影响发送计数）。
+- **接线**：`run_proactive_job` 发送成功分支（`_qq_push_sent` 判 `status=="sent"`）→ `_mark_sent` → `_write_back_proactive(resolved_cfg, uid, prompt, reply)`。
+
+### 测试基建排障（关键）
+
+真实 SqliteSaver 写回后 `get_tuple` 读不到追加消息。探针定位根因：**手写初始 checkpoint 的 id 时间戳前缀晚于 `update_state` 生成的真实新 id**（如 `1f1f0001-...` > `1f1a4132-...`），而 `get_tuple` 按 `checkpoint_id DESC` 取最新 → 旧 checkpoint 被误判为最新。修复：测试 `_make_db` 初始 id 用更早时间戳前缀（`1f000000-...`）。生产路径（真实 `ainvoke` 生成的 checkpoint 带正确 versions_seen）无此问题（历史高保真探针已验证主循环 `aget_state` 能完整读回 4 条消息）。
+
+### 验证
+
+- 新增 `tests/test_proactive_p3.py`（**10 用例**）：`TestProactiveSceneText`（场景行提取/缺失回落/空回落）、`TestWriteBackProactive`（尾 AI 插种子+回复 / 尾 Human 仅追加 / **空 thread 插种子+回复** / 无映射 False / 缺库 False）、`TestRunProactiveJobWriteBack`（端到端送达后主 thread 变 human/ai/human/ai 且触发侧 content=场景标签、`proactive_prompt` 归档完整 prompt；发送失败不写回）。
+- 全量 `pytest tests/` = **514 passed / 12 failed**（原 504 + 新增 10；12 失败与基线一致：test_cli 11 个 pygraphviz 环境缺失 + test_qq 1 个 MagicMock await，经 git stash 还原验证非本次引入）。
+- `ruff check src/gacore/proactive.py tests/test_proactive_p3.py` 全过。
+- 未 kill/重启 bot；未改 `.ps1/.bat`；未执行 git 提交。同步更新 roadmap 2026-08-30 P3 段。
