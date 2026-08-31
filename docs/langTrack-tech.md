@@ -94,7 +94,7 @@ flowchart LR
 |---|---|---|---|---|
 | GET | `/health` | — | `{"status":"ok"}` | 存活探针 |
 | POST | `/ingest` | body=`IngestRequest` | `{"status":"ok","inserted":N,"deduplicated":bool}` | 幂等：`batch_id` 重复时返回 `{"status":"ok","inserted":0,"deduplicated":true}` |
-| GET | `/dashboard` | `?day=YYYY-MM-DD`（可选） | `text/html` | 深色单页仪表盘，调 `render_dashboard_html(conn, day)`（`dashboard.py:237`），每次请求新开只读连接 |
+| GET | `/dashboard` | `?day=YYYY-MM-DD`（可选） | `text/html` | 深色单页仪表盘，调 `render_dashboard_html(conn, day)`（`dashboard.py:237`），每次请求新开只读连接；含「事实审查块」（FactCard 逐项人眼核对，不跑 ETL） |
 
 ### 2.1 幂等与事务语义（`storage.ingest_batch`, storage.py:89-115）
 
@@ -315,17 +315,24 @@ erDiagram
 
 ### 5.1 LangTrackDayStats TypedDict（`tools/langTrack_tools.py:112-144`）
 
-agent 工具 `langTrack_stats(day)` 的返回结构（gacore 主 agent 日报自我观察的数据源）：
+agent 工具 `langTrack_stats(day)` 的返回结构（gacore 主 agent 日报自我观察的数据源）。2026-08-31 起改由 `fact_card.build(detail="full")` 单一数据源映射（删除了原重复 SQL，见 §5.4），新增 `data_as_of / etl_watermark / current_known / stays / trips / stay_minutes / anomalies` 等公共字段（旧字段全部保留）：
 
 | 字段 | 类型 | 来源与用途 |
 |---|---|---|
 | day | str | 查询日（默认今天） |
 | available | bool | 当日 daily_stats 无行 → False |
+| data_as_of / data_as_of_ms / data_as_of_source | str/int/str | 数据实际覆盖到的时刻（区分生成时间 `generated_at`），来源 daily_stats 或 etl_state |
+| etl_watermark / etl_watermark_ms | str/int\|None | ETL 水位线（`_update_etl_state` 写入），无 daily_stats 时为 None |
 | screen_ms / screen_hours | int/float | total_screen_ms 及小时换算 |
 | top_apps | list[dict] | app_ranking_json 前 8 |
-| notification_count / clicked | int | 当日通知量 |
+| notification_count / clicked / top_notification_apps | int/int/list | 当日通知量及 Top App |
 | unlock_count / switch_count / location_count | int | 解锁/切换/定位 |
-| places | list[dict] | places 按 visit_count 前 4 `{label,visits}` |
+| places | list[dict] | places 前 4（2026-08-31 起带 device 过滤）`{label,visits,is_primary,address}` |
+| current_known | dict\|None | 截止 data_as_of 的最后一段停留（label/since/poi），人现在在哪 |
+| stays | list[dict] | 当日停留段（label/start_hhmm/end_hhmm/mins），内嵌 trips |
+| trips | list[dict] | 移动段（start/end/dist_m/from_label/to_label） |
+| stay_minutes | dict[str,int] | 按 label 聚合停留分钟数 |
+| anomalies | list[dict] | 当日异常（覆盖/滞留等）简要 |
 | sleep_signal | str | 凌晨 00-05 点 audio_env 样本 >5 → "疑似熬夜"，否则"未见熬夜信号"（tools:218-232） |
 | coverage | list[dict] | contract_coverage 中 status≠ok 的行（缺失/停滞/未登记），旧库无此表时降级为空（tools:234-253） |
 | persona | dict | §5.2 七日画像（tools:283） |
@@ -371,6 +378,24 @@ agent 工具 `langTrack_stats(day)` 的返回结构（gacore 主 agent 日报自
 usage、session、notification、location、audio_env、audio_clip、accel(false)、snapshot(partial)、screen_content、clipboard、input、media、bt_device、battery、network、app_lifecycle、call、sms。`STALE_DAYS=7`。
 
 契约由人维护：客户端新增/废弃类型时显式更新此文件，ETL 校验产出 unexpected/missing。
+
+### 5.4 FactCard（`fact_card.py`，2026-08-31 新增）
+
+统一「今日生活事实」的**单一数据源**：`build()` 纯读聚合（零 ETL、零写库），把 daily_stats / stays / trips / places / anomalies / audio_env / contract_coverage 拼成一张事实卡；`render_compact()` 只读渲染压缩文本（双出口：`outlet="prompt"` 注入 system prompt，`outlet="dashboard"` 供审查页）。`langTrack_stats`、dashboard 均消费它，不再各写一份 SQL。
+
+```mermaid
+flowchart LR
+    DB[("langTrack.db 只读")]
+    DB --> B[fact_card.build<br/>纯读聚合]
+    B --> C1["outlet=prompt<br/>render_compact"]
+    C1 --> P[context.build_system_prompt<br/>注入生活事实卡片]
+    B --> C2["outlet=full<br/>LangTrackDayStats 映射"]
+    C2 --> T[langTrack_stats 工具]
+    B --> C3["outlet=dashboard<br/>render_compact 审查"]
+    C3 --> D[/dashboard 事实审查块/]
+```
+
+核心字段：`day / available / has_facts / data_as_of / etl_watermark / current_known / stays / trips / stay_minutes / places / anomalies / sleep_signal / top_apps / notification_count / persona / compact`。降级原则：构建失败只记日志返回空卡，不抛异常、不挡对话；无 daily_stats 但已有位置时 `available=False, has_facts=True` 仍产轨迹；多设备未指定 device 时仅允许唯一设备，多设备明确降级不猜。注入路径（I2）不扫 events、不跑 ETL。
 
 ---
 

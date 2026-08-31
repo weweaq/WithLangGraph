@@ -1957,3 +1957,32 @@ QQ 机器人「韩立」已有完整 agent 回路，但面对随口话（“吃�
 - [x] 单测自测通过（10 passed），全量无新增回归。
 - [ ] 部署后观察线上：用户回复时韩立能从 checkpoint 读到自己主动发过的话（待 bot 在跑实测）。
 - [ ] 提交前按流程过 codegraph sync + subagent 审核后提交推送。
+
+## 2026-08-31：事实卡片双出口 + dashboard 审查（fact_card.py）
+
+### 背景
+按「先看见、再注入、再铺出口」切三轮实现 langTrack 事实卡片：统一「今日生活事实」单一数据源 `fact_card.build()`（纯读、零 ETL、零写库），双出口——`outlet="prompt"` 注入 QQ system prompt，`outlet="dashboard"` 供 `/dashboard` 事实审查页人眼核对；`langTrack_stats` 工具与 dashboard 均消费它，删除重复 SQL。
+
+### 已完成（I1 看见 / I2 注入 / I3 铺开）
+1. **Task 1（I1）`src/gacore/langTrack/fact_card.py`（新增 34022B）**：`FactCard/CompactSection/StayBrief/TripBrief/PlaceBrief/CurrentKnown` 等 TypedDict；`build(*, conn, db_path, day, device_id, now_ms, detail, outlet)` 纯读聚合；多设备未指定 device 时仅唯一设备、多设备明确降级；`_pack_compact` 按 priority 整段纳入/省略（轨迹保留最早 2 + 最近 3，中间折叠，禁止字符串硬切）；`render_compact()` 渲染压缩文本；失败降级只记日志返回空卡不抛异常；`_log_built` 结构化维测日志（outlet/compact_chars）。
+2. **Task 6（I1）`dashboard.py` 重写（18460B）**：插入事实审查块（人眼核对 FactCard 各段，不跑 ETL）；places 按 device 过滤；persona 从 card 注入不二次查询；构建失败只显示错误与导航，不回退设备相关 SQL。
+3. **Task 2（I2）`tools/langTrack_tools.py`（9895B）**：`langTrack_stats` 改消费 `fact_card.build(detail="full")` 映射全部公共字段（`LangTrackDayStats` 全字段 TypedDict + `_map_card_to_stats`），**删除原重复 SQL**；保留 `_ensure_etl`；损坏库探测 `SELECT 1` → `SELECT name FROM sqlite_master`（前者不触发 DatabaseError）。
+4. **Task 3（I2）`context.py` build_system_prompt**：在 daily/rollover 之后、working checkpoint 之前注入 `fact_card.build(detail="compact", outlet="prompt")` + `render_compact()`（try/except 降级空卡）；`_MEMORY_BG_RULE` 铁律由"daily 和 rollover 各追加一次"改为 `injected_bg` 标志只追加一次（修重复 bug）；打 `fact card injected` 结构化日志（outlet/compact_chars）。`fact_card.py` 修正：无 daily_stats 时 full 模式不再用 audio_env 计数覆盖 `sleep_signal`（保持"当日无 daily_stats"不误报"未见熬夜信号"）。
+5. **Task 4（I3）`proactive.py` build_proactive_prompt**：约束列表结尾追加一条动态编号约束（生活事实已在 system prompt 注入，仅自然相关时至多引用一项，禁止逐行复述/当亲口话/输出坐标或完整停留清单）。
+6. **Task 5（I3）`config/schedule.json` daily-report**：步骤 4 注明今日生活事实卡片已在 system prompt 注入勿重复；`langTrack_stats` 仅当需要更细维度（时间分配/App排行/通知/睡眠信号）时调用作补充。
+7. **Task 7（文档）**：本文件执行记录 + `langTrack-tech.md` §2 dashboard 行补事实审查块、§5.1 增公共字段、新增 §5.4 FactCard（含 mermaid）。
+
+### 验证
+- Task 1：`test_langTrack_fact_card.py` **43 passed**（首跑 42/1 failed 修正水位断言：etl_state 水位次日 00:00 才 day_window_closed）。
+- Task 6：`test_langTrack_dashboard.py` **11 passed**。
+- Task 2：`test_tools_langTrack.py` **7 passed**（扩夹具补 stays/trips/anomalies/etl_state/places.poi 列；三处修正：stay 结束时间覆盖水位 / audio 事件仅 with_stats 插入 / 损坏库探测改 sqlite_master）。
+- Task 3：`test_context.py` + `test_middleware.py` **51 passed**（补 pytest 导入 + autouse patch 禁真实库 + 5 个卡片注入用例）。
+- Task 4：`test_proactive_p2.py` **44 passed**（约束条数断言 4/5/6 → 5/6/7，补 topic_only 与 fact_card_rule 用例）。
+- 关键回归：`test_langTrack_fact_card / persona / tools_langTrack / context / middleware / dashboard / proactive*` 全过；全量 `pytest tests/` **568 passed / 12 failed**（12 失败为既有基线：test_cli 11 个 pygraphviz 环境缺失 + test_qq 1 个 MagicMock await，非本次引入）。`ruff check` 覆盖所有改动 py。
+- git 提交：Task 1（5932676）、Task 6（9c925bd）、Task 2+fact_card 语义修复（feat(langTrack): 工具层 langTrack_stats 消费 fact_card 单一数据源）。
+
+### 待办更新
+- [x] 事实卡片双出口（prompt 注入 / dashboard 审查）+ `langTrack_stats` 单一数据源（Task 1/2/3/4/5/6）。
+- [x] dashboard 事实审查块（Task 6）。
+- [x] 文档（Task 7：langTrack-tech.md §2/§5.1/§5.4 + 本文件执行记录）。
+- [ ] 部署后观察线上：QQ system prompt 含真实水位/按序轨迹/停留汇总，回复只在相关时引用至多一项；主动问候不念第二份 compact。
