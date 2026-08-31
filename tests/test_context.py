@@ -13,6 +13,7 @@ from typing import Final
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
+import gacore.context as ctx
 from gacore.config import Config
 from gacore.context import build_system_prompt, build_turn_prompt, extract_summaries, fold_history, periodic_hints, stamp_history_lines
 
@@ -23,6 +24,43 @@ FILE_HINT: Final = "[Write your current state to a file]"
 ASK_USER_HINT: Final = "[Long-running: consider asking the user for confirmation]"
 ANTI_LOOP_HINT: Final = "[Warning: long loop detected, wrap up soon]"
 MEMORY_HINT: Final = "[Memory refresh: reload L1 insights and L2 facts into working memory]"
+
+# A fake FactCard with content, so tests can simulate an available card without DB.
+_FAKE_CARD_WITH_CONTENT = {
+    "day": "2026-08-31",
+    "now_ms": 0,
+    "available": True,
+    "device_id": "d1",
+    "compact": "=== 生活事实（今日概览）\n· 08:40 在家，直到 09:10；09:25 在公司",
+    "compact_sections": [
+        {"key": "places", "title": "足迹", "lines": ["· 08:40 在家，直到 09:10；09:25 在公司"]}
+    ],
+    "debug_meta": {"card_fp": "data/langTrack.db", "degrade": ""},
+}
+
+_FAKE_CARD_EMPTY = {
+    "day": "2026-08-31",
+    "now_ms": 0,
+    "available": False,
+    "device_id": "d1",
+    "compact": "",
+    "compact_sections": [],
+    "debug_meta": {"card_fp": "data/langTrack.db", "degrade": "no_data"},
+}
+
+
+@pytest.fixture(autouse=True)
+def _no_real_langtrack_db(monkeypatch: pytest.MonkeyPatch) -> None:
+    """禁止任何 prompt 用例触碰真实 data/langTrack.db：默认卡片为空且不抛异常。"""
+
+    def _fake_build(*args, **kwargs):  # noqa: ARG001
+        return _FAKE_CARD_EMPTY
+
+    def _fake_render(card, *args, **kwargs):  # noqa: ARG001
+        return str(card.get("compact") or "")
+
+    monkeypatch.setattr(ctx.fact_card, "build", _fake_build)
+    monkeypatch.setattr(ctx.fact_card, "render_compact", _fake_render)
 
 
 @pytest.fixture()
@@ -238,3 +276,91 @@ def test_build_turn_prompt_marks_old_history_timestamps(cfg_with_assets: Config)
     sys_msg = prompt[0]
     assert isinstance(sys_msg, SystemMessage)
     assert "[历史@时间戳] [USER] 8月1日 我们约过面基" in sys_msg.content
+
+
+# ------------------------------------------------------------------ fact card injection
+
+
+def _set_card(monkeypatch: pytest.MonkeyPatch, card: dict) -> None:
+    def _fake_build(*args, **kwargs):  # noqa: ARG001
+        return card
+
+    def _fake_render(c, *args, **kwargs):  # noqa: ARG001
+        return str(c.get("compact") or "")
+
+    monkeypatch.setattr(ctx.fact_card, "build", _fake_build)
+    monkeypatch.setattr(ctx.fact_card, "render_compact", _fake_render)
+
+
+def test_fact_card_injected_between_rollover_and_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, cfg_with_assets: Config
+) -> None:
+    """Given an available card, the compact text must be injected before the working checkpoint."""
+    _set_card(monkeypatch, _FAKE_CARD_WITH_CONTENT)
+    state = _state([HumanMessage(content="hi")], key_info="k1")
+
+    prompt = build_system_prompt(state, cfg_with_assets)
+
+    assert ctx.LANGTRACK_CARD_PREFIX in prompt
+    assert "· 08:40 在家，直到 09:10；09:25 在公司" in prompt
+    # 卡片在 working checkpoint 之前
+    assert prompt.index(ctx.LANGTRACK_CARD_PREFIX) < prompt.index("[Working checkpoint]")
+    assert prompt.index(ctx.LANGTRACK_CARD_PREFIX) < prompt.index("[Working checkpoint]") < prompt.index("k1")
+
+
+def test_fact_card_empty_card_not_injected(monkeypatch: pytest.MonkeyPatch, cfg_with_assets: Config) -> None:
+    """Given an empty card (no data), the compact text must NOT be injected."""
+    _set_card(monkeypatch, _FAKE_CARD_EMPTY)
+
+    prompt = build_system_prompt(_state([HumanMessage(content="hi")]), cfg_with_assets)
+
+    assert ctx.LANGTRACK_CARD_PREFIX not in prompt
+
+
+def test_fact_card_build_failure_degrades_without_breaking_prompt(
+    monkeypatch: pytest.MonkeyPatch, cfg_with_assets: Config
+) -> None:
+    """Given a build that raises, the prompt must still be assembled (缺库不能弄死 QQ)."""
+
+    def _boom(*args, **kwargs):  # noqa: ARG001
+        raise RuntimeError("db locked")
+
+    monkeypatch.setattr(ctx.fact_card, "build", _boom)
+
+    prompt = build_system_prompt(_state([HumanMessage(content="hi")]), cfg_with_assets)
+
+    assert ctx.LANGTRACK_CARD_PREFIX not in prompt
+    assert "探测优先" in prompt  # 正常兜底规则仍在
+
+
+def test_memory_bg_rule_appended_only_once(
+    monkeypatch: pytest.MonkeyPatch, cfg_with_assets: Config
+) -> None:
+    """The memory-background rule must appear exactly once even with daily + card both injected."""
+    _set_card(monkeypatch, _FAKE_CARD_WITH_CONTENT)
+    monkeypatch.setattr(ctx, "load_recent_daily_summaries", lambda cfg_: "8月30日：昨日开会，讨论了日程")
+
+    prompt = build_system_prompt(_state([HumanMessage(content="hi")]), cfg_with_assets)
+
+    assert prompt.count("[记忆背景铁律]") == 1
+
+
+def test_fact_card_injected_logged(
+    monkeypatch: pytest.MonkeyPatch, cfg_with_assets: Config
+) -> None:
+    """The injection must emit a structured 'fact card injected' log with outlet=prompt."""
+    records: list[tuple[str, dict]] = []
+
+    class _Rec:
+        def info(self, message: str, **fields: object) -> None:
+            records.append((message, fields))
+
+    monkeypatch.setattr(ctx, "_context_logger", _Rec())
+    _set_card(monkeypatch, _FAKE_CARD_WITH_CONTENT)
+
+    build_system_prompt(_state([HumanMessage(content="hi")]), cfg_with_assets)
+
+    hits = [r for m, r in records if m == "fact card injected"]
+    assert hits
+    assert hits[0]["outlet"] == "prompt"
+    assert hits[0]["injected"] is True

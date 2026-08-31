@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from conftest import BindableFakeMessagesListChatModel
 from langchain.agents import create_agent
 from langchain.agents.middleware import ModelRetryMiddleware
@@ -32,6 +33,31 @@ from gacore.state import GAState, new_state
 
 _TZ8: timezone = timezone(timedelta(hours=8))
 _REAL_DT: datetime = datetime(2026, 8, 27, 16, 0, tzinfo=_TZ8)  # 2026-08-27 周四 16:00
+
+
+@pytest.fixture(autouse=True)
+def _no_real_langtrack_db(monkeypatch: pytest.MonkeyPatch) -> None:
+    """禁止 middleware 集成用例触碰真实 data/langTrack.db：卡片默认为空。"""
+    from gacore import context as ctx
+
+    _empty = {
+        "day": "2026-08-31",
+        "now_ms": 0,
+        "available": False,
+        "device_id": "d1",
+        "compact": "",
+        "compact_sections": [],
+        "debug_meta": {"card_fp": "data/langTrack.db", "degrade": "no_data"},
+    }
+
+    def _fake_build(*args, **kwargs):  # noqa: ARG001
+        return _empty
+
+    def _fake_render(card, *args, **kwargs):  # noqa: ARG001
+        return str(card.get("compact") or "")
+
+    monkeypatch.setattr(ctx.fact_card, "build", _fake_build)
+    monkeypatch.setattr(ctx.fact_card, "render_compact", _fake_render)
 
 _EMPTY_PROMPT: str = "[Empty response. Please respond or call a tool.]"
 _CALL: dict[str, object] = {

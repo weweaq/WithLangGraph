@@ -15,11 +15,18 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 from gacore.character import card_prompt
 from gacore.config import Config
+from gacore.jsonl_logger import get_logger
+from gacore.langTrack import fact_card
 from gacore.state import GAState
 from gacore.tools.daily_notes import load_recent_daily_summaries
 
 _TZ = timezone(timedelta(hours=8))
 _WEEKDAY_CN: Final = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+
+_context_logger = get_logger("context")
+
+# 生活事实卡片前缀（fact-card 设计文档 §2.6）：注入后用于日志/观测识别。
+LANGTRACK_CARD_PREFIX: Final = "=== 生活事实（"
 
 _MAX_CONTENT_LEN: Final = 200
 _FOLD_LIMIT: Final = 30
@@ -183,15 +190,39 @@ def build_system_prompt(state: GAState, cfg: Config) -> str:
         if role_text:
             prompt += f"\n\n{ROLE_HEADER}\n{role_text}{_ROLE_TOOL_BRIDGE}"
     daily = load_recent_daily_summaries(cfg)
+    injected_bg = False
     if daily:
         prompt += f"\n{DAILY_HEADER}\n{stamp_daily_history(daily)}"
-        prompt += _MEMORY_BG_RULE
+        injected_bg = True
     # One-shot cross-day memory injection: set by qq.py::_maybe_rollover on the first
     # message of a new day and cleared by graph.py::cleanup_images after that turn.
     rollover = (state.get("rollover_context") or "").strip()
     if rollover:
         prompt += f"\n{ROLLOVER_HEADER}\n{rollover}"
+        injected_bg = True
+    # 今日生活事实卡片（compact）：纯读、零 ETL，作为今日记忆背景注入；
+    # 注入位置在 daily notes / rollover 之后、working checkpoint 之前。
+    _fact_text = ""
+    try:
+        _fact_card = fact_card.build(detail="compact", outlet="prompt")
+        _fact_text = fact_card.render_compact(_fact_card)
+    except Exception:  # noqa: BLE001 - 缺库/损坏一律不弄死 QQ
+        _fact_text = ""
+    if _fact_text:
+        prompt += f"\n{_fact_text}"
+        injected_bg = True
+    # 记忆背景铁律只追加一次（修复 daily/rollover 各自追加造成的重复注入）
+    if injected_bg:
         prompt += _MEMORY_BG_RULE
+    try:
+        _context_logger.info(
+            "fact card injected",
+            outlet="prompt",
+            injected=bool(_fact_text),
+            compact_chars=len(_fact_text),
+        )
+    except Exception:  # noqa: BLE001 - 日志失败不影响返回
+        pass
     # Multi-option output mode: set by qq.py::_run_agent when proposal_detect() fires;
     # cleared by graph.py::cleanup_images after the turn so it never leaks into later turns.
     mode = (state.get("output_mode") or "").strip()
