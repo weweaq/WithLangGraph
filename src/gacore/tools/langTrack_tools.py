@@ -8,7 +8,9 @@
 
 - 需要最新数据时自动触发 ETL（幂等，几秒），再读事实表
 
-- 返回结构化信号字典，由 agent 决定如何融入日报，本模块不做分析
+- 数据读取统一委托给 `fact_card.build`（纯读聚合，单一数据源），本模块只做
+
+  结果映射与工具注册，不再重复 SQL
 
 - 不依赖 scheduler / graph / 其他 tools；注册只需在 tools/__init__.py 加一行
 
@@ -17,8 +19,6 @@
 from __future__ import annotations
 
 
-
-import json
 
 import sqlite3
 
@@ -37,7 +37,14 @@ from langchain_core.tools import tool
 
 
 from gacore.jsonl_logger import get_logger
-from gacore.langTrack.persona import build as build_persona
+from gacore.langTrack.fact_card import (
+    AnomalyBrief,
+    CurrentKnown,
+    PlaceBrief,
+    StayBrief,
+    TripBrief,
+    build as build_fact_card,
+)
 
 
 
@@ -113,13 +120,35 @@ def _ensure_etl() -> bool:
 
 class LangTrackDayStats(TypedDict):
 
-    """某一天的结构化使用画像（来自 daily_stats + sessions + places 事实表）。"""
+    """某一天的结构化使用画像。
+
+
+
+    与 ``fact_card.FactCard`` 同构：数据读取委托给 fact_card.build（纯读），
+
+    本 TypedDict 为工具对外契约，字段只增不减，保持向后兼容。
+
+    语义约定：``available`` 仅表示当日有 daily_stats；``has_facts`` 才表示
+
+    是否有可用的当日事实（daily_stats / stays / trips 任一存在）。
+
+    """
 
 
 
     day: str
 
     available: bool
+
+    has_facts: bool
+
+    ambiguous_device: bool
+
+    candidate_device_ids: list[str]
+
+    device_id: str
+
+    generated_at: str
 
     screen_ms: int
 
@@ -131,20 +160,39 @@ class LangTrackDayStats(TypedDict):
 
     notification_clicked: int
 
+    top_notification_apps: list[dict]
+
+    screen_on_count: int
+
+    screen_off_count: int
+
     unlock_count: int
 
     switch_count: int
 
     location_count: int
 
-    places: list[dict]
+    audio_clip_count: int
+
+    places: list[PlaceBrief]
+
+    stays: list[StayBrief]
+
+    trips: list[TripBrief]
+
+    stay_minutes: dict[str, int]
+
+    anomalies: list[AnomalyBrief]
+
+    midnight_audio_n: int | None
 
     sleep_signal: str
 
     # P0 拟人语义字段（v2 设计文档附录 A；旧库未跑派生时为 None/[]，下游需做空值防御）
-    # 作息节律三标量来自 daily_stats P0 列；sleep_signal 为遗留兼容信号，保留但以本组为准
-    sleep_start_hhmm: int | None
-    sleep_end_hhmm: int | None
+    # 作息节律三标量来自 daily_stats P0 列（schema 为 TEXT，故注解 str|None）；
+    # sleep_signal 为遗留兼容信号，保留但以本组为准
+    sleep_start_hhmm: str | None
+    sleep_end_hhmm: str | None
     sleep_duration_min: int | None
     time_app: list[dict]  # 时段×应用矩阵（daily_stats.time_app_json 解析后）
 
@@ -152,16 +200,48 @@ class LangTrackDayStats(TypedDict):
     coverage: list[dict]
     persona: dict
 
+    # 数据水位 / 当前已知 / 日窗状态（fact_card 透传）
+    etl_watermark: str
+    etl_watermark_ms: int | None
+    data_as_of: str
+    data_as_of_ms: int | None
+    data_as_of_source: str
+    location_as_of: str
+    location_as_of_ms: int | None
+    data_age_min: int | None
+    day_window_closed: bool
+    current_known: CurrentKnown | None
 
-def _row_val(row, col: str, default=None):
-    """安全读取 sqlite3.Row 列；旧库缺列（P0 派生未跑）时返回 default，不抛异常。"""
-    if row is None:
-        return default
-    try:
-        v = row[col]
-        return default if v is None else v
-    except (KeyError, IndexError):
-        return default
+    # compact 事实卡片（注入用 / 审计用；空串/空表表示未生成）
+    compact_sections: list
+    compact: str
+    compact_chars: int
+    compact_lines: list[str]
+    compact_omitted: dict[str, str]
+    card_fp: str
+
+
+def _unavailable(day: str, reason: str) -> LangTrackDayStats:
+    """返回不可用画像（available=False）。replacement reason 供旧语义兼容。"""
+    return LangTrackDayStats(
+        day=day, available=False, has_facts=False,
+        ambiguous_device=False, candidate_device_ids=[], device_id="",
+        generated_at="",
+        screen_ms=0, screen_hours=0.0, top_apps=[], notification_count=0,
+        notification_clicked=0, top_notification_apps=[],
+        screen_on_count=0, screen_off_count=0, unlock_count=0, switch_count=0,
+        location_count=0, audio_clip_count=0,
+        places=[], stays=[], trips=[], stay_minutes={}, anomalies=[],
+        midnight_audio_n=None, sleep_signal=reason,
+        sleep_start_hhmm=None, sleep_end_hhmm=None, sleep_duration_min=None,
+        time_app=[], coverage=[], persona={},
+        etl_watermark="", etl_watermark_ms=None,
+        data_as_of="", data_as_of_ms=None, data_as_of_source="unknown",
+        location_as_of="", location_as_of_ms=None, data_age_min=None,
+        day_window_closed=False, current_known=None,
+        compact_sections=[], compact="", compact_chars=0, compact_lines=[],
+        compact_omitted={}, card_fp="",
+    )
 
 
 def _today() -> str:
@@ -171,20 +251,80 @@ def _today() -> str:
     return datetime.datetime.now(datetime.UTC).astimezone().strftime("%Y-%m-%d")
 
 
+def _map_card_to_stats(card: dict, day: str) -> LangTrackDayStats:
+    """将 FactCard 映射为 LangTrackDayStats（字段全量透传，只增不减）。
 
+    仅做语义兼容替换：fact_card 的「当日无 daily_stats」信号在工具层还原为
+    旧的「当日无数据（可能未采集或未同步）」文案，保证下游与旧测试不破坏。
+    """
+    ss = card["sleep_signal"]
+    if not card["available"] and ss == "当日无 daily_stats":
+        ss = "当日无数据（可能未采集或未同步）"
+    return LangTrackDayStats(
+        day=day,
+        available=card["available"],
+        has_facts=card["has_facts"],
+        ambiguous_device=card["ambiguous_device"],
+        candidate_device_ids=list(card["candidate_device_ids"]),
+        device_id=card["device_id"],
+        generated_at=card["generated_at"],
+        screen_ms=card["screen_ms"],
+        screen_hours=card["screen_hours"],
+        top_apps=card["top_apps"],
+        notification_count=card["notification_count"],
+        notification_clicked=card["notification_clicked"],
+        top_notification_apps=card["top_notification_apps"],
+        screen_on_count=card["screen_on_count"],
+        screen_off_count=card["screen_off_count"],
+        unlock_count=card["unlock_count"],
+        switch_count=card["switch_count"],
+        location_count=card["location_count"],
+        audio_clip_count=card["audio_clip_count"],
+        places=card["places"],
+        stays=card["stays"],
+        trips=card["trips"],
+        stay_minutes=card["stay_minutes"],
+        anomalies=card["anomalies"],
+        midnight_audio_n=card["midnight_audio_n"],
+        sleep_signal=ss,
+        sleep_start_hhmm=card["sleep_start_hhmm"],
+        sleep_end_hhmm=card["sleep_end_hhmm"],
+        sleep_duration_min=card["sleep_duration_min"],
+        time_app=card["time_app"],
+        coverage=card["coverage"],
+        persona=card["persona"],
+        etl_watermark=card["etl_watermark"],
+        etl_watermark_ms=card["etl_watermark_ms"],
+        data_as_of=card["data_as_of"],
+        data_as_of_ms=card["data_as_of_ms"],
+        data_as_of_source=card["data_as_of_source"],
+        location_as_of=card["location_as_of"],
+        location_as_of_ms=card["location_as_of_ms"],
+        data_age_min=card["data_age_min"],
+        day_window_closed=card["day_window_closed"],
+        current_known=card["current_known"],
+        compact_sections=card["compact_sections"],
+        compact=card["compact"],
+        compact_chars=card["compact_chars"],
+        compact_lines=card["compact_lines"],
+        compact_omitted=card["compact_omitted"],
+        card_fp=card["card_fp"],
+    )
 
 
 @tool
-
 def langTrack_stats(day: str = "") -> dict:
-
     """读取某天（默认今天）的手机使用数据画像：屏幕时长、App 排行、通知、睡眠信号、场景。
 
 
 
     数据来自 langTrack 采集链路（weiCheckApp 手机端 → /ingest → ETL 事实表）。
 
-    返回结构化信号供日报交叉分析；无数据时 available=False。
+    返回结构化信号（含数据水位、当前已知地点、当日停留/移动/异常、compact 事实卡）
+
+    供日报交叉分析；无数据时 available=False。
+
+    注意：available 仅表示当日有 daily_stats；has_facts 才表示是否有可用当日事实。
 
     """
 
@@ -199,146 +339,20 @@ def langTrack_stats(day: str = "") -> dict:
     db = _db_path()
 
     if not db.exists():
-        return LangTrackDayStats(day=day, available=False, screen_ms=0, screen_hours=0.0,
-                                top_apps=[], notification_count=0, notification_clicked=0,
-                                unlock_count=0, switch_count=0, location_count=0,
-                                places=[], sleep_signal="langTrack 数据库不存在",
-                                sleep_start_hhmm=None, sleep_end_hhmm=None,
-                                sleep_duration_min=None, time_app=[],
-                                coverage=[], persona={})
+        return _unavailable(day, "langTrack 数据库不存在")
 
 
+    conn = None
     try:
-
         conn = sqlite3.connect(db)
-
+        # 健康探测：损坏库在此报错（避免把噪音交给 fact_card）
+        conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
         conn.row_factory = sqlite3.Row
-
-        stat = conn.execute(
-
-            "SELECT * FROM daily_stats WHERE day=?", (day,)
-
-        ).fetchone()
-
-        if not stat:
+        card = build_fact_card(conn=conn, day=day, detail="full", outlet="tool")
+    except Exception as e:  # noqa: BLE001 - 工具错误路径：返回失败不抛
+        return _unavailable(day, f"读取失败: {e}")
+    finally:
+        if conn is not None:
             conn.close()
-            return LangTrackDayStats(day=day, available=False, screen_ms=0, screen_hours=0.0,
-                                    top_apps=[], notification_count=0, notification_clicked=0,
-                                    unlock_count=0, switch_count=0, location_count=0,
-                                    places=[], sleep_signal="当日无数据（可能未采集或未同步）",
-                                    sleep_start_hhmm=None, sleep_end_hhmm=None,
-                                    sleep_duration_min=None, time_app=[],
-                                    coverage=[], persona={})
 
-
-        ranking = json.loads(stat["app_ranking_json"] or "[]")
-
-        places = conn.execute(
-
-            "SELECT label, visit_count FROM places ORDER BY visit_count DESC LIMIT 4"
-
-        ).fetchall()
-
-
-
-        # 睡眠信号：凌晨 00-05 点环境音频样本数（粗略，沿用 report.py 逻辑）
-
-        midnight_audio = conn.execute(
-
-            "SELECT COUNT(*) c FROM events WHERE type='audio_env' "
-
-            "AND date(ts/1000,'unixepoch','+8 hours')=? "
-
-            "AND strftime('%H', ts/1000,'unixepoch','+8 hours') BETWEEN '00' AND '05'",
-
-            (day,),
-
-        ).fetchone()["c"]
-
-        sleep_signal = "凌晨 00-05 点仍有环境音频样本，疑似熬夜" if midnight_audio > 5 else "未见熬夜信号"
-
-        # A① 契约覆盖：取非 ok 的类型（缺失/停滞/未登记），供日报输出采集缺口
-        coverage: list[dict] = []
-        try:
-            cov_rows = conn.execute(
-                "SELECT type, desc, status, last_seen_ts, consumed FROM contract_coverage "
-                "WHERE status != 'ok' ORDER BY status, type"
-            ).fetchall()
-            coverage = [
-                {
-                    "type": r["type"],
-                    "desc": r["desc"],
-                    "status": r["status"],
-                    "last_seen": r["last_seen_ts"],
-                    "consumed": r["consumed"],
-                }
-                for r in cov_rows
-            ]
-        except sqlite3.OperationalError:
-            # contract_coverage 表尚未建立（旧库未重跑 ETL）时不阻塞
-            coverage = []
-
-        # P0 时段×应用矩阵：daily_stats.time_app_json（TEXT JSON）解析为 list；
-        # 旧库未跑 P0 派生（无该列）或值为空 → []
-        _time_app = []
-        _raw_ta = _row_val(stat, "time_app_json")
-        if _raw_ta:
-            try:
-                _time_app = json.loads(_raw_ta)
-            except (TypeError, ValueError):
-                _time_app = []
-        if not isinstance(_time_app, list):
-            _time_app = []
-
-        conn.close()
-
-        return LangTrackDayStats(
-            day=day,
-
-            available=True,
-
-            screen_ms=stat["total_screen_ms"],
-
-            screen_hours=round(stat["total_screen_ms"] / 3600000, 2),
-
-            top_apps=ranking[:8],
-
-            notification_count=stat["notification_count"],
-
-            notification_clicked=stat["notification_clicked"],
-
-            unlock_count=stat["unlock_count"],
-
-            switch_count=stat["switch_count"],
-
-            location_count=stat["location_count"],
-
-            places=[{"label": p["label"], "visits": p["visit_count"]} for p in places],
-
-            sleep_signal=sleep_signal,
-
-            sleep_start_hhmm=_row_val(stat, "sleep_start_hhmm"),
-            sleep_end_hhmm=_row_val(stat, "sleep_end_hhmm"),
-            sleep_duration_min=_row_val(stat, "sleep_duration_min"),
-            time_app=_time_app,
-
-            coverage=coverage,
-            persona=build_persona(db_path=str(db), days=7),
-
-        )
-
-    except Exception as e:  # noqa: BLE001
-
-        logger.warning("langTrack_stats failed", error_type=type(e).__name__, error=str(e))
-
-        return LangTrackDayStats(day=day, available=False, screen_ms=0, screen_hours=0.0,
-
-                                top_apps=[], notification_count=0, notification_clicked=0,
-
-                                unlock_count=0, switch_count=0, location_count=0,
-
-                                places=[], sleep_signal=f"读取失败: {e}",
-                                sleep_start_hhmm=None, sleep_end_hhmm=None,
-                                sleep_duration_min=None, time_app=[],
-                                coverage=[], persona={})
-
+    return _map_card_to_stats(card, day)

@@ -617,8 +617,9 @@ def _fill_card(
 
     card["has_facts"] = bool(card["available"]) or bool(stay_briefs) or bool(trip_briefs)
 
-    # 凌晨音频：仅 full 模式扫 events（注入路径不扫）
-    if detail == "full":
+    # 凌晨音频：仅 full 模式扫 events（注入路径不扫）；
+    # 无 daily_stats 时保持"当日无 daily_stats"，不因 0 样本误报"未见熬夜信号"
+    if detail == "full" and card.get("available"):
         if dev is not None:
             try:
                 n = conn.execute(
