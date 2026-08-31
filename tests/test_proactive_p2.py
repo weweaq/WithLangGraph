@@ -237,7 +237,7 @@ class TestBuildPromptEmotion:
         prompt = proactive.build_proactive_prompt(self._job(), "u1", _dt(2026, 8, 28, 8))
         nums = self._constraint_numbers(prompt)
         assert nums == list(range(1, len(nums) + 1))
-        assert len(nums) == 4  # base 3 + closing "proactive greeting" note
+        assert len(nums) == 5  # base 3 + closing "proactive greeting" note + fact-card rule
 
     def test_constraint_numbers_continuous_emotion_only(self) -> None:
         prompt = proactive.build_proactive_prompt(
@@ -245,16 +245,34 @@ class TestBuildPromptEmotion:
         )
         nums = self._constraint_numbers(prompt)
         assert nums == list(range(1, len(nums) + 1))
-        assert len(nums) == 5
+        assert len(nums) == 6
 
     def test_constraint_numbers_continuous_topic_and_emotion(self) -> None:
-        # Worst case: both optional constraints present — numbering must stay 1..6.
+        # Worst case: both optional constraints present — numbering must stay 1..7.
         prompt = proactive.build_proactive_prompt(
             self._job(), "u1", _dt(2026, 8, 28, 8), topic="上次方案", emotion="down"
         )
         nums = self._constraint_numbers(prompt)
         assert nums == list(range(1, len(nums) + 1))
+        assert len(nums) == 7
+
+    def test_constraint_numbers_continuous_topic_only(self) -> None:
+        # Topic-only path keeps continuous numbering 1..6 (base 3 + topic + greeting + fact-card).
+        prompt = proactive.build_proactive_prompt(
+            self._job(), "u1", _dt(2026, 8, 28, 8), topic="上次方案"
+        )
+        nums = self._constraint_numbers(prompt)
+        assert nums == list(range(1, len(nums) + 1))
         assert len(nums) == 6
+
+    def test_fact_card_rule_appended_last(self) -> None:
+        """The fact-card constraint must always be the final numbered line of the prompt."""
+        prompt = proactive.build_proactive_prompt(self._job(), "u1", _dt(2026, 8, 28, 8))
+        lines = [ln.strip() for ln in prompt.splitlines() if ln.strip() and ln.strip()[0].isdigit()]
+        last = lines[-1]
+        assert "生活事实" in last
+        assert "system prompt 注入" in last
+        assert "禁止逐行复述" in last
 
     @staticmethod
     def _constraint_numbers(prompt: str) -> list[int]:

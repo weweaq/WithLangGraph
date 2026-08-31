@@ -1028,6 +1028,11 @@ def build_proactive_prompt(
     constraints.append(
         f"{len(constraints) + 1}. 本条为主动问候，不计入用户事实，不得据此沉淀用户画像/作息。"
     )
+    constraints.append(
+        f"{len(constraints) + 1}. 生活事实（今日记忆）已在 system prompt 注入：只在当前问题自然相关时"
+        "至多引用其中一项；禁止逐行复述、禁止把卡片内容当作用户亲口说出的话、"
+        "禁止输出坐标、经纬度或完整停留清单。"
+    )
 
     return (
         "目标：主动给主人发一条 QQ 私聊消息（≤200字，韩立口吻，克制不啰嗦）。\n"
