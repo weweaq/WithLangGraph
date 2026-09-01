@@ -454,6 +454,42 @@ class TestDailyQuality:
         lm.build_location_shadow(v1_db)
         assert self._quality(v1_db) == first
 
+    def test_shadow_creates_quality_table_on_old_db(self, v1_db, shadow_env):
+        """P1 回归：Task 6 前的旧库（无 daily_location_quality 表）跑 shadow 幂等补建不崩溃。"""
+        conn = sqlite3.connect(v1_db)
+        conn.execute("DROP TABLE daily_location_quality")
+        conn.commit()
+        conn.close()
+
+        lm.build_location_shadow(v1_db)
+
+        q = self._quality(v1_db)
+        assert q[("2026-08-17", "dev1")]["points_total"] == 25
+
+    def test_incremental_quality_merges_new_events(self, v1_db, shadow_env, monkeypatch):
+        """增量模式：load_events 为全量，受影响日质量行合并新旧点（无 stale/漏计）。"""
+        from gacore.langTrack import label_places
+        monkeypatch.setattr(
+            label_places, "CONFIG_PATH", Path(v1_db).parent / "none.json"
+        )
+        etl.run(v1_db, run_geocode=False, run_route=False, run_poi=False)
+        before = self._quality(v1_db)
+        assert before[("2026-08-17", "dev1")]["points_total"] == 25
+
+        conn = sqlite3.connect(v1_db)
+        _ins_loc(conn.cursor(), "dev1", BASE + 30_000_000, *HOME, acc=20, idx=[1000])
+        conn.commit()
+        conn.close()
+
+        etl.run(v1_db, incremental=True, run_geocode=False, run_route=False, run_poi=False)
+
+        after = self._quality(v1_db)
+        # 08-17 行含新增点（全量重算，非仅增量事件）
+        assert after[("2026-08-17", "dev1")]["points_total"] == 26
+        # 其余日不残留错误行：全量行集 upsert，与首跑一致；无新增键
+        assert set(after) == set(before)
+        assert after[("2026-08-19", "dev1")] == before[("2026-08-19", "dev1")]
+
     def test_v1_run_writes_quality_and_trips_coord_columns(
         self, v1_db, shadow_env, monkeypatch
     ):
@@ -481,3 +517,50 @@ class TestDailyQuality:
         # 连跑两次幂等（审计列外一致）
         etl.run(v1_db, run_geocode=False, run_route=False, run_poi=False)
         assert self._quality(v1_db) == q
+
+
+class TestShadowAccuracyFilter:
+    """§3.1：shadow 几何构建走精度过滤（与 v1 geom_points 同口径），
+    point_count / stay accuracy 统计保持原始点（§2.3：point_count 为
+    成员网格内原始 location 点数，不等于参与 stay 判定的点数）。"""
+
+    def test_geometry_filtered_counts_raw(self, tmp_path, monkeypatch):
+        from gacore.langTrack import etl_config
+
+        cfg = json.loads(json.dumps(etl_config.DEFAULTS))
+        cfg["location"]["apply_accuracy_filter"] = True
+        cfg["location"]["max_accuracy_m"] = 30.0
+        monkeypatch.setattr(etl_config, "load_etl_config", lambda: cfg)
+        monkeypatch.setattr(
+            etl_config, "load_coord_systems",
+            lambda: {"default": "unknown", "periods": []},
+        )
+
+        path = tmp_path / "acc.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(storage._SCHEMA)
+        conn.executescript(etl._SCHEMA)
+        cur = conn.cursor()
+        idx = [1]
+        # home 停驻 8 点 @10min，其中第 5 点 acc=500 超阈值（过滤只影响几何）
+        for k in range(8):
+            acc = 500 if k == 4 else 20
+            _ins_loc(cur, "dev1", BASE + k * 600_000, *HOME, acc=acc, idx=idx)
+        conn.commit()
+        conn.close()
+
+        lm.build_location_shadow(path)
+
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        stays = list(conn.execute("SELECT * FROM shadow_stays_v2"))
+        places = list(conn.execute("SELECT * FROM shadow_places_v2"))
+        conn.close()
+
+        assert len(stays) == 1
+        assert stays[0]["n_points"] == 7                # 几何输入：过滤后 7 点
+        assert stays[0]["accuracy_known_points"] == 8   # 统计口径：窗口内原始 8 点
+        assert stays[0]["avg_accuracy_m"] == 80.0       # (20*7+500)/8
+        assert len(places) == 1
+        assert places[0]["point_count"] == 8            # §2.3 原始点数
+        assert places[0]["visit_count"] == 1

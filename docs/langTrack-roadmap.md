@@ -2166,19 +2166,24 @@ subagent 独立复审提交 c97d2d5 + 工作区索引修复：无 P1 级正确�
 
 ### 已完成
 1. **`src/gacore/langTrack/location_facts.py`（修改）**：`location_points`（events→LocationPoint 全链路唯一解析入口，按 (device,ts) 排序）、`accuracy_filter`（§3.1 仅作用于几何构建输入；默认 `apply_accuracy_filter=False` 只观测，开启时仅过滤已知且超阈值的点，缺 accuracy 按 `accept_missing_accuracy` 配置）、`daily_quality_rows`（§3.2 按 (day,device_id) 聚合：总数/有效数/精度三档/半小时格数/中位采样间隔/提供者分布，直接产出表行）；`to_amap_coord`/`wgs84_to_gcj02`（境外坐标不转换 guard）。
-2. **`src/gacore/langTrack/etl.py`（修改）**：`daily_location_quality` 表（PRIMARY KEY(day,device_id)，v1/v2 共表只读聚合）；trips 新增 `endpoint_coord_system`（NOT NULL DEFAULT 'unknown'）与 `polyline_coord_system` 两列 + `_migrate_trips_coord_columns` 旧库 ALTER 迁移；`_write_daily_quality` 幂等写入（增量只重建 affected days，全量 DELETE 重建，UPSERT 刷新 updated_at）；`_build_location_v1` 集成——入口 `load_coord_systems()` 配置错误直接拒绝 ETL，质量统计全量观测（不过滤），`build_stays/build_places` 输入改 geom_points（精度过滤后），`build_trips` 阈值从 etl_config trips 节点读取，trips 落库写两列（endpoint=resolve 的 source 坐标制、polyline 有缓存时标 'gcj02'）。
+2. **`src/gacore/langTrack/etl.py`（修改）**：`daily_location_quality` 表（PRIMARY KEY(day,device_id)，v1/v2 共表只读聚合；DDL 独立为 `_DAILY_QUALITY_DDL` 常量并嵌入 `_SCHEMA`，`_write_daily_quality` 写入前幂等补建——修复旧库跑 `--location-shadow` 崩溃）；trips 新增 `endpoint_coord_system`（NOT NULL DEFAULT 'unknown'）与 `polyline_coord_system` 两列 + `_migrate_trips_coord_columns` 旧库 ALTER 迁移；`_write_daily_quality` 幂等写入（增量只重建 affected days，全量 DELETE 重建，UPSERT 刷新 updated_at；`load_events` 为全量、行集覆盖全部 (day,device)，无 stale 行）；`_build_location_v1` 集成——入口 `load_coord_systems()` 配置错误直接拒绝 ETL，质量统计全量观测（不过滤），`build_stays/build_places` 输入改 geom_points（精度过滤后），`build_trips` 阈值从 etl_config trips 节点读取，trips 落库写两列（endpoint=resolve 的 source 坐标制、polyline 有缓存时标 'gcj02'）。
 3. **`src/gacore/langTrack/routes.py`（修改）**：`build_trips` 输入改 LocationPoint 列表、三个阈值（min_duration_ms/min_dist_m/max_infer_gap_ms）真正使用传入参数不再引用模块常量；`direction_polyline` 新增 coord_system 参数（起终点经 to_amap_coord 转换，unknown 模块级警告一次）；`incremental_encode_trips` 按 (device_id,start_ts) 逐段解析坐标制、成功补路同步标记 `polyline_coord_system='gcj02'`、坐标制配置错误拒绝本次补路（零请求）、失败段不标记留待重试；`encode_belt_pois` 网格坐标来自高德 polyline 量化，固定按 source="gcj02" 放行（禁止二次 WGS84→GCJ02 偏移）。
 4. **`src/gacore/langTrack/geocode.py`（修改）**：`_to_amap` 入口统一转换 + unknown 模块级警告一次；`_regeo_one/_regeo_request/batch_reverse_geocode/reverse_geocode/around_search` 全部新增 coord_system 参数；`incremental_encode` 每点按 (device_id,first_seen) 解析坐标制、按坐标制分组批量编码（混合来源不共用一个转换参数）、配置错误拒绝编码；`enrich_business_area` 逐点解析坐标制。
 5. **`src/gacore/langTrack/label_places.py`（修改）**：`confirm()` 交互确认的 reverse_geocode 按 (device_id,first_seen) 解析坐标制后转换，配置错误拒绝进入交互确认。
-6. **`src/gacore/langTrack/location_migration.py`（修改）**：shadow 管线共用 `location_points` 单一解析（替换原重复解析循环）；`_write_daily_quality` 共表写入（全量重建，不触碰位置事实表，与 shadow 只读承诺不冲突）。
-7. **测试（+37 用例）**：`test_langTrack_geocode.py`（新建 10：regeo/around URL 坐标转换、unknown 警告一次、incremental 按坐标制分组+配置错误拒绝、enrich 逐点解析）；`test_langTrack_routes.py`（新建 15：build_trips 基础/推断/超长 gap 跳过/双阈值参数/设备隔离，direction URL 转换与警告，补路标记 gcj02/按设备解析/配置错误零请求/失败不标记，belt POI gcj02 原样放行）；`test_langTrack_location_facts.py`（39→48：location_points/accuracy_filter/daily_quality_rows 语义）；`test_langTrack_etl_location.py`（12→15：TestDailyQuality——shadow 与 v1 管线共表写入、跨午夜按自然日拆行、语义列精确断言、双跑幂等、v1 trips 坐标制两列）。
+6. **`src/gacore/langTrack/location_migration.py`（修改）**：shadow 管线共用 `location_points` 单一解析（替换原重复解析循环）；`build_stays/build_trips` 几何输入改 `geom_points`（§3.1 精度过滤后，与 v1 `_build_location_v1` 同口径），`point_count`/stay accuracy 统计保持原始点（§2.3：point_count 为成员网格内原始 location 点数，不等于参与 stay 判定的点数）；`_write_daily_quality` 共表写入（全量重建，不触碰位置事实表，与 shadow 只读承诺不冲突）。
+7. **测试（+40 用例）**：`test_langTrack_geocode.py`（新建 10：regeo/around URL 坐标转换、unknown 警告一次、incremental 按坐标制分组+配置错误拒绝、enrich 逐点解析）；`test_langTrack_routes.py`（新建 15：build_trips 基础/推断/超长 gap 跳过/双阈值参数/设备隔离，direction URL 转换与警告，补路标记 gcj02/按设备解析/配置错误零请求/失败不标记，belt POI gcj02 原样放行）；`test_langTrack_location_facts.py`（39→48：location_points/accuracy_filter/daily_quality_rows 语义）；`test_langTrack_etl_location.py`（12→18：TestDailyQuality——shadow 与 v1 管线共表写入、跨午夜按自然日拆行、语义列精确断言、双跑幂等、v1 trips 坐标制两列；review-loop 三项回归——旧库 DROP 质量表后跑 shadow 幂等补建不崩溃、增量质量行合并新事件无 stale、shadow 几何过滤 vs 原始统计口径分离）。
+
+### review-loop 处置（subagent 审核）
+- **P1 旧库 shadow 崩溃**：`build_location_shadow` 自建连接只执行 `_shadow_ddl()`/`SCHEMA_V2`，均不含质量表；Task 6 前的旧库跑 `--location-shadow` 在 `_write_daily_quality` 处 no such table 崩溃（测试夹具先跑 `etl._SCHEMA` 掩盖了该路径）。修复：DDL 提取为 `_DAILY_QUALITY_DDL` 常量，`_write_daily_quality` 写入前幂等补建；回归测试 DROP 表后跑 shadow。
+- **P2 shadow 几何未过滤精度**：v1 管线几何输入为 `geom_points`（§3.1 过滤后），shadow 仍用全量 `all_points`，用户开启 `apply_accuracy_filter=True` 后两者口径分叉。修复：shadow `build_stays/build_trips` 改用 `geom_points`；统计列保持原始点（§2.3 明确 point_count 为原始点数）。测试锁定：单段停留 n_points=7（过滤后）vs point_count=8（原始）、accuracy_known_points=8/avg=80.0（窗口内原始点）。
+- **增量质量行 stale 疑虑（核实非缺陷）**：增量模式 DELETE 仅 affected days，但 `load_events` 为全量、`daily_quality_rows` 产全量行集，UPSERT 覆盖全部 (day,device) 键，无残留；补测试锁定语义（追加事件后受影响日 25→26 合并、未受影响日与首跑一致、无新增键）。
 
 ### 验证（维护测试日志）
-- langTrack 组：`pytest tests -k langTrack` **342 passed**（Task 5 review 后 305 + 37 新增）。
+- langTrack 组：`pytest tests -k langTrack` **345 passed**（Task 5 review 后 305 + 40 新增；其中 37 为主体用例、3 为 review-loop 回归）。
 - 坐标语义抽查：geocode/routes 测试断言最终 HTTP 请求 URL 中的 location/origin/destination 坐标（wgs84→GCJ02 转换值、gcj02/unknown 原样、belt POI 网格坐标原样）。
-- ruff：净新增 0——本次触及文件发现 28 项全为 HEAD 存量（同文件基线 28 项），首跑引入的 3 处 I001（etl.py 新导入块 + 两个新测试文件）已修复清零。
+- ruff：触及文件净新增 0（etl.py/routes.py/geocode.py 各 12/6/8 项与父提交基线逐项一致，仅行号平移；location_facts/location_migration/label_places 及全部测试文件 clean）。
 - 真实库策略：首版保持 `apply_accuracy_filter=False` 只观测（etl_config DEFAULTS），provider/accuracy/coverage 分布待 dashboard 实测后由用户确认开启。
 
 ### 待办更新
-- [x] Task 6：坐标质量与完整高德坐标边界（daily_location_quality + to_amap_coord 全入口 + trips 坐标制两列 + build_trips 参数化 + 37 用例）。
+- [x] Task 6：坐标质量与完整高德坐标边界（daily_location_quality + to_amap_coord 全入口 + trips 坐标制两列 + build_trips 参数化 + 40 用例，含 review-loop 回归 3 项）。
 - [ ] Task 7：迁移 FactCard 与 tool 兼容契约。

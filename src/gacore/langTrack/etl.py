@@ -159,8 +159,31 @@ OWN_PACKAGES = {"com.wei.checkapp"}
 ETL_VERSION = "1.0.0"
 
 
+# Task 6 §3.2 坐标质量日表 DDL（只读聚合，v1/v2 共用；ETL 幂等重建）。
+# 独立成常量：_write_daily_quality 写入前幂等补建——build_location_shadow 等
+# 自建连接的库可能未执行过 etl._SCHEMA（P1 修复：旧库跑 --location-shadow 崩溃）。
+_DAILY_QUALITY_DDL = """
+-- Task 6 §3.2 坐标质量日表（只读聚合，v1/v2 共用；ETL 幂等重建）
+CREATE TABLE IF NOT EXISTS daily_location_quality (
+  day TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  points_total INTEGER NOT NULL,
+  points_valid INTEGER NOT NULL,
+  accuracy_known INTEGER NOT NULL,
+  accuracy_le_50 INTEGER NOT NULL,
+  accuracy_51_150 INTEGER NOT NULL,
+  accuracy_gt_150 INTEGER NOT NULL,
+  observed_half_hour_bins INTEGER NOT NULL,
+  median_interval_sec REAL,
+  providers_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now','+8 hours')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now','+8 hours')),
+  PRIMARY KEY(day, device_id)
+);
+"""
 
-_SCHEMA = """
+
+_SCHEMA = f"""
 
 CREATE TABLE IF NOT EXISTS sessions (
 
@@ -489,23 +512,7 @@ CREATE TABLE IF NOT EXISTS grid_pois (
   PRIMARY KEY(grid_lat, grid_lon)
 );
 
--- Task 6 §3.2 坐标质量日表（只读聚合，v1/v2 共用；ETL 幂等重建）
-CREATE TABLE IF NOT EXISTS daily_location_quality (
-  day TEXT NOT NULL,
-  device_id TEXT NOT NULL,
-  points_total INTEGER NOT NULL,
-  points_valid INTEGER NOT NULL,
-  accuracy_known INTEGER NOT NULL,
-  accuracy_le_50 INTEGER NOT NULL,
-  accuracy_51_150 INTEGER NOT NULL,
-  accuracy_gt_150 INTEGER NOT NULL,
-  observed_half_hour_bins INTEGER NOT NULL,
-  median_interval_sec REAL,
-  providers_json TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now','+8 hours')),
-  updated_at TEXT NOT NULL DEFAULT (datetime('now','+8 hours')),
-  PRIMARY KEY(day, device_id)
-);
+{_DAILY_QUALITY_DDL}
 
 -- B5 ETL 运行血缘：每次 ETL 运行一条记录
 CREATE TABLE IF NOT EXISTS etl_runs (
@@ -2099,8 +2106,10 @@ def _write_daily_quality(
     """§3.2 坐标质量日表幂等写入：增量只重建 affected days，全量 DELETE 重建。
 
     rows 为 location_facts.daily_quality_rows 产物（v1/v2 管线共用本入口，
-    表名固定不随 user_version 切换）。
+    表名固定不随 user_version 切换）。写入前幂等补建表——shadow 等自建连接
+    的路径可能未执行过 etl._SCHEMA（P1：旧库跑 --location-shadow 崩溃）。
     """
+    conn.executescript(_DAILY_QUALITY_DDL)
     if incremental_active:
         ph = ",".join("?" * len(affected_days))
         conn.execute(f"DELETE FROM daily_location_quality WHERE day IN ({ph})", list(affected_days))
