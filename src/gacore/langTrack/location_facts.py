@@ -1,4 +1,4 @@
-"""location_facts.py —— 位置智能 canonical 纯算法层（零 DB / 文件 / 网络访问）。
+﻿"""location_facts.py —— 位置智能 canonical 纯算法层（零 DB / 文件 / 网络访问）。
 
 本模块只负责“给定规范化坐标点 / 停留段，算出客观事实”，不触碰任何外部 IO：
 
@@ -133,7 +133,7 @@ def parse_location_point(
 # 基础几何工具
 # ---------------------------------------------------------------------------
 
-def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Haversine 球面距离（米）。"""
     r = 6371008.8
     p1, p2 = math.radians(lat1), math.radians(lat2)
@@ -285,14 +285,14 @@ def cluster_stays(stays: Iterable[StayInput]) -> list[PlaceCluster]:
         for i, cl in enumerate(clusters):
             if cl["device_id"] != seed["device_id"]:
                 continue
-            d_center = _haversine_m(cl["lat"], cl["lon"], seed["lat"], seed["lon"])
+            d_center = haversine_m(cl["lat"], cl["lon"], seed["lat"], seed["lon"])
             if d_center > CLUSTER_CENTER_MAX_M:
                 continue
             # 试加入后 spread 校验
             merged_stays = list(cl["stays"]) + seed["stays"]
             mlat, mlon = _weighted_center(merged_stays)
             spread = max(
-                _haversine_m(mlat, mlon, st.center_lat, st.center_lon)
+                haversine_m(mlat, mlon, st.center_lat, st.center_lon)
                 for st in merged_stays
             )
             if spread > CLUSTER_SPREAD_MAX_M:
@@ -323,7 +323,7 @@ def cluster_stays(stays: Iterable[StayInput]) -> list[PlaceCluster]:
         member_keys = tuple(sorted(cl["member_keys"]))
         clat, clon = cl["lat"], cl["lon"]
         radius = round(
-            max(_haversine_m(clat, clon, st.center_lat, st.center_lon) for st in cl["stays"]),
+            max(haversine_m(clat, clon, st.center_lat, st.center_lon) for st in cl["stays"]),
             1,
         )
         out.append(
@@ -396,9 +396,12 @@ class OldPlace(NamedTuple):
     address: str | None
     matched_level: str | None
     grid_keys: tuple[str, ...] = ()  # 旧 place 的成员网格（无则 [grid_key]）
+    # 附加 geocode 派生列（缓存迁移载荷；matching 逻辑不读）。NamedTuple 只读共享默认值，
+    # 消费方 _decide_labels_and_cache 仅整体透传，不做就地修改。
+    geocode: dict = {}  # noqa: RUF012
 
 
-def _jaccard(a: set, b: set) -> float:
+def jaccard(a: set, b: set) -> float:
     if not a and not b:
         return 0.0
     return len(a & b) / len(a | b)
@@ -434,8 +437,8 @@ def match_old_new(
             if n["device_id"] != o.device_id:
                 continue
             n_keys = set(n.get("member_grid_keys", [n["grid_key"]]))
-            jac = _jaccard(o_keys, n_keys)
-            dist = _haversine_m(o.lat, o.lon, n["lat"], n["lon"])
+            jac = jaccard(o_keys, n_keys)
+            dist = haversine_m(o.lat, o.lon, n["lat"], n["lon"])
             if jac >= MATCH_JACCARD_MIN or dist <= MATCH_CENTER_DIST_MAX_M:
                 edges.append(
                     {

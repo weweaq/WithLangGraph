@@ -21,8 +21,14 @@
 
 from __future__ import annotations
 
+import datetime
+import hashlib
+import json
 import sqlite3
 from pathlib import Path
+
+# 迁移编排默认标签文件路径（与 label_places.CONFIG_PATH 同源）。
+DEFAULT_LABELS_PATH = Path(__file__).resolve().parents[3] / "data" / "place_labels.json"
 
 # ---------------------------------------------------------------------------
 # 表清单
@@ -84,6 +90,12 @@ MIGRATION_STATE_STATUSES: tuple[str, ...] = (
 
 class LocationMigrationError(RuntimeError):
     """位置迁移流程错误（校验失败 / 事务异常），不会静默吞掉。"""
+
+
+def new_run_id() -> str:
+    """东八区时间戳 run_id（审计行与 failed 表快照名共用）。"""
+    now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+    return now.strftime("%Y%m%d_%H%M%S")
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +484,20 @@ def activate_location_v2(
     if missing:
         raise LocationMigrationError("missing v2 tables: " + ", ".join(missing))
 
+    # Task 4：未解决的阻断性迁移 issue（如 v1 标签多设备歧义）禁止切换
+    if "location_migration_issues" in names:
+        placeholders = ",".join("?" for _ in BLOCKING_ISSUE_KINDS)
+        n_blocking = conn.execute(
+            f"SELECT COUNT(*) FROM location_migration_issues "
+            f"WHERE kind IN ({placeholders}) AND resolution_status='open'",
+            BLOCKING_ISSUE_KINDS,
+        ).fetchone()[0]
+        if n_blocking:
+            raise LocationMigrationError(
+                f"blocking label migration issues: {n_blocking} open "
+                f"({','.join(BLOCKING_ISSUE_KINDS)}) — resolve before activate"
+            )
+
     conn.execute("BEGIN IMMEDIATE")
     try:
         # 1) 备份旧表
@@ -823,5 +849,517 @@ def build_location_shadow(
             f"stays={len(stay_rows)} trips={len(trip_rows)}"
         )
         return len(stay_rows)
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Task 4：迁移稳定 ID、人工 tag 与 geocode 缓存（§2.4 步骤 3-6 / §2.5）
+# ---------------------------------------------------------------------------
+
+# 旧 places → places_v2 可迁移的 geocode 派生字段（§2.5；label/user_tag 除外）。
+GEOCODE_FIELDS: tuple[str, ...] = (
+    "address", "poi", "district", "township", "business_area", "poi_type",
+    "poi_l1", "poi_l2", "poi_l3", "poi_signal", "poi_fallback",
+    "matched_level", "behavior", "geocoded_at",
+)
+
+# 阻断 activate 的 issue 种类（resolution_status=open 时）。
+BLOCKING_ISSUE_KINDS: tuple[str, ...] = ("multi_device_ambiguity",)
+
+
+def _legacy_place_id(device_id: str, grid_key: str) -> str:
+    """§2.4 步骤 3：旧 (device_id,grid_key) 的 legacy place ID。"""
+    return hashlib.sha1(f"{device_id}|legacy|{grid_key}".encode()).hexdigest()[:16]
+
+
+def _load_old_places(conn: sqlite3.Connection) -> list:
+    """v1 places 表 → OldPlace 列表（含 geocode 字段，供 matching 与缓存迁移）。"""
+    from gacore.langTrack.location_facts import OldPlace
+
+    cols = ",".join(("device_id", "grid_key", "lat", "lon", "label", *GEOCODE_FIELDS))
+    out = []
+    for r in conn.execute(f"SELECT {cols} FROM places"):
+        row = dict(zip(("device_id", "grid_key", "lat", "lon", "label", *GEOCODE_FIELDS), r))
+        out.append(
+            OldPlace(
+                device_id=row["device_id"],
+                place_id=_legacy_place_id(row["device_id"], row["grid_key"]),
+                grid_key=row["grid_key"],
+                lat=row["lat"],
+                lon=row["lon"],
+                label=row["label"] or "未知",
+                poi=row["poi"],
+                address=row["address"],
+                matched_level=row["matched_level"],
+                grid_keys=(row["grid_key"],),
+                geocode={k: row[k] for k in GEOCODE_FIELDS},
+            )
+        )
+    return out
+
+
+def _load_shadow_drafts(conn: sqlite3.Connection) -> list[dict]:
+    """shadow_places_v2 + shadow_place_cells_v2 → matching 输入 drafts。"""
+    drafts = []
+    for r in conn.execute(
+        "SELECT device_id, place_id, grid_key, lat, lon FROM shadow_places_v2"
+    ):
+        members = tuple(
+            gk
+            for (gk,) in conn.execute(
+                "SELECT grid_key FROM shadow_place_cells_v2 WHERE device_id=? AND place_id=?",
+                (r[0], r[1]),
+            )
+        )
+        drafts.append(
+            {
+                "device_id": r[0],
+                "place_id": r[1],
+                "grid_key": r[2],
+                "lat": r[3],
+                "lon": r[4],
+                "member_grid_keys": members,
+            }
+        )
+    return drafts
+
+
+def _decide_labels_and_cache(
+    olds: list,
+    drafts: list[dict],
+    finalized: list[dict],
+    old_to_new: dict[str, str],
+    regeo_shift_m: float,
+) -> dict:
+    """纯决策（无 DB/IO）：DB 人工 tag 归属 + geocode 缓存迁移/失效。
+
+    返回 {rename, label_updates, tag_conflicts, geocode_updates,
+    geocode_reused, geocode_invalidated}。
+    """
+    from gacore.langTrack.location_facts import haversine_m
+
+    final_by_cluster = {d["place_id"]: f for d, f in zip(drafts, finalized)}
+    olds_by_cluster: dict[str, list] = {}
+    for o in olds:
+        ck = old_to_new.get(o.place_id)
+        if ck is not None:
+            olds_by_cluster.setdefault(ck, []).append(o)
+
+    rename: dict[str, str] = {}
+    for d, f in zip(drafts, finalized):
+        if d["place_id"] != f["place_id"]:
+            rename[d["place_id"]] = f["place_id"]
+
+    label_updates: list[tuple[str, str, str]] = []  # (device_id, final_id, label)
+    tag_conflicts: list[tuple] = []  # (device_id, new_place_id, old_place_id, tag, reason)
+    geocode_updates: list[tuple[str, str, dict]] = []  # (device_id, final_id, fields)
+    geocode_reused = geocode_invalidated = 0
+
+    for ck, draft in final_by_cluster.items():
+        final_id = rename.get(ck, ck)
+        device_id = draft["device_id"]
+        members = olds_by_cluster.get(ck, [])
+
+        # 人工 tag：唯一 tag 直接归属；多个不同 tag → conflict + 未知（禁止静默择一）
+        tags = sorted({o.label for o in members if o.label and o.label != "未知"})
+        if len(tags) <= 1:
+            label_updates.append((device_id, final_id, tags[0] if tags else "未知"))
+        else:
+            label_updates.append((device_id, final_id, "未知"))
+            for o in members:
+                if o.label and o.label != "未知":
+                    tag_conflicts.append(
+                        (device_id, final_id, o.place_id, o.label, "merge_conflicting_tags")
+                    )
+
+        if not members:
+            continue
+        # geocode 缓存（§2.5）：中心偏移>阈值 → 失效；单 old 需 poi/address 非空；
+        # merge 需全部偏移达标且非空 poi/address/matched_level 完全一致
+        dists = [haversine_m(o.lat, o.lon, draft["lat"], draft["lon"]) for o in members]
+        if any(d > regeo_shift_m for d in dists):
+            geocode_invalidated += 1
+            continue
+        if len(members) == 1:
+            o = members[0]
+            if o.poi or o.address:
+                geocode_updates.append((device_id, final_id, dict(o.geocode)))
+                geocode_reused += 1
+            else:
+                geocode_invalidated += 1
+        else:
+            sigs = {(o.poi or "", o.address or "", o.matched_level or "") for o in members}
+            if len(sigs) == 1 and (members[0].poi or members[0].address):
+                geocode_updates.append((device_id, final_id, dict(members[0].geocode)))
+                geocode_reused += 1
+            else:
+                geocode_invalidated += 1
+
+    return {
+        "rename": rename,
+        "label_updates": label_updates,
+        "tag_conflicts": tag_conflicts,
+        "geocode_updates": geocode_updates,
+        "geocode_reused": geocode_reused,
+        "geocode_invalidated": geocode_invalidated,
+        "final_by_cluster": final_by_cluster,
+    }
+
+
+def _map_label_file(
+    version: int,
+    rows: list[dict],
+    cells_final: dict[tuple[str, str], str],
+    shadow_final: set[tuple[str, str]],
+    now_iso: str,
+) -> tuple[list[dict], list[tuple]]:
+    """纯映射：标签文件行 → (v3 labels, issues)。
+
+    - v1 平铺：仅单设备 shadow 可自动迁移；多设备全部进 multi_device_ambiguity；
+    - v2 (device_id,grid_key)：经 place_cells 映射 place_id，无匹配进 issue；
+    - v3：place_id 仍存在于 shadow 才保留，否则进 issue。
+    issues 元素：(kind, source_payload_json, device_id, grid_key, tag)。
+    """
+    v3_labels: list[dict] = []
+    issues: list[tuple] = []
+
+    def _issue(kind: str, payload: dict, device_id=None, grid_key=None, tag=None):
+        issues.append(
+            (kind, json.dumps(payload, ensure_ascii=False, sort_keys=True), device_id, grid_key, tag)
+        )
+
+    if version == 0:
+        return v3_labels, issues
+
+    if version == 1:
+        devices = {d for d, _ in cells_final}
+        if len(devices) > 1:
+            for row in rows:
+                _issue(
+                    "multi_device_ambiguity",
+                    {"grid_key": row["grid_key"], "tag": row["tag"]},
+                    grid_key=row["grid_key"],
+                    tag=row["tag"],
+                )
+            return v3_labels, issues
+        dev = next(iter(devices)) if devices else None
+        for row in rows:
+            pid = cells_final.get((dev, row["grid_key"])) if dev else None
+            if pid is None:
+                _issue(
+                    "unmapped_tag",
+                    {"grid_key": row["grid_key"], "tag": row["tag"]},
+                    grid_key=row["grid_key"],
+                    tag=row["tag"],
+                )
+                continue
+            v3_labels.append(
+                {
+                    "device_id": dev,
+                    "place_id": pid,
+                    "anchor_grid_key": row["grid_key"],
+                    "tag": row["tag"],
+                    "updated_at": now_iso,
+                }
+            )
+        return v3_labels, issues
+
+    for row in rows:
+        if version == 2:
+            pid = cells_final.get((row["device_id"], row["grid_key"]))
+            if pid is None:
+                _issue(
+                    "unmapped_tag",
+                    {**row},
+                    device_id=row["device_id"],
+                    grid_key=row["grid_key"],
+                    tag=row["tag"],
+                )
+                continue
+            v3_labels.append(
+                {
+                    "device_id": row["device_id"],
+                    "place_id": pid,
+                    "anchor_grid_key": row["grid_key"],
+                    "tag": row["tag"],
+                    "updated_at": now_iso,
+                }
+            )
+        else:  # v3
+            if (row["device_id"], row["place_id"]) not in shadow_final:
+                _issue(
+                    "unmapped_tag",
+                    {**row},
+                    device_id=row["device_id"],
+                    grid_key=row.get("anchor_grid_key"),
+                    tag=row["tag"],
+                )
+                continue
+            v3_labels.append(row)
+
+    return v3_labels, issues
+
+
+def prepare_location_migration(
+    db_path: Path | str,
+    *,
+    labels_path: Path | str,
+    run_id: str,
+    regeo_shift_m: float = 50.0,
+) -> dict:
+    """Task 4：迁移稳定 ID、人工 tag 与 geocode 缓存（§2.4 步骤 3-6）。
+
+    前置：build_location_shadow 已运行（shadow_* 表就绪且非空）。
+    单个 BEGIN IMMEDIATE 事务内完成 DB 部分，事务外 fsync 写标签 pending：
+
+    1. 旧 places → legacy OldPlace（ID=sha1(device|legacy|grid)[:16]）；
+    2. resolve_place_ids 落定 shadow place 最终 place_id（规则 9/10/12），并同步改写
+       shadow_places/place_cells/stays/trips 全部引用；
+    3. DB 人工 tag：split 随最佳 child；merge 多个不同 tag 写 place_tag_conflicts_v2，
+       label 置未知（禁止静默择一）；
+    4. geocode 缓存（§2.5）：偏移≤regeo_shift_m 且证据满足才迁移（name_evidence=
+       legacy_cache），其余失效待重编；
+    5. 标签文件 → v3：v1 平铺仅单设备自动迁移（多设备歧义写 issues 并阻断 activate）；
+       v2 (device,grid) 经 place_cells 映射；无匹配写 issues（原始 payload 保留）；
+    6. 写 location_place_mapping / location_migration_issues / location_migration_metrics，
+       state=prepared；
+    7. 事务外写 <labels>.v3.pending（fsync）+ <labels>.v2_backup 备份，正式文件不动。
+
+    返回报告 dict（mapping/tag/conflict/geocode 计数与 pending 路径）。
+    """
+    from gacore.langTrack import label_places
+    from gacore.langTrack.location_facts import (
+        haversine_m,
+        jaccard,
+        resolve_place_ids,
+    )
+
+    db_path = Path(db_path)
+    labels_path = Path(labels_path)
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        names = _table_names(conn)
+        for t in ("places", "shadow_places_v2", "shadow_place_cells_v2"):
+            if t not in names:
+                raise LocationMigrationError(
+                    f"missing table: {t} (run build_location_shadow first)"
+                )
+        create_location_v2_tables(conn)  # 审计表 / conflicts 表幂等创建
+
+        olds = _load_old_places(conn)
+        drafts = _load_shadow_drafts(conn)
+        finalized, old_to_new, _ = resolve_place_ids(olds, drafts)
+        decision = _decide_labels_and_cache(olds, drafts, finalized, old_to_new, regeo_shift_m)
+        rename = decision["rename"]
+        final_by_cluster = decision["final_by_cluster"]
+
+        # mapping 指标（jaccard / distance 重算，供 dashboard 迁移审查）
+        mapping_rows = []
+        for o in olds:
+            ck = old_to_new.get(o.place_id)
+            if ck is None:
+                mapping_rows.append(
+                    (run_id, o.device_id, o.grid_key, o.place_id, None, "unmatched", None, None)
+                )
+                continue
+            draft = final_by_cluster[ck]
+            final_id = rename.get(ck, ck)
+            jac = jaccard({o.grid_key}, set(draft["member_grid_keys"]))
+            dist = haversine_m(o.lat, o.lon, draft["lat"], draft["lon"])
+            mapping_rows.append(
+                (
+                    run_id, o.device_id, o.grid_key, o.place_id, final_id,
+                    "matched", round(jac, 4), round(dist, 2),
+                )
+            )
+
+        # 标签文件映射（纯计算，cells_final 事务内改写后读取）
+        now_iso = label_places.now_cst()
+        version, rows = label_places.load_label_doc(labels_path)
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # a) place_id 落定改写（places/cells/stays/trips 引用一致）
+            for old_cluster, final_id in sorted(rename.items()):
+                conn.execute(
+                    "UPDATE shadow_place_cells_v2 SET place_id=? WHERE device_id=? AND place_id=?",
+                    (final_id, final_by_cluster[old_cluster]["device_id"], old_cluster),
+                )
+                conn.execute(
+                    "UPDATE shadow_places_v2 SET place_id=? WHERE device_id=? AND place_id=?",
+                    (final_id, final_by_cluster[old_cluster]["device_id"], old_cluster),
+                )
+                conn.execute(
+                    "UPDATE shadow_stays_v2 SET place_id=? WHERE device_id=? AND place_id=?",
+                    (final_id, final_by_cluster[old_cluster]["device_id"], old_cluster),
+                )
+                for col in ("from_place_id", "to_place_id"):
+                    conn.execute(
+                        f"UPDATE shadow_trips_v2 SET {col}=? WHERE device_id=? AND {col}=?",
+                        (final_id, final_by_cluster[old_cluster]["device_id"], old_cluster),
+                    )
+
+            # b) DB 人工 tag + merge conflicts
+            for device_id, final_id, label in decision["label_updates"]:
+                conn.execute(
+                    "UPDATE shadow_places_v2 SET label=? WHERE device_id=? AND place_id=?",
+                    (label, device_id, final_id),
+                )
+            conn.executemany(
+                "INSERT OR REPLACE INTO place_tag_conflicts_v2(device_id, new_place_id, "
+                "old_place_id, tag, reason) VALUES (?,?,?,?,?)",
+                decision["tag_conflicts"],
+            )
+
+            # c) geocode 缓存迁移
+            for device_id, final_id, fields in decision["geocode_updates"]:
+                sets = ", ".join(f"{k}=?" for k in GEOCODE_FIELDS)
+                conn.execute(
+                    f"UPDATE shadow_places_v2 SET {sets}, name_evidence='legacy_cache' "
+                    "WHERE device_id=? AND place_id=?",
+                    (*fields.values(), device_id, final_id),
+                )
+
+            # d) mapping / issues / metrics / state
+            conn.executemany(
+                "INSERT OR REPLACE INTO location_place_mapping(run_id, old_device_id, "
+                "old_grid_key, old_place_id, new_place_id, match_reason, jaccard, distance_m) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                mapping_rows,
+            )
+
+            cells_final = {
+                (r[0], r[1]): r[2]
+                for r in conn.execute(
+                    "SELECT device_id, grid_key, place_id FROM shadow_place_cells_v2"
+                )
+            }
+            shadow_final = {
+                (r[0], r[1])
+                for r in conn.execute("SELECT device_id, place_id FROM shadow_places_v2")
+            }
+            v3_labels, label_issues = _map_label_file(
+                version, rows, cells_final, shadow_final, now_iso
+            )
+            conn.executemany(
+                "INSERT INTO location_migration_issues(run_id, kind, source_payload, "
+                "device_id, grid_key, tag) VALUES (?,?,?,?,?,?)",
+                [(run_id, *issue) for issue in label_issues],
+            )
+
+            metrics = {
+                "old_places_total": len(olds),
+                "old_places_matched": len(old_to_new),
+                "place_id_renamed": len(rename),
+                "shadow_places_total": len(drafts),
+                "label_file_version": version,
+                "tag_total": len(rows),
+                "tag_migrated": len(v3_labels),
+                "tag_issues": len(label_issues),
+                "tag_conflicts": len(decision["tag_conflicts"]),
+                "geocode_reused": decision["geocode_reused"],
+                "geocode_invalidated": decision["geocode_invalidated"],
+                "blocked": 1 if any(i[0] in BLOCKING_ISSUE_KINDS for i in label_issues) else 0,
+            }
+            conn.executemany(
+                "INSERT OR REPLACE INTO location_migration_metrics(run_id, metric, value) "
+                "VALUES (?,?,?)",
+                [(run_id, k, v) for k, v in metrics.items()],
+            )
+            _write_state(conn, run_id, 1, "prepared")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+        # e) 事务外两阶段文件：pending + backup（正式文件不动）
+        pending = label_places.write_labels_v3_pending(labels_path, v3_labels)
+
+        report = {
+            "run_id": run_id,
+            **metrics,
+            "pending_labels_path": str(pending),
+        }
+        print(
+            f"[migration] prepare: old={len(olds)} matched={len(old_to_new)} "
+            f"renamed={len(rename)} tag={len(rows)}→{len(v3_labels)} "
+            f"issues={len(label_issues)} conflicts={len(decision['tag_conflicts'])} "
+            f"geocode reused/invalidated={decision['geocode_reused']}/{decision['geocode_invalidated']}"
+        )
+        return report
+    finally:
+        conn.close()
+
+
+def _pending_label_path(labels_path: Path, state_pending: str | None) -> Path:
+    return Path(state_pending) if state_pending else labels_path.with_name(
+        labels_path.name + ".v3.pending"
+    )
+
+
+def _finish_state_complete(conn: sqlite3.Connection, run_id: str) -> None:
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _write_state(conn, run_id, 2, "complete")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def finalize_label_swap(db_path: Path | str, *, labels_path: Path | str | None = None) -> Path:
+    """两阶段切换第二步：DB 已 COMMIT 后原子替换标签文件并写 status=complete。
+
+    仅接受 status=pending_label_swap；pending 文件缺失抛错（用
+    recover_pending_swap 走 DB 投影兜底）。返回正式标签文件路径。
+    """
+    from gacore.langTrack import label_places
+
+    db_path = Path(db_path)
+    target = Path(labels_path) if labels_path else label_places.CONFIG_PATH
+    conn = sqlite3.connect(db_path)
+    try:
+        state = read_migration_state(conn)
+        if not state or state["status"] != "pending_label_swap":
+            current = state["status"] if state else None
+            raise LocationMigrationError(f"no pending label swap (status={current!r})")
+        pending = _pending_label_path(target, state["pending_labels_path"])
+        label_places.swap_pending_labels(pending, target)
+        _finish_state_complete(conn, state["run_id"])
+        return target
+    finally:
+        conn.close()
+
+
+def recover_pending_swap(db_path: Path | str, *, labels_path: Path | str | None = None) -> str:
+    """服务启动恢复：发现 pending_label_swap 时完成标签文件切换（§2.4 步骤 13）。
+
+    - pending 文件存在 → 原子替换正式文件（"swapped"）；
+    - pending 丢失 → 从正式 places（v2）label 列投影重建标签文件（"projected"）；
+    - 无 pending 状态 → no-op（"none"）。
+    完成后均以短事务写 status=complete。
+    """
+    from gacore.langTrack import label_places
+
+    db_path = Path(db_path)
+    target = Path(labels_path) if labels_path else label_places.CONFIG_PATH
+    conn = sqlite3.connect(db_path)
+    try:
+        state = read_migration_state(conn)
+        if not state or state["status"] != "pending_label_swap":
+            return "none"
+        pending = _pending_label_path(target, state["pending_labels_path"])
+        if pending.exists():
+            label_places.swap_pending_labels(pending, target)
+            action = "swapped"
+        else:
+            rows = label_places.project_labels_v3_from_db(conn)
+            label_places.write_labels_v3_atomic(target, rows)
+            action = "projected"
+        _finish_state_complete(conn, state["run_id"])
+        print(f"[migration] label swap recovered: {action}")
+        return action
     finally:
         conn.close()

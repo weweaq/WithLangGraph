@@ -2441,11 +2441,72 @@ def main() -> None:
     parser.add_argument("--incremental", action="store_true", help="incremental rebuild from watermark")
 
     parser.add_argument("--location-shadow", action="store_true", help="构建位置事实 v2 shadow 对比表(只读,不切换生产表)")
+
+    parser.add_argument("--location-prepare", action="store_true",
+                        help="Task 4: 迁移稳定 place_id/人工 tag/geocode 缓存, 写标签 v3 pending(不切换生产表)")
+
+    parser.add_argument("--location-activate", action="store_true",
+                        help="Task 4: 事务切换 v2 正式表并原子替换标签文件(需先 --location-prepare)")
+
+    parser.add_argument("--location-rollback", action="store_true",
+                        help="Task 4: 回滚到 v1 六张业务表并恢复标签 v2 backup")
+
+    parser.add_argument("--location-recover", action="store_true",
+                        help="Task 4: 服务启动恢复 pending_label_swap(崩溃后自动补标签切换)")
     args = parser.parse_args()
 
     if args.location_shadow:
         from gacore.langTrack import location_migration
         location_migration.build_location_shadow(args.db, incremental=args.incremental)
+        return
+
+    if args.location_prepare:
+        from gacore.langTrack import location_migration
+        location_migration.prepare_location_migration(
+            args.db, labels_path=location_migration.DEFAULT_LABELS_PATH, run_id=location_migration.new_run_id()
+        )
+        return
+
+    if args.location_activate:
+        from gacore.langTrack import label_places
+        from gacore.langTrack import location_migration
+        labels_path = location_migration.DEFAULT_LABELS_PATH
+        pending = labels_path.with_name(labels_path.name + label_places.PENDING_SUFFIX)
+        conn = sqlite3.connect(args.db)
+        try:
+            location_migration.activate_location_v2(conn, location_migration.new_run_id(),
+                                                    pending_labels_path=str(pending))
+        finally:
+            conn.close()
+        location_migration.finalize_label_swap(args.db, labels_path=labels_path)
+        print("[etl] location v2 activate 完成: user_version=2, 标签文件已切换为 v3")
+        return
+
+    if args.location_rollback:
+        from gacore.langTrack import label_places
+        from gacore.langTrack import location_migration
+        run_id = location_migration.new_run_id()
+        conn = sqlite3.connect(args.db)
+        try:
+            location_migration.rollback_location_v2(conn, run_id)
+        finally:
+            conn.close()
+        # DB 已回滚到 v1：用 v2 backup 原子恢复标签文件，并删除残留 pending
+        labels_path = location_migration.DEFAULT_LABELS_PATH
+        backup = labels_path.with_name(labels_path.name + label_places.BACKUP_SUFFIX)
+        pending = labels_path.with_name(labels_path.name + label_places.PENDING_SUFFIX)
+        if backup.exists():
+            label_places.restore_labels_backup(backup, labels_path)
+        pending.unlink(missing_ok=True)
+        print("[etl] location v2 rollback 完成: user_version=1, 标签文件已恢复 v2 backup")
+        return
+
+    if args.location_recover:
+        from gacore.langTrack import location_migration
+        action = location_migration.recover_pending_swap(
+            args.db, labels_path=location_migration.DEFAULT_LABELS_PATH
+        )
+        print(f"[etl] location v2 recover: {action}")
         return
 
     if args.purge:

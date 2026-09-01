@@ -2083,4 +2083,31 @@ QQ 机器人「韩立」已有完整 agent 回路，但面对随口话（“吃�
 
 ### 待办更新
 - [x] Task 3：shadow 全量位置事实（build_location_shadow 幂等重建 + 12 用例通过）。
-- [ ] Task 4：迁移稳定 ID、人工 tag 与 geocode 缓存（label v3 两阶段切换）。
+- [x] Task 4：迁移稳定 ID、人工 tag 与 geocode 缓存（label v3 两阶段切换）——见下节。
+
+
+## 2026-09-01：位置智能增强 Task 4（迁移稳定 ID / 人工 tag / geocode 缓存，label v3 两阶段切换）
+
+### 背景
+位置智能增强计划 Task 4（§2.4 步骤 3-6、12-13 / §2.5）：在 shadow 表就绪后落定稳定 place_id（split 随最佳 child、merge 冲突禁止静默择一）、迁移 DB 人工 tag 与标签文件（v1/v2 → v3，两阶段切换 + 崩溃恢复）、迁移或失效 geocode 缓存（偏移>50m 失效待重编）。
+
+### 已完成
+1. **`src/gacore/langTrack/location_migration.py`（修改）**：
+   - `prepare_location_migration(db, labels_path, run_id, regeo_shift_m=50)`：旧 places → legacy OldPlace（sha1(device|legacy|grid)[:16]）→ `resolve_place_ids` 落定最终 place_id 并同步改写 shadow_places/place_cells/stays/trips 全部引用；DB 人工 tag 唯一归属 / 冲突写 place_tag_conflicts_v2（label 置未知）；geocode 缓存按 §2.5 决策（单旧需偏移≤50m 且 poi/address 非空；merge 需全部达标且签名完全一致，否则失效）；标签文件 → v3（v1 平铺仅单设备自动迁移，多设备歧义写 issue 并阻断 activate；v2 经 place_cells 映射；v3 透传存在的 place_id）；写 mapping/issues/metrics 审计 + state=prepared；事务外 fsync 写 `*.v3.pending` + `*.v2_backup`。
+   - `finalize_label_swap` / `recover_pending_swap`：DB COMMIT 后原子替换正式标签文件并短事务写 status=complete；recover 支持 pending 存在（swapped）/ 丢失（从正式 places label 投影重建，projected）/ 无 pending（no-op）三条路径（§2.4 步骤 13）。
+   - `activate_location_v2` 增加阻断性检查：open 状态 multi_device_ambiguity issue 存在时禁止切换（事务外先验，不触碰旧库）。
+   - 新增 `new_run_id()`（东八区时间戳）与 `DEFAULT_LABELS_PATH`。
+   - 纯决策函数 `_decide_labels_and_cache` / `_map_label_file` 无 DB/IO，决策与落库分离。
+2. **`src/gacore/langTrack/label_places.py`（修改）**：标签文件 v3 全套——`parse_label_doc`（v1 平铺 / v2 (device,grid) / v3 (device,place_id)，非法结构显式 LabelFileError）、`load_label_doc` 严格模式、`write_labels_v3_atomic`、`write_labels_v3_pending`（备份正式文件 + fsync pending）、`swap_pending_labels`、`restore_labels_backup`（rollback 恢复 v2 backup）、`project_labels_v3_from_db`（v1 表无 place_id 列拒绝投影）、`apply_labels_v3`（(device_id,place_id) 恢复人工 tag，设备隔离，anchor_grid_key 仅追溯）。旧 v1 容错接口 load_labels/save_labels/apply_labels/confirm 保留不动。
+3. **`src/gacore/langTrack/location_facts.py`（修改）**：`OldPlace` 增加 `geocode` 字段（缓存迁移载荷，matching 逻辑不读）；`haversine_m`/`jaccard` 公开（migration 决策层复用）。
+4. **`src/gacore/langTrack/etl.py`（修改）**：main() 新增 `--location-prepare` / `--location-activate`（activate + finalize 编排）/ `--location-rollback`（rollback + 恢复 v2 backup + 删残留 pending）/ `--location-recover` 四个 CLI 入口。
+5. **测试**：`tests/test_langTrack_label_places.py` 新增 21 用例（parse 三版本与非法拒绝、文件 IO 原子性、pending 备份不动正式文件、swap 消费、DB 投影拒绝 v1、apply 设备隔离、prepare→activate→finalize 全链路、崩溃恢复 swapped/projected 两分支、CLI 编排冒烟）；`tests/test_langTrack_location_migration.py` 新增 10 用例（split 旧 ID 归最佳 child、merge 同 tag 保留 / 冲突置未知+双 conflict、v1 多设备阻断 activate 与 resolved 放行、geocode 偏移失效 / 空 poi 失效 / 复用携带全部字段+legacy_cache、标签 v2 经 cells 映射 / v3 透传与 unmapped、mapping unmatched 记录）。
+
+### 验证（维护测试日志）
+- Task 4 单测：`test_langTrack_label_places.py` **21 passed** + `test_langTrack_location_migration.py` **24 passed**（首跑修正一处：split 场景 mapping 断言——mapping 按旧 place 记录而非按 cluster，唯一旧行只产出一条 matched 行）。
+- 位置事实全组：`test_langTrack_etl_location.py`（12）+ `test_langTrack_location_facts.py`（39）合计 **97 passed**。
+- 回归：全套 `pytest tests` **679 passed / 12 failed（存量环境问题：test_cli.py pygraphviz 缺失 ×11 + test_qq.py ×1，git stash 后 HEAD 复现一致，非本次引入）**。
+- `ruff check` location_migration / label_places / location_facts / 两个测试文件全部通过（location_facts OldPlace.geocode 默认值加 RUF012 noqa：NamedTuple 只读共享默认，消费方仅整体透传）。
+
+### 待办更新
+- [x] Task 4：迁移稳定 ID、人工 tag 与 geocode 缓存（label v3 两阶段切换 + 35 用例通过）。

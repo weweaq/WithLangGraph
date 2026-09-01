@@ -445,3 +445,365 @@ class TestNoIoInsideTransaction:
         assert "open(" not in src
         assert ".write" not in src
         assert "requests" not in src
+
+
+# ---------------------------------------------------------------------------
+# 7) Task 4：迁移决策场景（split / merge / 多设备阻断 / geocode 缓存 / 标签文件映射）
+# ---------------------------------------------------------------------------
+
+import hashlib
+import json
+
+
+def _cluster_id(device: str, grids: list[str]) -> str:
+    """与 location_facts._cluster_key 相同的 new_cluster_key 语义。"""
+    joined = "|".join(sorted(grids))
+    return hashlib.sha1(f"{device}|{joined}".encode()).hexdigest()[:16]
+
+
+def _legacy_id(device: str, grid: str) -> str:
+    return hashlib.sha1(f"{device}|legacy|{grid}".encode()).hexdigest()[:16]
+
+
+def _task4_db(tmp_path, old_places, clusters) -> Path:
+    """Task 4 迁移决策测试库：v1 places + 手工 shadow_* 表。
+
+    old_places: (device, grid_key, lat, lon, label, poi, address)
+    clusters:   (device, (center_lat, center_lon), [grid_key, ...])
+    """
+    p = tmp_path / "task4.db"
+    conn = sqlite3.connect(p)
+    conn.executescript(etl._SCHEMA)
+    if old_places:
+        conn.executemany(
+            "INSERT INTO places(device_id, grid_key, lat, lon, label, visit_count, "
+            "poi, address, matched_level) VALUES (?,?,?,?,?,?,?,?,?)",
+            [
+                (d, g, la, lo, lb, 10, poi, addr, "poi" if poi else None)
+                for d, g, la, lo, lb, poi, addr in old_places
+            ],
+        )
+    conn.commit()
+    conn.close()
+
+    conn = sqlite3.connect(p)
+    lm.create_location_v2_tables(conn)
+    conn.executescript(lm._shadow_ddl())
+    for dev, (clat, clon), grids in clusters:
+        pid = _cluster_id(dev, grids)
+        conn.execute(
+            "INSERT INTO shadow_places_v2(device_id, place_id, grid_key, lat, lon, label, "
+            "first_seen, last_seen, point_count, visit_count, stay_ms, is_primary, "
+            "source_coord_system, center_method) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (dev, pid, grids[0], clat, clon, "未知", 1000, 2000, 10, 1, 3_600_000, 1,
+             "unknown", "stay_duration_weighted"),
+        )
+        conn.executemany(
+            "INSERT INTO shadow_place_cells_v2(device_id, place_id, grid_key) VALUES (?,?,?)",
+            [(dev, pid, g) for g in grids],
+        )
+        conn.execute(
+            "INSERT INTO shadow_stays_v2(device_id, start_ts, end_ts, duration_ms, center_lat, "
+            "center_lon, min_lat, min_lon, max_lat, max_lon, n_points, radius_m, grid_key, "
+            "place_id, source_coord_system, day) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (dev, 1000, 4_600_000, 3_600_000, clat, clon, clat, clon, clat, clon, 10, 30.0,
+             grids[0], pid, "unknown", "2026-08-17"),
+        )
+    conn.commit()
+    conn.close()
+    return p
+
+
+HOME_GK = "31.992,118.783"
+
+
+class TestTask4Split:
+    def test_split_old_id_goes_to_best_child(self, tmp_path):
+        """一旧拆二（规则 10）：旧 ID 只给 Jaccard 最佳 child，另一 child 用 new_cluster_key。"""
+        db = _task4_db(
+            tmp_path,
+            old_places=[("dev1", HOME_GK, 31.992, 118.783, "家", "甲小区南门", "某某路1号")],
+            clusters=[
+                ("dev1", (31.992, 118.783), [HOME_GK]),          # jaccard=1.0
+                ("dev1", (31.9922, 118.7832), ["31.993,118.784"]),  # 仅 dist≈25m 建边
+            ],
+        )
+        labels = tmp_path / "place_labels.json"
+        labels.write_text("{}", encoding="utf-8")
+
+        report = lm.prepare_location_migration(db, labels_path=labels, run_id="run-split")
+
+        legacy = _legacy_id("dev1", HOME_GK)
+        orphan_child = _cluster_id("dev1", ["31.993,118.784"])
+        conn = sqlite3.connect(db)
+        rows = {r[0]: (r[1], r[2]) for r in conn.execute(  # place_id -> (grid_key, label)
+            "SELECT place_id, grid_key, label FROM shadow_places_v2 WHERE device_id='dev1'"
+        )}
+        # 最佳 child 继承旧 ID 与人工 tag；另一 child 用 cluster key、label 未知
+        assert rows[legacy][1] == "家"
+        assert rows[orphan_child][1] == "未知"
+        # mapping 按旧 place 记录：唯一旧行 matched，jaccard=1.0
+        mapping = list(conn.execute(
+            "SELECT old_grid_key, new_place_id, match_reason, jaccard FROM location_place_mapping"
+        ))
+        conn.close()
+        assert mapping == [(HOME_GK, legacy, "matched", 1.0)]
+        assert report["place_id_renamed"] == 1
+        assert report["geocode_reused"] == 1  # 旧缓存随最佳 child
+
+
+class TestTask4Merge:
+    def test_merge_same_tag_survivor_keeps_label(self, tmp_path):
+        """两旧并一（规则 11）：相同 tag → survivor 保留标签，无 conflict。"""
+        db = _task4_db(
+            tmp_path,
+            old_places=[
+                ("dev1", HOME_GK, 31.992, 118.783, "家", "甲小区南门", "某某路1号"),
+                ("dev1", "31.992,118.784", 31.992, 118.784, "家", "甲小区南门", "某某路1号"),
+            ],
+            clusters=[("dev1", (31.992, 118.7835), [HOME_GK, "31.992,118.784"])],
+        )
+        labels = tmp_path / "place_labels.json"
+        labels.write_text("{}", encoding="utf-8")
+        report = lm.prepare_location_migration(db, labels_path=labels, run_id="run-merge")
+
+        conn = sqlite3.connect(db)
+        row = conn.execute(
+            "SELECT place_id, label FROM shadow_places_v2 WHERE device_id='dev1'"
+        ).fetchone()
+        # survivor 是两个 legacy id 之一（全局排序确定），但 place_id 必为 legacy 语义
+        assert row[0] in {_legacy_id("dev1", HOME_GK), _legacy_id("dev1", "31.992,118.784")}
+        assert row[1] == "家"
+        n_conflict = conn.execute("SELECT COUNT(*) FROM place_tag_conflicts_v2").fetchone()[0]
+        conn.close()
+        assert n_conflict == 0
+        # geocode merge：全部偏移达标且签名一致 → 复用
+        assert report["geocode_reused"] == 1
+        assert report["geocode_invalidated"] == 0
+
+    def test_merge_conflicting_tags_becomes_unknown(self, tmp_path):
+        """两旧并一但 tag 冲突 → label 置未知 + 每个带 tag 旧 place 写一条 conflict（禁止静默择一）。"""
+        db = _task4_db(
+            tmp_path,
+            old_places=[
+                ("dev1", HOME_GK, 31.992, 118.783, "家", "甲小区南门", "某某路1号"),
+                ("dev1", "31.992,118.784", 31.992, 118.784, "公司", "乙大厦", "某某路2号"),
+            ],
+            clusters=[("dev1", (31.992, 118.7835), [HOME_GK, "31.992,118.784"])],
+        )
+        labels = tmp_path / "place_labels.json"
+        labels.write_text("{}", encoding="utf-8")
+        report = lm.prepare_location_migration(db, labels_path=labels, run_id="run-conflict")
+
+        conn = sqlite3.connect(db)
+        label = conn.execute("SELECT label FROM shadow_places_v2 WHERE device_id='dev1'").fetchone()[0]
+        conflicts = {
+            (r[0], r[1], r[2])
+            for r in conn.execute("SELECT tag, reason, old_place_id FROM place_tag_conflicts_v2")
+        }
+        conn.close()
+        assert label == "未知"
+        assert conflicts == {
+            ("家", "merge_conflicting_tags", _legacy_id("dev1", HOME_GK)),
+            ("公司", "merge_conflicting_tags", _legacy_id("dev1", "31.992,118.784")),
+        }
+        assert report["tag_conflicts"] == 2
+        # geocode merge：签名（poi/address/matched_level）不一致 → 失效待重编
+        assert report["geocode_reused"] == 0
+        assert report["geocode_invalidated"] == 1
+
+
+class TestTask4MultiDeviceBlock:
+    def test_v1_flat_label_with_two_devices_blocks_activate(self, tmp_path):
+        """v1 平铺标签 + 多设备 shadow → multi_device_ambiguity 阻断 activate；
+        人工标记 resolved 后放行。"""
+        db = _task4_db(
+            tmp_path,
+            old_places=[
+                ("dev1", HOME_GK, 31.992, 118.783, "家", None, None),
+                ("dev2", HOME_GK, 31.992, 118.783, "未知", None, None),
+            ],
+            clusters=[
+                ("dev1", (31.992, 118.783), [HOME_GK]),
+                ("dev2", (31.992, 118.783), [HOME_GK]),
+            ],
+        )
+        labels = tmp_path / "place_labels.json"
+        labels.write_text(json.dumps({HOME_GK: "家"}, ensure_ascii=False), encoding="utf-8")
+
+        report = lm.prepare_location_migration(db, labels_path=labels, run_id="run-block")
+        assert report["blocked"] == 1
+        assert report["tag_issues"] == 1  # v1 一行标签 → 一条歧义 issue
+
+        conn = sqlite3.connect(db)
+        kinds = [r[0] for r in conn.execute(
+            "SELECT kind FROM location_migration_issues WHERE resolution_status='open'"
+        )]
+        conn.close()
+        assert kinds == ["multi_device_ambiguity"]
+
+        # activate 被阻断，旧库不动
+        conn = sqlite3.connect(db)
+        with pytest.raises(lm.LocationMigrationError, match="blocking label migration issues"):
+            lm.activate_location_v2(conn, "run-block")
+        conn.close()
+
+        # 人工解决（标记 resolved）后 activate 放行
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE location_migration_issues SET resolution_status='resolved'")
+        conn.commit()
+        lm.activate_location_v2(conn, "run-block")
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        conn.close()
+
+
+class TestTask4GeocodeCache:
+    def test_center_shift_beyond_threshold_invalidates(self, tmp_path):
+        """中心偏移 > regeo_shift_m（默认 50m）→ 缓存失效，不迁移。"""
+        db = _task4_db(
+            tmp_path,
+            old_places=[("dev1", HOME_GK, 31.992, 118.783, "家", "甲小区南门", "某某路1号")],
+            clusters=[("dev1", (31.993, 118.783), [HOME_GK])],  # 偏移≈111m
+        )
+        labels = tmp_path / "place_labels.json"
+        labels.write_text("{}", encoding="utf-8")
+        report = lm.prepare_location_migration(db, labels_path=labels, run_id="run-shift")
+
+        conn = sqlite3.connect(db)
+        poi, evidence = conn.execute(
+            "SELECT poi, name_evidence FROM shadow_places_v2 WHERE device_id='dev1'"
+        ).fetchone()
+        conn.close()
+        assert report["geocode_reused"] == 0
+        assert report["geocode_invalidated"] == 1
+        assert poi is None and evidence != "legacy_cache"
+
+    def test_empty_poi_address_invalidates(self, tmp_path):
+        """偏移达标但 poi/address 全空 → 缓存失效。"""
+        db = _task4_db(
+            tmp_path,
+            old_places=[("dev1", HOME_GK, 31.992, 118.783, "家", None, None)],
+            clusters=[("dev1", (31.992, 118.783), [HOME_GK])],
+        )
+        labels = tmp_path / "place_labels.json"
+        labels.write_text("{}", encoding="utf-8")
+        report = lm.prepare_location_migration(db, labels_path=labels, run_id="run-empty")
+        assert report["geocode_reused"] == 0
+        assert report["geocode_invalidated"] == 1
+
+    def test_reuse_carries_all_geocode_fields(self, tmp_path):
+        """复用时全部 geocode 字段 + name_evidence='legacy_cache' 落到 shadow 行。"""
+        db = _task4_db(
+            tmp_path,
+            old_places=[("dev1", HOME_GK, 31.992, 118.783, "家", "甲小区南门", "某某路1号")],
+            clusters=[("dev1", (31.992, 118.783), [HOME_GK])],
+        )
+        labels = tmp_path / "place_labels.json"
+        labels.write_text("{}", encoding="utf-8")
+        lm.prepare_location_migration(db, labels_path=labels, run_id="run-reuse")
+
+        conn = sqlite3.connect(db)
+        row = conn.execute(
+            "SELECT poi, address, matched_level, name_evidence FROM shadow_places_v2 WHERE device_id='dev1'"
+        ).fetchone()
+        conn.close()
+        assert row == ("甲小区南门", "某某路1号", "poi", "legacy_cache")
+
+
+class TestTask4LabelFileMapping:
+    def test_v2_label_maps_through_place_cells(self, tmp_path):
+        """v2 (device,grid) 标签经 place_cells 映射为 place_id；无匹配写 unmapped_tag（不阻断）。"""
+        db = _task4_db(
+            tmp_path,
+            old_places=[("dev1", HOME_GK, 31.992, 118.783, "家", None, None)],
+            clusters=[("dev1", (31.992, 118.783), [HOME_GK])],
+        )
+        labels = tmp_path / "place_labels.json"
+        labels.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "labels": [
+                        {"device_id": "dev1", "grid_key": HOME_GK, "tag": "家"},
+                        {"device_id": "dev1", "grid_key": "39.999,116.111", "tag": "外星"},
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        report = lm.prepare_location_migration(db, labels_path=labels, run_id="run-v2")
+
+        pending = labels.with_name(labels.name + ".v3.pending")
+        doc = json.loads(pending.read_text(encoding="utf-8"))
+        assert doc["version"] == 3
+        assert len(doc["labels"]) == 1
+        assert doc["labels"][0]["place_id"] == _legacy_id("dev1", HOME_GK)
+        assert doc["labels"][0]["anchor_grid_key"] == HOME_GK
+        # unmapped_tag 不阻断 activate
+        assert report["tag_issues"] == 1
+        assert report["blocked"] == 0
+
+    def test_v3_label_kept_only_if_place_id_exists(self, tmp_path):
+        """v3 标签：place_id 仍存在于 shadow 才保留，否则 unmapped_tag。"""
+        db = _task4_db(
+            tmp_path,
+            old_places=[("dev1", HOME_GK, 31.992, 118.783, "家", None, None)],
+            clusters=[("dev1", (31.992, 118.783), [HOME_GK])],
+        )
+        keep_id = _legacy_id("dev1", HOME_GK)
+        labels = tmp_path / "place_labels.json"
+        labels.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "labels": [
+                        {"device_id": "dev1", "place_id": keep_id,
+                         "anchor_grid_key": HOME_GK, "tag": "家",
+                         "updated_at": "2026-08-01T00:00:00+08:00"},
+                        {"device_id": "dev1", "place_id": "deadbeef0000ffff",
+                         "anchor_grid_key": None, "tag": "公司",
+                         "updated_at": "2026-08-01T00:00:00+08:00"},
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        report = lm.prepare_location_migration(db, labels_path=labels, run_id="run-v3")
+
+        pending = labels.with_name(labels.name + ".v3.pending")
+        doc = json.loads(pending.read_text(encoding="utf-8"))
+        assert [r["place_id"] for r in doc["labels"]] == [keep_id]
+        # 保留行原样透传（含 updated_at）
+        assert doc["labels"][0]["updated_at"] == "2026-08-01T00:00:00+08:00"
+        assert report["tag_migrated"] == 1
+        assert report["tag_issues"] == 1
+
+    def test_unmatched_old_place_recorded_in_mapping(self, tmp_path):
+        """无法匹配任何新 cluster 的旧 place → mapping 记 unmatched，不参与 tag/geocode。"""
+        db = _task4_db(
+            tmp_path,
+            old_places=[
+                ("dev1", HOME_GK, 31.992, 118.783, "家", "甲小区南门", "某某路1号"),
+                ("dev1", "39.999,116.000", 39.999, 116.000, "公司", "丙大楼", "某路3号"),
+            ],
+            clusters=[("dev1", (31.992, 118.783), [HOME_GK])],
+        )
+        labels = tmp_path / "place_labels.json"
+        labels.write_text("{}", encoding="utf-8")
+        report = lm.prepare_location_migration(db, labels_path=labels, run_id="run-unmatch")
+
+        conn = sqlite3.connect(db)
+        rows = {
+            r[0]: (r[1], r[2])
+            for r in conn.execute(
+                "SELECT old_grid_key, new_place_id, match_reason FROM location_place_mapping"
+            )
+        }
+        conn.close()
+        assert rows[HOME_GK][1] == "matched"
+        assert rows["39.999,116.000"] == (None, "unmatched")
+        assert report["old_places_matched"] == 1
+        # 远点旧缓存不会挂到 home cluster 上
+        assert report["geocode_reused"] == 1
