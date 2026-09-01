@@ -328,7 +328,7 @@ CREATE TABLE IF NOT EXISTS anomalies (
 
   ts INTEGER,
 
-  UNIQUE(day, kind, grid_key)
+  UNIQUE(day, kind, device_id, grid_key)
 
 );
 
@@ -1139,30 +1139,30 @@ def infer_home_work_candidates(conn: sqlite3.Connection) -> int:
     - 公司：工作日白天 09:00-18:00 高频停留（>=15 次）→ 高置信（work 榜）。
 
     - 双榜并行：评估网格 = 凌晨停留榜 ∪ 工作日白天高频榜；纯白天高频、
-
       凌晨无停留的办公网格也能进入公司候选（修复验收盲区③）。
 
     - 已确认点（label 家/公司）不再跳过，同样计算并回填 confidence_home /
-
       confidence_work，candidate_label 记为其确认标签（修复验收盲区②）；
-
       未确认点 candidate_label 记推断候选，label 保持中性由用户确认。
+
+    设备隔离（Task 5c）：全部统计与回填按 (device_id, grid_key) 显式键——
+    两设备共处同一网格时各自独立累计/回填，他设备的已确认标签不串扰。
 
     """
 
-    home_days: dict[str, set[str]] = defaultdict(set)
+    home_days: dict[tuple[str, str], set[str]] = defaultdict(set)
 
-    work_count: dict[str, int] = defaultdict(int)
+    work_count: dict[tuple[str, str], int] = defaultdict(int)
 
     rows = conn.execute(
 
-        "SELECT ts, payload FROM events WHERE type='location'"
+        "SELECT device_id, ts, payload FROM events WHERE type='location'"
 
     ).fetchall()
 
     import datetime
 
-    for ts, raw in rows:
+    for device_id, ts, raw in rows:
 
         try:
 
@@ -1179,44 +1179,44 @@ def infer_home_work_candidates(conn: sqlite3.Connection) -> int:
         dt = datetime.datetime.fromtimestamp(ts / 1000, tz=_TZ_CST)
         hour = dt.hour
         if hour < 5:
-            home_days[gk].add(dt.strftime("%Y-%m-%d"))
+            home_days[(device_id, gk)].add(dt.strftime("%Y-%m-%d"))
         if 9 <= hour < 18 and dt.weekday() < 5:
 
-            work_count[gk] += 1
+            work_count[(device_id, gk)] += 1
 
 
 
-    # 已确认标签（label 家/公司）按网格索引，用于回填 candidate_label
+    # 已确认标签（label 家/公司）按 (device_id, grid_key) 索引，用于回填 candidate_label
 
-    confirmed: dict[str, str] = {}
+    confirmed: dict[tuple[str, str], str] = {}
 
-    for gk, lab in conn.execute(
+    for dev, gk, lab in conn.execute(
 
-        "SELECT grid_key, label FROM places WHERE label IN ('家','公司')"
+        "SELECT device_id, grid_key, label FROM places WHERE label IN ('家','公司')"
 
     ):
 
-        confirmed.setdefault(gk, lab)
+        confirmed[(dev, gk)] = lab
 
 
 
     WORK_THRESHOLD = 15  # 工作日白天高频阈值：>=15 次进入公司候选评估
 
-    # 评估网格 = 凌晨停留榜 ∪ 工作日白天高频榜 ∪ 已确认 label 网格。
+    # 评估 (device, grid) = 凌晨停留榜 ∪ 工作日白天高频榜 ∪ 已确认 label。
 
     # 已确认点强制纳入，保证置信度无条件回填（即使不在任何高频榜）。
 
-    grids = set(home_days) | {gk for gk, n in work_count.items() if n >= WORK_THRESHOLD} | set(confirmed)
+    grids = set(home_days) | {k for k, n in work_count.items() if n >= WORK_THRESHOLD} | set(confirmed)
 
 
 
     n_updated = 0
 
-    for gk in grids:
+    for dev, gk in grids:
 
-        home_conf = min(1.0, len(home_days.get(gk, ())) / 3.0)
+        home_conf = min(1.0, len(home_days.get((dev, gk), ())) / 3.0)
 
-        work_conf = min(1.0, work_count.get(gk, 0) / WORK_THRESHOLD)
+        work_conf = min(1.0, work_count.get((dev, gk), 0) / WORK_THRESHOLD)
 
         candidate = None
 
@@ -1230,15 +1230,15 @@ def infer_home_work_candidates(conn: sqlite3.Connection) -> int:
 
         # 已确认点回填确认标签；未确认点写入推断候选
 
-        cand_final = confirmed.get(gk, candidate)
+        cand_final = confirmed.get((dev, gk), candidate)
 
         cur = conn.execute(
 
             "UPDATE places SET candidate_label=?, confidence_home=?, confidence_work=? "
 
-            "WHERE grid_key=?",
+            "WHERE device_id=? AND grid_key=?",
 
-            (cand_final, round(home_conf, 2), round(work_conf, 2), gk),
+            (cand_final, round(home_conf, 2), round(work_conf, 2), dev, gk),
 
         )
 
@@ -1253,32 +1253,26 @@ def infer_home_work_candidates(conn: sqlite3.Connection) -> int:
 def detect_anomalies(conn: sqlite3.Connection, lookback_days: int = 7) -> int:
     """P1-3 新地点/异常事件探测：识别打破规律的点，写入 anomalies 表。
 
-    夜间边界（深夜在外判定）与 new_place 回看窗口走 etl_config 外置配置。
+    三类异常（作画像叙事节点）：
+    - new_place      首次到访新地点：近 lookback_days 天内 first_seen 且访问次数 <= 3，
+                     且非已确认家/公司（如新出现的医院、商场、陌生住宅区）。
+    - late_night_out 深夜/凌晨在外：停驻点开始时间落在夜间窗口且不在本设备的家。
+    - off_schedule   工作日白天缺席公司：当天有停驻但 13:00 无公司停留
+                     （按 (day, device_id) 分组评估，设备互不合并）。
+
+    v1/v2 双读（Task 5c，显式 device_id/place_id）：家/公司集合按
+    (device_id, 地点键) 匹配——v1 键为 grid_key，v2（user_version>=2）键为
+    place_id（stay 的 grid_key 可能只是 place 的成员网格而非代表网格）；
+    他设备的家/公司不算自己的，name 查询同样带 device_id。
+    夜间边界与 new_place 回看窗口走 etl_config 外置配置。
     """
     cfg = load_etl_config()["anomaly"]
     night_start_h = cfg["night_start_h"]
     night_end_h = cfg["night_end_h"]
     lookback_days = cfg.get("new_place_lookback_days", lookback_days)
 
-    """P1-3 新地点/异常事件探测：识别打破规律的点，写入 anomalies 表。
-
-
-
-    三类异常（作画像叙事节点）：
-
-    - new_place      首次到访新地点：近 lookback_days 天内 first_seen 且访问次数 <= 3，
-
-                     且非已确认家/公司（如新出现的医院、商场、陌生住宅区）。
-
-    - late_night_out 深夜/凌晨在外：停驻点开始时间落在 23:00-05:00 且不在家网格
-
-                     （深夜还待在公司/外出场所，规律打破）。
-
-    - off_schedule   工作日白天缺席公司：当天有停驻但 10:00-17:00 无公司网格停留
-
-                     （居家办公/请假/翘班，与"白天在公司"惯例相悖）。
-
-    """
+    v2 = conn.execute("PRAGMA user_version").fetchone()[0] >= 2
+    key_col = "place_id" if v2 else "grid_key"
 
     conn.row_factory = sqlite3.Row
 
@@ -1286,126 +1280,93 @@ def detect_anomalies(conn: sqlite3.Connection, lookback_days: int = 7) -> int:
 
     now_ms = int(time.time() * 1000)
 
-    home = {r[0] for r in conn.execute("SELECT grid_key FROM places WHERE label='家'")}
+    if v2:
+        home = {(r[0], r[1]) for r in conn.execute(
+            "SELECT device_id, place_id FROM places WHERE label='家'")}
+        work = {(r[0], r[1]) for r in conn.execute(
+            "SELECT device_id, place_id FROM places WHERE label='公司'")}
+    else:
+        home = {(r[0], r[1]) for r in conn.execute(
+            "SELECT device_id, grid_key FROM places WHERE label='家'")}
+        work = {(r[0], r[1]) for r in conn.execute(
+            "SELECT device_id, grid_key FROM places WHERE label='公司'")}
 
-    work = {r[0] for r in conn.execute("SELECT grid_key FROM places WHERE label='公司'")}
-
-
-
-    def place_name(gk: str) -> str:
-
+    def place_name(device_id: str, key: str | None) -> str:
+        if not key:
+            return ""
         r = conn.execute(
-
-            "SELECT poi, poi_fallback FROM places WHERE grid_key=? LIMIT 1", (gk,)
-
+            f"SELECT poi, poi_fallback FROM places WHERE device_id=? AND {key_col}=? LIMIT 1",
+            (device_id, key),
         ).fetchone()
-
         if r:
-
-            return r["poi"] or r["poi_fallback"] or gk
-
-        return gk
-
-
+            return r["poi"] or r["poi_fallback"] or key
+        return key
 
     rows: list[tuple] = []
 
-
-
-    # 1) 新地点
-
+    # 1) 新地点（v1/v2 places 行均含 first_seen/visit_count/poi 列；v2 附带 place_id）
     for r in conn.execute("SELECT * FROM places"):
-
         if r["label"] in ("家", "公司"):
-
             continue
-
         if r["first_seen"] and r["first_seen"] >= now_ms - lookback_days * 86400000 and r["visit_count"] <= 3:
             day = datetime.datetime.fromtimestamp(r["first_seen"] / 1000, tz=_TZ_CST).strftime("%Y-%m-%d")
             name = r["poi"] or r["poi_fallback"] or r["grid_key"]
+            detail = f"首次到访新地点：{name}（访问 {r['visit_count']} 次）"
+            if v2:
+                rows.append((day, "new_place", r["device_id"], r["place_id"], r["grid_key"], name, detail, r["first_seen"]))
+            else:
+                rows.append((day, "new_place", r["device_id"], r["grid_key"], name, detail, r["first_seen"]))
 
-            rows.append((
-
-                day, "new_place", r["device_id"], r["grid_key"], name,
-
-                f"首次到访新地点：{name}（访问 {r['visit_count']} 次）", r["first_seen"],
-
-            ))
-
-
-
-    # 2) 深夜/凌晨在外（23:00-05:00 停留且不在家网格）
+    # 2) 深夜/凌晨在外（夜间窗口停留且不在本设备的家）
     for r in conn.execute("SELECT * FROM stays"):
         h = datetime.datetime.fromtimestamp(r["start_ts"] / 1000, tz=_TZ_CST).hour
         if not (h >= night_start_h or h < night_end_h):
             continue
-        if r["grid_key"] in home:
-
+        key = r["place_id"] if v2 else r["grid_key"]
+        if (r["device_id"], key) in home:
             continue
-
         day = r["day"]
-
         dur = (r["end_ts"] - r["start_ts"]) / 60000.0
+        name = place_name(r["device_id"], key)
+        detail = f"深夜在外停留 {dur:.0f} 分钟：{name}"
+        if v2:
+            rows.append((day, "late_night_out", r["device_id"], r["place_id"], r["grid_key"], name, detail, r["start_ts"]))
+        else:
+            rows.append((day, "late_night_out", r["device_id"], r["grid_key"], name, detail, r["start_ts"]))
 
-        name = place_name(r["grid_key"])
-
-        rows.append((
-
-            day, "late_night_out", r["device_id"], r["grid_key"], name,
-
-            f"深夜在外停留 {dur:.0f} 分钟：{name}", r["start_ts"],
-
-        ))
-
-
-
-    # 3) 工作日白天缺席公司（当天有停驻但 10:00-17:00 无公司网格停留）
-
-    for day, day_stays in _group_stays_by_day(conn):
-
+    # 3) 工作日白天缺席公司（当天有停驻但 13:00 无公司停留；按设备分组）
+    for day, device_id, day_stays in _group_stays_by_day(conn):
         if datetime.date.fromisoformat(day).weekday() >= 5:
-
             continue
-
         if not day_stays:
-
             continue
-
-        # 正午 13:00 作为"白天在公司"的代表时刻：停留段覆盖 13:00 且落在公司网格
-
+        # 正午 13:00 作为"白天在公司"的代表时刻：停留段覆盖 13:00 且落在公司
         # （不能用 start_ts 落在窗口内判断——公司停留段常开始于 08:40/09:47，会被误判缺席）
-
         noon = int(datetime.datetime.fromisoformat(f"{day} 13:00").replace(tzinfo=_TZ_CST).timestamp() * 1000)
-
+        key_idx = 3 if v2 else 2  # stay 条目 (start_ts, end_ts, grid_key, place_id)
         in_office = any(
-
-            s[2] in work and s[0] <= noon <= s[1]
-
+            (device_id, s[key_idx]) in work and s[0] <= noon <= s[1]
             for s in day_stays
-
         )
-
         if not in_office:
+            detail = "工作日白天未到公司（正午 13:00 无公司停留）"
+            if v2:
+                rows.append((day, "off_schedule", device_id, None, "", "", detail, day_stays[0][0]))
+            else:
+                rows.append((day, "off_schedule", device_id, "", "", detail, day_stays[0][0]))
 
-            rows.append((
-
-                day, "off_schedule", day_stays[0][4], "", "",
-
-                "工作日白天未到公司（正午 13:00 无公司网格停驻）", day_stays[0][0],
-
-            ))
-
-
-
-    conn.executemany(
-
-        "INSERT OR IGNORE INTO anomalies(day, kind, device_id, grid_key, poi, detail, ts) "
-
-        "VALUES (?,?,?,?,?,?,?)",
-
-        rows,
-
-    )
+    if v2:
+        conn.executemany(
+            "INSERT OR IGNORE INTO anomalies(day, kind, device_id, place_id, grid_key, poi, detail, ts) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            rows,
+        )
+    else:
+        conn.executemany(
+            "INSERT OR IGNORE INTO anomalies(day, kind, device_id, grid_key, poi, detail, ts) "
+            "VALUES (?,?,?,?,?,?,?)",
+            rows,
+        )
 
     conn.commit()
 
@@ -1527,17 +1488,22 @@ def detect_route_changes(conn: sqlite3.Connection) -> int:
 
 
 
-def _group_stays_by_day(conn: sqlite3.Connection) -> list[tuple[str, list[tuple]]]:
+def _group_stays_by_day(conn: sqlite3.Connection) -> list[tuple[str, str, list[tuple]]]:
+    """按 (day, device_id) 分组停驻点（Task 5c 设备隔离：设备互不合并）。
 
-    """按天分组停驻点：返回 [(day, [(start_ts, end_ts, grid_key, in_work_hours, device_id), ...])]。"""
-
-    by_day: dict[str, list] = defaultdict(list)
-
-    for r in conn.execute("SELECT * FROM stays"):
-
-        by_day[r["day"]].append((r["start_ts"], r["end_ts"], r["grid_key"], False, r["device_id"]))
-
-    return sorted(by_day.items())
+    返回 [(day, device_id, [(start_ts, end_ts, grid_key, place_id), ...])]；
+    v1 stays 无 place_id 列时以 NULL 占位，条目结构两版本一致。
+    """
+    has_pid = "place_id" in {r[1] for r in conn.execute("PRAGMA table_info(stays)")}
+    pid_sel = "place_id" if has_pid else "NULL AS place_id"
+    by_key: dict[tuple[str, str], list] = defaultdict(list)
+    for r in conn.execute(
+        f"SELECT day, device_id, start_ts, end_ts, grid_key, {pid_sel} FROM stays"
+    ):
+        by_key[(r["day"], r["device_id"])].append(
+            (r["start_ts"], r["end_ts"], r["grid_key"], r["place_id"])
+        )
+    return [(day, dev, stays) for (day, dev), stays in sorted(by_key.items())]
 
 
 
@@ -1898,12 +1864,19 @@ def _now_cst(conn: sqlite3.Connection) -> str:
 
 
 def _migrate_fact_tables(conn: sqlite3.Connection) -> None:
-    """PRAGMA 守卫的事实表迁移：补齐 device_id / created_at / updated_at / etl_version。"""
+    """PRAGMA 守卫的事实表迁移：补齐 device_id / created_at / updated_at / etl_version。
+
+    位置事实 v2 激活后（user_version>=2）places/stays/trips/anomalies/grid_pois/
+    route_grids 结构冻结（无 etl_version 列），v1 迁移不得触碰，仅处理 sessions/daily_stats。
+    """
 
     # daily_stats：SQLite 不支持 ALTER PRIMARY KEY，需重建表修正主键为 (device_id, day)
     _migrate_daily_stats_pk(conn)
 
-    fact_tables = ["sessions", "stays", "trips", "daily_stats", "places", "anomalies", "grid_pois", "route_grids"]
+    v2 = conn.execute("PRAGMA user_version").fetchone()[0] >= 2
+    fact_tables = ["sessions", "daily_stats"]
+    if not v2:
+        fact_tables += ["stays", "trips", "places", "anomalies", "grid_pois", "route_grids"]
     for t in fact_tables:
         cols = {r[1] for r in conn.execute(f"PRAGMA table_info({t})")}
         for col in ("created_at", "updated_at", "etl_version"):
@@ -1977,8 +1950,57 @@ def _migrate_daily_stats_pk(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
+def _migrate_anomalies_unique(conn: sqlite3.Connection) -> None:
+    """anomalies 唯一键加入 device_id（Task 5c 设备隔离修复）。
+
+    旧表 UNIQUE(day, kind, grid_key)：两设备同日同类同网格异常互相吞行
+    （off_schedule 的 grid_key 恒为空串，跨设备必撞 → INSERT OR IGNORE 丢行）。
+    anomalies 为全量重算的派生表，重建迁移保留历史行与 id。v2 已激活
+    （user_version>=2）时 schema 冻结——其唯一索引本就含 device_id，跳过。
+    """
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= 2:
+        return
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='anomalies'"
+    ).fetchone():
+        return
+    for idx in conn.execute("PRAGMA index_list(anomalies)").fetchall():
+        if not idx[2]:  # unique 标志位（tuple/Row 位置访问双兼容）
+            continue
+        cols = {r[2] for r in conn.execute(f"PRAGMA index_info({idx[1]})")}
+        if "device_id" in cols:
+            return  # 已是含 device_id 的唯一键（新库 / 已迁移）
+    conn.execute("DROP TABLE IF EXISTS anomalies_old")
+    conn.execute("ALTER TABLE anomalies RENAME TO anomalies_old")
+    conn.execute(
+        """
+        CREATE TABLE anomalies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            grid_key TEXT,
+            poi TEXT,
+            detail TEXT,
+            ts INTEGER,
+            UNIQUE(day, kind, device_id, grid_key)
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_anomalies_day ON anomalies(day)")
+    conn.execute(
+        "INSERT INTO anomalies(id, day, kind, device_id, grid_key, poi, detail, ts) "
+        "SELECT id, day, kind, device_id, grid_key, poi, detail, ts FROM anomalies_old"
+    )
+    conn.execute("DROP TABLE anomalies_old")
+    conn.commit()
+
+
 def _stamp_fact_tables(conn: sqlite3.Connection) -> None:
-    """B8：标注 etl_version/updated_at，并回填 created_at（按各表自然时间字段）。"""
+    """B8：标注 etl_version/updated_at，并回填 created_at（按各表自然时间字段）。
+
+    位置事实 v2 激活后位置表结构冻结（无 etl_version 列），仅标注 sessions/daily_stats。
+    """
 
     # (表, 自然时间字段, 是否毫秒时间戳)
     spec = {
@@ -1991,6 +2013,10 @@ def _stamp_fact_tables(conn: sqlite3.Connection) -> None:
         "grid_pois": ("queried_at", True),
         "route_grids": ("day", False),
     }
+    v2 = conn.execute("PRAGMA user_version").fetchone()[0] >= 2
+    if v2:
+        frozen = {"stays", "trips", "places", "anomalies", "grid_pois", "route_grids"}
+        spec = {t: s for t, s in spec.items() if t not in frozen}
     for t, (time_col, is_ms) in spec.items():
         conn.execute(
             f"UPDATE {t} SET etl_version=?, updated_at=datetime('now','+8 hours') "
@@ -2045,124 +2071,12 @@ def _update_etl_state(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool = True, run_route: bool = True, run_poi: bool = True, incremental: bool = False) -> None:
+def _build_location_v1(conn: sqlite3.Connection, events, incremental_active: bool, affected_days: set[str]) -> None:
+    """v1 位置管线：stays/trips/places 构建 + 家/公司候选推断 + top2 主点标记。
 
-    conn = sqlite3.connect(db_path)
-
-    conn.executescript(_SCHEMA)
-
-    # 迁移：旧 places 表补 is_primary 列（新库已含）
-
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(places)")}
-
-    if "is_primary" not in cols:
-
-        conn.execute("ALTER TABLE places ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0")
-
-    # 迁移：places 语义/候选列 + 旧库空 device_id 归并
-
-    migrate_places(conn)
-
-    # B migration: ensure fact tables have device_id / created_at / updated_at / etl_version
-    _migrate_fact_tables(conn)
-
-    # B1 incremental watermark: read etl_state; if watermark exists, rebuild only lookback window
-    incremental_active = False
-    affected_days: set[str] = set()
-    if incremental:
-        watermarks = _read_watermarks(conn)
-        if watermarks:
-            affected_days = _compute_affected_days(conn, watermarks, lookback_days=3)
-            if affected_days:
-                incremental_active = True
-                print(f"[etl] incremental: rebuild {len(affected_days)} affected days")
-            else:
-                print("[etl] incremental: no affected days, full rebuild")
-        else:
-            print("[etl] incremental: no watermark in etl_state, full rebuild")
-
-    # 同设备重装前后 device_id 归一（必须在 load_events 之前，build 系列按 device_id 分组）
-
-    n_alias = merge_device_aliases(conn)
-
-    if n_alias:
-
-        print(f"[etl] 设备别名归并完成: {n_alias} 个")
-
-
-
-    events = load_events(conn)
-
-    print(f"[etl] 事件总数(清洗后): {len(events)}")
-
-
-
-    # 重置表（全量重建，简单可靠）；places 用 upsert 保留已标注标签（家/公司）
-
-    # P0 派生列保护：DELETE 前快照，INSERT 基础列后按 (device_id, day) 还原
-    p0_snap = {}
-    try:
-        for _d, _day, _s1, _s2, _dur, _taj in conn.execute(
-            "SELECT device_id, day, sleep_start_hhmm, sleep_end_hhmm, "
-            "sleep_duration_min, time_app_json FROM daily_stats"
-        ):
-            p0_snap[(_d, _day)] = (_s1, _s2, _dur, _taj)
-    except sqlite3.OperationalError:
-        p0_snap = {}
-
-    if incremental_active:
-        ph = ",".join("?" * len(affected_days))
-        conn.execute(f"DELETE FROM sessions WHERE day IN ({ph})", list(affected_days))
-        conn.execute(f"DELETE FROM daily_stats WHERE day IN ({ph})", list(affected_days))
-    else:
-        conn.execute("DELETE FROM sessions")
-        conn.execute("DELETE FROM daily_stats")
-    sessions = build_sessions(events)
-    if incremental_active:
-        sessions = [r for r in sessions if r[1] in affected_days]
-
-    conn.executemany(
-
-        "INSERT INTO sessions(device_id, day, pkg, app, activity, start_ms, end_ms, duration_ms) "
-
-        "VALUES (?,?,?,?,?,?,?,?)",
-
-        sessions,
-
-    )
-
-    print(f"[etl] sessions: {len(sessions)}")
-
-
-
-    daily = build_daily_stats(events, sessions)
-    if incremental_active:
-        daily = [r for r in daily if r[1] in affected_days]
-
-    conn.executemany(
-
-        "INSERT INTO daily_stats(device_id, day, total_screen_ms, app_ranking_json, notification_count, "
-
-        "notification_clicked, top_notification_apps_json, screen_on_count, screen_off_count, "
-
-        "unlock_count, switch_count, location_count, audio_clip_count) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-
-        daily,
-
-    )
-
-    print(f"[etl] daily_stats: {len(daily)}")
-
-    if p0_snap:
-        conn.executemany(
-            "UPDATE daily_stats SET sleep_start_hhmm=?, sleep_end_hhmm=?, "
-            "sleep_duration_min=?, time_app_json=? WHERE device_id=? AND day=?",
-            [(_s1, _s2, _dur, _taj, _d, _day) for (_d, _day), (_s1, _s2, _dur, _taj) in p0_snap.items()],
-        )
-        conn.commit()
-        print(f"[etl] daily_stats P0 派生列还原: {len(p0_snap)} 行")
-
-
+    v2 激活后由 run() 分流跳过（v1 写入会破坏 place_id 语义并复活 visit_count
+    累加事故）；本函数保持 v1 库行为完全不变。结束时提交并关闭传入连接。
+    """
 
     # L1：停驻点检测 → stays 表（全量重建）
 
@@ -2299,6 +2213,164 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool
     conn.commit()
 
     conn.close()
+
+
+def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool = True, run_route: bool = True, run_poi: bool = True, incremental: bool = False) -> None:
+
+    conn = sqlite3.connect(db_path)
+
+    conn.executescript(_SCHEMA)
+
+    # 位置事实 v2 守卫：激活后（user_version>=2）places/stays/trips 为 v2 冻结
+    # schema（place_id 主键 + 三个计数语义）。v1 位置管线禁止触碰——否则
+    # visit_count 累加事故（P0）复活、place_id/stay 引用被洗掉。位置事实改由
+    # rebuild_location_v2 全量重建（见下方 L1 段分支）。
+    v2_location = conn.execute("PRAGMA user_version").fetchone()[0] >= 2
+
+    if v2_location:
+
+        print("[etl] location schema v2 active: 位置事实走 v2 全量重建分支")
+
+    else:
+
+        # 迁移：旧 places 表补 is_primary 列（新库已含）
+
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(places)")}
+
+        if "is_primary" not in cols:
+
+            conn.execute("ALTER TABLE places ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0")
+
+        # 迁移：places 语义/候选列 + 旧库空 device_id 归并
+
+        migrate_places(conn)
+
+        # 迁移：anomalies 唯一键加入 device_id（跨设备同日同类异常不再互相吞行）
+        _migrate_anomalies_unique(conn)
+
+    # B migration: ensure fact tables have device_id / created_at / updated_at / etl_version
+    # （v2 下内部自动跳过位置事实表，仅处理 sessions/daily_stats）
+    _migrate_fact_tables(conn)
+
+    # B1 incremental watermark: read etl_state; if watermark exists, rebuild only lookback window
+    incremental_active = False
+    affected_days: set[str] = set()
+    if incremental:
+        watermarks = _read_watermarks(conn)
+        if watermarks:
+            affected_days = _compute_affected_days(conn, watermarks, lookback_days=3)
+            if affected_days:
+                incremental_active = True
+                print(f"[etl] incremental: rebuild {len(affected_days)} affected days")
+            else:
+                print("[etl] incremental: no affected days, full rebuild")
+        else:
+            print("[etl] incremental: no watermark in etl_state, full rebuild")
+
+    # 同设备重装前后 device_id 归一（必须在 load_events 之前，build 系列按 device_id 分组）
+
+    n_alias = merge_device_aliases(conn)
+
+    if n_alias:
+
+        print(f"[etl] 设备别名归并完成: {n_alias} 个")
+
+
+
+    events = load_events(conn)
+
+    print(f"[etl] 事件总数(清洗后): {len(events)}")
+
+
+
+    # 重置表（全量重建，简单可靠）；places 用 upsert 保留已标注标签（家/公司）
+
+    # P0 派生列保护：DELETE 前快照，INSERT 基础列后按 (device_id, day) 还原
+    p0_snap = {}
+    try:
+        for _d, _day, _s1, _s2, _dur, _taj in conn.execute(
+            "SELECT device_id, day, sleep_start_hhmm, sleep_end_hhmm, "
+            "sleep_duration_min, time_app_json FROM daily_stats"
+        ):
+            p0_snap[(_d, _day)] = (_s1, _s2, _dur, _taj)
+    except sqlite3.OperationalError:
+        p0_snap = {}
+
+    if incremental_active:
+        ph = ",".join("?" * len(affected_days))
+        conn.execute(f"DELETE FROM sessions WHERE day IN ({ph})", list(affected_days))
+        conn.execute(f"DELETE FROM daily_stats WHERE day IN ({ph})", list(affected_days))
+    else:
+        conn.execute("DELETE FROM sessions")
+        conn.execute("DELETE FROM daily_stats")
+    sessions = build_sessions(events)
+    if incremental_active:
+        sessions = [r for r in sessions if r[1] in affected_days]
+
+    conn.executemany(
+
+        "INSERT INTO sessions(device_id, day, pkg, app, activity, start_ms, end_ms, duration_ms) "
+
+        "VALUES (?,?,?,?,?,?,?,?)",
+
+        sessions,
+
+    )
+
+    print(f"[etl] sessions: {len(sessions)}")
+
+
+
+    daily = build_daily_stats(events, sessions)
+    if incremental_active:
+        daily = [r for r in daily if r[1] in affected_days]
+
+    conn.executemany(
+
+        "INSERT INTO daily_stats(device_id, day, total_screen_ms, app_ranking_json, notification_count, "
+
+        "notification_clicked, top_notification_apps_json, screen_on_count, screen_off_count, "
+
+        "unlock_count, switch_count, location_count, audio_clip_count) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+
+        daily,
+
+    )
+
+    print(f"[etl] daily_stats: {len(daily)}")
+
+    if p0_snap:
+        conn.executemany(
+            "UPDATE daily_stats SET sleep_start_hhmm=?, sleep_end_hhmm=?, "
+            "sleep_duration_min=?, time_app_json=? WHERE device_id=? AND day=?",
+            [(_s1, _s2, _dur, _taj, _d, _day) for (_d, _day), (_s1, _s2, _dur, _taj) in p0_snap.items()],
+        )
+        conn.commit()
+        print(f"[etl] daily_stats P0 派生列还原: {len(p0_snap)} 行")
+
+
+
+    # ===== 位置事实构建：v1 管线 / v2 全量重建分流 =====
+    if v2_location:
+
+        # v2：全量重建正式 places/place_cells/stays/trips（单一计算来源，保留
+        # 人工 tag / geocode 缓存 / 已编码路线）；首版 v2 位置只允许全量，
+        # incremental 仅记录。v1 候选推断/top2 基于全表 grid_key UPDATE（无设备
+        # 隔离），v2 下跳过，由显式 device_id/place_id 版本接管。
+
+        conn.commit()
+
+        conn.close()
+
+        from gacore.langTrack.location_migration import rebuild_location_v2
+
+        n_stays_v2 = rebuild_location_v2(db_path, incremental=incremental)
+
+        print(f"[etl] location v2 全量重建: stays={n_stays_v2}")
+
+    else:
+
+        _build_location_v1(conn, events, incremental_active, affected_days)
 
     # 恢复持久化的家/公司标签（data/place_labels.json）
 

@@ -854,15 +854,233 @@ def build_location_shadow(
 
 
 # ---------------------------------------------------------------------------
-# Task 4：迁移稳定 ID、人工 tag 与 geocode 缓存（§2.4 步骤 3-6 / §2.5）
+# Task 5b：激活后全量重建（正式 v2 表）—— etl.run v2 分支的唯一位置事实入口
 # ---------------------------------------------------------------------------
 
-# 旧 places → places_v2 可迁移的 geocode 派生字段（§2.5；label/user_tag 除外）。
+# geocode 缓存派生列（§2.5；rebuild 失效与 Task 4 迁移决策共用）。
 GEOCODE_FIELDS: tuple[str, ...] = (
     "address", "poi", "district", "township", "business_area", "poi_type",
     "poi_l1", "poi_l2", "poi_l3", "poi_signal", "poi_fallback",
     "matched_level", "behavior", "geocoded_at",
 )
+
+# rebuild UPSERT 的 places 统计列（label/geocode 缓存列不在此列，保留正式表现值）。
+REBUILD_PLACE_STATS: tuple[str, ...] = (
+    "grid_key", "lat", "lon", "first_seen", "last_seen",
+    "point_count", "visit_count", "stay_ms", "is_primary",
+    "source_coord_system", "center_method",
+)
+
+
+def _load_formal_places(conn: sqlite3.Connection) -> list:
+    """v2 正式 places + place_cells → OldPlace 列表（rebuild 的 place_id 沿用基准）。
+
+    成员网格取 place_cells（无 cell 时退化为代表网格，与 match_old_new 兜底一致）。
+    """
+    from gacore.langTrack.location_facts import OldPlace
+
+    members: dict[tuple[str, str], list[str]] = {}
+    for r in conn.execute("SELECT device_id, place_id, grid_key FROM place_cells"):
+        members.setdefault((r[0], r[1]), []).append(r[2])
+
+    cols = ("device_id", "place_id", "grid_key", "lat", "lon", "label", *GEOCODE_FIELDS)
+    out = []
+    for r in conn.execute(f"SELECT {','.join(cols)} FROM places"):
+        row = dict(zip(cols, r))
+        out.append(
+            OldPlace(
+                device_id=row["device_id"],
+                place_id=row["place_id"],
+                grid_key=row["grid_key"],
+                lat=row["lat"],
+                lon=row["lon"],
+                label=row["label"] or "未知",
+                poi=row["poi"],
+                address=row["address"],
+                matched_level=row["matched_level"],
+                grid_keys=tuple(
+                    members.get((row["device_id"], row["place_id"]), [row["grid_key"]])
+                ),
+                geocode={k: row[k] for k in GEOCODE_FIELDS},
+            )
+        )
+    return out
+
+
+def rebuild_location_v2(
+    db_path: Path | str,
+    *,
+    incremental: bool = False,
+    coord_config: dict | None = None,
+    regeo_shift_m: float = 50.0,
+) -> int:
+    """v2 激活后的位置事实全量重建（正式表，§2.4 ETL v2 分支）。
+
+    复用 :func:`build_location_shadow` 作为唯一计算来源（先全量重建 shadow_* 表，
+    路线缓存已在该步从正式 trips 读回），再单事务合并进正式 v2 表：
+
+    - places：按 (device_id, place_id) UPSERT 统计列；label / geocode 缓存列保留
+      正式表现值；中心偏移 > regeo_shift_m 的保留地点清空 geocode 缓存（§2.5 失效
+      待重编）；shadow 中不存在的地点删除（无 stay 支持 → 事实消失）；
+    - place_cells / stays / trips：DELETE + INSERT 全量重建（重置自增序列保证
+      幂等逐行一致）；trips 的 polyline/route_key 缓存经 shadow 带回，不烧配额。
+
+    幂等：相同 events 连续跑两次，四张表内容（含 id，除 created_at/updated_at
+    审计列）完全一致。返回写入正式 stays 的行数。
+    """
+    from gacore.langTrack.location_facts import haversine_m, resolve_place_ids
+
+    db_path = Path(db_path)
+    pre = sqlite3.connect(db_path)
+    try:
+        if pre.execute("PRAGMA user_version").fetchone()[0] < 2:
+            raise LocationMigrationError(
+                "rebuild_location_v2 requires user_version >= 2 (activate first)"
+            )
+    finally:
+        pre.close()
+
+    build_location_shadow(db_path, incremental=incremental, coord_config=coord_config)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        names = _table_names(conn)
+        needed = ("places", "place_cells", "stays", "trips",
+                  "shadow_places_v2", "shadow_place_cells_v2",
+                  "shadow_stays_v2", "shadow_trips_v2")
+        missing = [t for t in needed if t not in names]
+        if missing:
+            raise LocationMigrationError("missing tables: " + ", ".join(missing))
+
+        conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # a0) place_id 落定：正式表现有 ID 沿用（resolve 规则 9/10/12，与
+            # Task 4 迁移同源——shadow 的 cluster key 会破坏稳定 ID 语义）；
+            # shadow 四表引用同步改写；merge 冲突 tag 写 place_tag_conflicts
+            # （非 survivor 行随后删除，tag 不静默丢）
+            olds = _load_formal_places(conn)
+            drafts = _load_shadow_drafts(conn)
+            finalized, _, conflicts = resolve_place_ids(olds, drafts)
+            rename: dict[str, str] = {}
+            final_by_cluster: dict[str, dict] = {}
+            for d, f in zip(drafts, finalized):
+                final_by_cluster[d["place_id"]] = f
+                if d["place_id"] != f["place_id"]:
+                    rename[d["place_id"]] = f["place_id"]
+            _rewrite_shadow_place_ids(conn, rename, final_by_cluster)
+            if conflicts:
+                conn.executemany(
+                    "INSERT OR REPLACE INTO place_tag_conflicts_v2(device_id, "
+                    "new_place_id, old_place_id, tag, reason) VALUES (?,?,?,?,?)",
+                    [
+                        (c["device_id"], rename.get(c["new_place_id"], c["new_place_id"]),
+                         c["old_place_id"], c["tag"], c["reason"])
+                        for c in conflicts
+                    ],
+                )
+
+            # a0.5) geocode 失效判定：shadow（已 rewrite，final ID）vs 正式表
+            # 旧中心——必须在 UPSERT 改写 lat/lon 前快照
+            old_center: dict[tuple[str, str], tuple[float, float]] = {
+                (r[0], r[1]): (r[2], r[3])
+                for r in conn.execute("SELECT device_id, place_id, lat, lon FROM places")
+            }
+            shadow_centers = [
+                (r["device_id"], r["place_id"], r["lat"], r["lon"])
+                for r in conn.execute(
+                    "SELECT device_id, place_id, lat, lon FROM shadow_places_v2"
+                )
+            ]
+            invalidate = [
+                (d, p) for d, p, lat, lon in shadow_centers
+                if (d, p) in old_center
+                and haversine_m(old_center[(d, p)][0], old_center[(d, p)][1], lat, lon)
+                > regeo_shift_m
+            ]
+
+            # a) places UPSERT：统计列以 shadow 为准；label/geocode 保留正式表现值
+            cols = ", ".join(REBUILD_PLACE_STATS)
+            sets = ", ".join(f"{c}=excluded.{c}" for c in REBUILD_PLACE_STATS)
+            conn.execute(
+                f"INSERT INTO places(device_id, place_id, {cols}) "
+                f"SELECT device_id, place_id, {cols} FROM shadow_places_v2 WHERE 1 "
+                f"ON CONFLICT(device_id, place_id) DO UPDATE SET {sets}, "
+                "updated_at=datetime('now','+8 hours')"
+            )
+
+            # b) geocode 缓存失效（§2.5）：中心偏移超阈值 → 清空待重编
+            if invalidate:
+                nulls = ", ".join(f"{c}=NULL" for c in GEOCODE_FIELDS)
+                conn.executemany(
+                    f"UPDATE places SET {nulls}, name_evidence='' "
+                    "WHERE device_id=? AND place_id=?",
+                    invalidate,
+                )
+
+            # c) shadow 中不存在的地点删除（事实消失；人工 tag 由标签文件兜底）
+            conn.execute(
+                "DELETE FROM places WHERE (device_id, place_id) NOT IN "
+                "(SELECT device_id, place_id FROM shadow_places_v2)"
+            )
+
+            # d) place_cells / stays / trips 全量重建（幂等）。AUTOINCREMENT 表 DELETE
+            # 不重置 sqlite_sequence，必须在 INSERT 前重置，否则本轮行沿用旧序列
+            # 高位 id（第一次 5..8、第二次 1..4 → 两次内容不一致）
+            has_seq = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"
+            ).fetchone() is not None
+            conn.execute("DELETE FROM place_cells")
+            conn.execute(
+                "INSERT INTO place_cells(device_id, place_id, grid_key) "
+                "SELECT device_id, place_id, grid_key FROM shadow_place_cells_v2"
+            )
+            conn.execute("DELETE FROM stays")
+            if has_seq:
+                conn.execute("DELETE FROM sqlite_sequence WHERE name='stays'")
+            stay_cols = ("device_id, start_ts, end_ts, duration_ms, center_lat, "
+                         "center_lon, min_lat, min_lon, max_lat, max_lon, n_points, "
+                         "accuracy_known_points, avg_accuracy_m, radius_m, grid_key, "
+                         "place_id, source_coord_system, day")
+            conn.execute(
+                f"INSERT INTO stays({stay_cols}) SELECT {stay_cols} FROM shadow_stays_v2"
+            )
+            conn.execute("DELETE FROM trips")
+            if has_seq:
+                conn.execute("DELETE FROM sqlite_sequence WHERE name='trips'")
+            trip_cols = ("device_id, start_ts, end_ts, duration_ms, start_lat, start_lon, "
+                         "end_lat, end_lon, from_place_id, to_place_id, "
+                         "endpoint_coord_system, dist_m, n_points, day, polyline, "
+                         "polyline_coord_system, route_key, route_mode, route_encoded_at")
+            conn.execute(
+                f"INSERT INTO trips({trip_cols}) SELECT {trip_cols} FROM shadow_trips_v2"
+            )
+
+            n_stays = conn.execute("SELECT COUNT(*) FROM stays").fetchone()[0]
+            if "etl_runs" in _table_names(conn):
+                conn.execute(
+                    "INSERT INTO etl_runs(version, mode, status, started_at, finished_at, "
+                    "rows_stays) VALUES (?, 'location_v2_rebuild', 'done', "
+                    "datetime('now','+8 hours'), datetime('now','+8 hours'), ?)",
+                    ("2.0.0", n_stays),
+                )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+        print(
+            f"[etl] location v2 rebuild: stays={n_stays} "
+            f"geocode_invalidated={len(invalidate)}"
+        )
+        return n_stays
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Task 4：迁移稳定 ID、人工 tag 与 geocode 缓存（§2.4 步骤 3-6 / §2.5）
+# ---------------------------------------------------------------------------
 
 # 阻断 activate 的 issue 种类（resolution_status=open 时）。
 BLOCKING_ISSUE_KINDS: tuple[str, ...] = ("multi_device_ambiguity",)
@@ -923,6 +1141,33 @@ def _load_shadow_drafts(conn: sqlite3.Connection) -> list[dict]:
             }
         )
     return drafts
+
+
+def _rewrite_shadow_place_ids(
+    conn: sqlite3.Connection,
+    rename: dict[str, str],
+    final_by_cluster: dict[str, dict],
+) -> None:
+    """shadow 四表 place_id 落定改写（cluster key → final ID；prepare/rebuild 共用）。"""
+    for old_cluster, final_id in sorted(rename.items()):
+        device_id = final_by_cluster[old_cluster]["device_id"]
+        conn.execute(
+            "UPDATE shadow_place_cells_v2 SET place_id=? WHERE device_id=? AND place_id=?",
+            (final_id, device_id, old_cluster),
+        )
+        conn.execute(
+            "UPDATE shadow_places_v2 SET place_id=? WHERE device_id=? AND place_id=?",
+            (final_id, device_id, old_cluster),
+        )
+        conn.execute(
+            "UPDATE shadow_stays_v2 SET place_id=? WHERE device_id=? AND place_id=?",
+            (final_id, device_id, old_cluster),
+        )
+        for col in ("from_place_id", "to_place_id"):
+            conn.execute(
+                f"UPDATE shadow_trips_v2 SET {col}=? WHERE device_id=? AND {col}=?",
+                (final_id, device_id, old_cluster),
+            )
 
 
 def _decide_labels_and_cache(
@@ -1182,24 +1427,7 @@ def prepare_location_migration(
         conn.execute("BEGIN IMMEDIATE")
         try:
             # a) place_id 落定改写（places/cells/stays/trips 引用一致）
-            for old_cluster, final_id in sorted(rename.items()):
-                conn.execute(
-                    "UPDATE shadow_place_cells_v2 SET place_id=? WHERE device_id=? AND place_id=?",
-                    (final_id, final_by_cluster[old_cluster]["device_id"], old_cluster),
-                )
-                conn.execute(
-                    "UPDATE shadow_places_v2 SET place_id=? WHERE device_id=? AND place_id=?",
-                    (final_id, final_by_cluster[old_cluster]["device_id"], old_cluster),
-                )
-                conn.execute(
-                    "UPDATE shadow_stays_v2 SET place_id=? WHERE device_id=? AND place_id=?",
-                    (final_id, final_by_cluster[old_cluster]["device_id"], old_cluster),
-                )
-                for col in ("from_place_id", "to_place_id"):
-                    conn.execute(
-                        f"UPDATE shadow_trips_v2 SET {col}=? WHERE device_id=? AND {col}=?",
-                        (final_id, final_by_cluster[old_cluster]["device_id"], old_cluster),
-                    )
+            _rewrite_shadow_place_ids(conn, rename, final_by_cluster)
 
             # b) DB 人工 tag + merge conflicts
             for device_id, final_id, label in decision["label_updates"]:

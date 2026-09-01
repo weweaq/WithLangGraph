@@ -234,34 +234,22 @@ def _resolve_device(conn: sqlite3.Connection, device_id: str | None):
 
 
 # ---------------------------------------------------------------------------
-# 查询
+# 查询（位置事实经 location_reader 双读层，v1: grid_key 关联 / v2: place_id 关联）
 # ---------------------------------------------------------------------------
 
 
-def _load_places(conn: sqlite3.Connection, device_id: str | None) -> dict[str, dict]:
-    """places 表 → {grid_key: place dict}，用于 stay/trip 标签 JOIN。"""
-    if device_id is None:
-        return {}
-    cols = "grid_key, label, visit_count, poi, behavior, district, address"
-    try:
-        rows = conn.execute(
-            f"SELECT {cols} FROM places WHERE device_id=?", (device_id,)
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return {}
-    out: dict[str, dict] = {}
-    for r in rows:
-        gk = r["grid_key"]
-        if gk:
-            out[str(gk)] = {
-                "label": _row_val(r, "label", "") or "",
-                "visit_count": _row_val(r, "visit_count", 0) or 0,
-                "poi": _row_val(r, "poi", "") or "",
-                "behavior": _row_val(r, "behavior", "") or "",
-                "district": _row_val(r, "district", "") or "",
-                "address": _row_val(r, "address", "") or "",
-            }
-    return out
+def _place_of_stay(stay: dict) -> dict | None:
+    """stay 行内嵌的关联 place（v2 按 place_id JOIN；未命中返回 None）。"""
+    if stay.get("place_label") is None and stay.get("place_poi") is None:
+        return None
+    return {
+        "label": stay.get("place_label") or "",
+        "visit_count": 0,
+        "poi": stay.get("place_poi") or "",
+        "behavior": stay.get("place_behavior") or "",
+        "district": stay.get("place_district") or "",
+        "address": stay.get("place_address") or "",
+    }
 
 
 def _load_stays(conn: sqlite3.Connection, device_id: str | None, day_start_ms: int, day_end_ms: int) -> list[dict]:
@@ -272,52 +260,29 @@ def _load_stays(conn: sqlite3.Connection, device_id: str | None, day_start_ms: i
     """
     if device_id is None:
         return []
-    try:
-        rows = conn.execute(
-            "SELECT start_ts, end_ts, grid_key FROM stays "
-            "WHERE device_id=? AND start_ts < ? AND end_ts > ?",
-            (device_id, day_end_ms, day_start_ms),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return []
-    return [
-        {"start_ts": int(r["start_ts"]), "end_ts": int(r["end_ts"]), "grid_key": r["grid_key"]}
-        for r in rows
-    ]
+    from gacore.langTrack import location_reader as lr
+
+    return lr.read_stays(conn, device_id=device_id, overlap=(day_start_ms, day_end_ms))
 
 
 def _load_trips(conn: sqlite3.Connection, device_id: str | None, day_start_ms: int, day_end_ms: int) -> list[dict]:
     """同 _load_stays：trips 表缺失时返回空列表，不清空手机事实。"""
     if device_id is None:
         return []
-    try:
-        rows = conn.execute(
-            "SELECT start_ts, end_ts, dist_m FROM trips "
-            "WHERE device_id=? AND start_ts < ? AND end_ts > ?",
-            (device_id, day_end_ms, day_start_ms),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return []
-    return [
-        {"start_ts": int(r["start_ts"]), "end_ts": int(r["end_ts"]), "dist_m": int(r["dist_m"] or 0)}
-        for r in rows
-    ]
+    from gacore.langTrack import location_reader as lr
+
+    return lr.read_trips(conn, device_id=device_id, overlap=(day_start_ms, day_end_ms))
 
 
 def _load_anomalies(conn: sqlite3.Connection, device_id: str | None, day: str) -> list[dict]:
     """同 _load_stays：anomalies 表缺失时返回空列表，不清空手机事实。"""
     if device_id is None:
         return []
-    try:
-        rows = conn.execute(
-            "SELECT kind, poi, detail FROM anomalies WHERE device_id=? AND day=?",
-            (device_id, day),
-        ).fetchall()
-    except sqlite3.OperationalError:
-        return []
+    from gacore.langTrack import location_reader as lr
+
+    rows = lr.read_anomalies(conn, day=day, device_id=device_id)
     return [
-        {"kind": _row_val(r, "kind", "") or "", "poi": _row_val(r, "poi", "") or "",
-         "detail": _row_val(r, "detail", "") or ""}
+        {"kind": r["kind"] or "", "poi": r["poi"] or "", "detail": r["detail"] or ""}
         for r in rows
     ]
 
@@ -516,10 +481,9 @@ def _fill_card(
     else:
         card["sleep_signal"] = "当日无 daily_stats"
 
-    # 当日 stays / trips（时间窗相交）
+    # 当日 stays / trips（时间窗相交；place 字段由 location_reader 内嵌）
     stays_raw = _load_stays(conn, dev, day_start_ms, day_end_ms)
     trips_raw = _load_trips(conn, dev, day_start_ms, day_end_ms)
-    places_map = _load_places(conn, dev)
 
     # 事实水位：ETL 优先，其次当日 stays/trips 最大 end_ts
     fallback = None
@@ -577,7 +541,7 @@ def _fill_card(
     stay_minutes: dict[str, int] = {}
     stay_briefs: list[StayBrief] = []
     for s, cs, ce in clipped_stays:
-        place = places_map.get(s["grid_key"]) if s["grid_key"] else None
+        place = _place_of_stay(s)
         label = _resolve_label(place, place.get("poi") if place else None)
         poi = (place.get("poi") or "") if place else ""
         mins = (ce - cs) // 60000
@@ -596,7 +560,7 @@ def _fill_card(
         covering = [(s, cs, ce) for s, cs, ce in clipped_stays if s["start_ts"] <= cutoff <= ce]
         if covering:
             s, cs, ce = covering[-1]
-            place = places_map.get(s["grid_key"]) if s["grid_key"] else None
+            place = _place_of_stay(s)
             label = _resolve_label(place, place.get("poi") if place else None)
             current_known = CurrentKnown(
                 label=label,
@@ -617,10 +581,10 @@ def _fill_card(
         next_candidates = [(s[1], s) for s in clipped_stays if s[1] >= t["end_ts"]]
         if prev_candidates:
             prev_candidates.sort(key=lambda x: x[0], reverse=True)
-            prev_label = _stay_label(prev_candidates[0][1], places_map)
+            prev_label = _stay_label(prev_candidates[0][1])
         if next_candidates:
             next_candidates.sort(key=lambda x: x[0])
-            next_label = _stay_label(next_candidates[0][1], places_map)
+            next_label = _stay_label(next_candidates[0][1])
         trip_briefs.append(TripBrief(
             start_hhmm=_hhmm(cs), end_hhmm=_hhmm(ce),
             dist_m=int(t["dist_m"] or 0), from_label=prev_label, to_label=next_label,
@@ -656,9 +620,9 @@ def _fill_card(
     _pack_compact(card)
 
 
-def _stay_label(stay_tuple, places_map: dict) -> str:
+def _stay_label(stay_tuple) -> str:
     s, _, _ = stay_tuple
-    place = places_map.get(s["grid_key"]) if s["grid_key"] else None
+    place = _place_of_stay(s)
     return _resolve_label(place, place.get("poi") if place else None)
 
 
@@ -685,22 +649,20 @@ def _fill_full_extras(conn: sqlite3.Connection, card: FactCard, dev: str | None,
     """full 模式补齐：全历史 places / coverage / persona。不查 events 之外的非必要数据。"""
     if dev is not None:
         try:
-            rows = conn.execute(
-                "SELECT grid_key, label, visit_count, poi, behavior, district, address "
-                "FROM places WHERE device_id=? ORDER BY visit_count DESC LIMIT 4",
-                (dev,),
-            ).fetchall()
+            from gacore.langTrack import location_reader as lr
+
+            rows = lr.read_places(conn, device_id=dev, limit=4)
             card["places"] = [
                 PlaceBrief(
-                    label=_row_val(r, "label", "") or "",
-                    visits=int(_row_val(r, "visit_count", 0) or 0),
-                    poi=_row_val(r, "poi", "") or "",
-                    behavior=_row_val(r, "behavior", "") or "",
-                    address=_row_val(r, "address", "") or "",
+                    label=r.get("label") or "",
+                    visits=int(r.get("visit_count") or 0),
+                    poi=r.get("poi") or "",
+                    behavior=r.get("behavior") or "",
+                    address=r.get("address") or "",
                 )
                 for r in rows
             ]
-        except sqlite3.OperationalError:
+        except Exception:  # noqa: BLE001 - 缺表降级
             card["places"] = []
     # A① 契约覆盖：非 ok 类型
     coverage: list[dict] = []

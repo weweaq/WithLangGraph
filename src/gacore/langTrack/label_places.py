@@ -244,92 +244,144 @@ def save_labels(labels: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(labels, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def apply_labels(db_path: Path = DB_PATH) -> int:
-    """ETL 后调用：按配置文件恢复标签。返回更新的点数。"""
-    labels = load_labels()
-    if not labels:
-        return 0
-    conn = sqlite3.connect(db_path)
-    n = 0
-    for grid_key, label in labels.items():
-        cur = conn.execute(
-            "UPDATE places SET label=? WHERE grid_key=?", (label, grid_key)
-        )
-        n += cur.rowcount
-    conn.commit()
-    conn.close()
+def apply_labels(db_path: Path = DB_PATH) -> int:
+    """ETL 后调用：按配置文件恢复标签。返回更新的点数。
+
+    按"标签行形态"而非 DB 版本分支：
+    - v1/v2 行（grid_key 定位）：UPDATE ... WHERE grid_key=?（v1/v2 places 均有该列）；
+    - v3 行（device_id+place_id 定位）：UPDATE ... WHERE device_id=? AND place_id=?。
+    """
+    try:
+        _, rows = load_label_doc(CONFIG_PATH)
+    except LabelFileError as e:
+        print(f"[label] 标签文件不可用，跳过恢复: {e}")
+        return 0
+    if not rows:
+        return 0
+    conn = sqlite3.connect(db_path)
+    n = 0
+    try:
+        for row in rows:
+            if "place_id" in row and "device_id" in row:
+                cur = conn.execute(
+                    "UPDATE places SET label=?, updated_at=datetime('now','+8 hours') "
+                    "WHERE device_id=? AND place_id=?",
+                    (row["tag"], row["device_id"], row["place_id"]),
+                )
+            else:
+                gk = row.get("grid_key")
+                if not gk:
+                    continue
+                if row.get("device_id"):
+                    # v2 标签行（device_id + grid_key）：设备隔离，不波及他设备同网格地点
+                    cur = conn.execute(
+                        "UPDATE places SET label=? WHERE device_id=? AND grid_key=?",
+                        (row["tag"], row["device_id"], gk),
+                    )
+                else:
+                    cur = conn.execute(
+                        "UPDATE places SET label=? WHERE grid_key=?", (row["tag"], gk)
+                    )
+            n += cur.rowcount
+        conn.commit()
+    finally:
+        conn.close()
     return n
 
 
-def confirm() -> None:
-    """交互式确认：打印主点地址 + 家/公司置信度候选，让用户输入标签。
-
-    候选制：ETL 推断的 candidate_label 仅作建议展示，用户确认前 label 保持中性
-    （未知/常驻点），确认后写入 place_labels.json 持久化。
-
-    P1-1 确认闭环：优先展示【待确认候选点】（label=未知 且 candidate_label 非空），
-    用户确认后正式定名；随后展示已确认点供复核修改。
-    """
+def confirm() -> None:
+    """交互式确认：打印主点地址 + 家/公司置信度候选，让用户输入标签。
+
+    候选制：ETL 推断的 candidate_label 仅作建议展示，用户确认前 label 保持中性
+    （未知/常驻点），确认后写入 place_labels.json 持久化。
+
+    P1-1 确认闭环：优先展示【待确认候选点】（label=未知 且 candidate_label 非空），
+    用户确认后正式定名；随后展示已确认点供复核修改。
+
+    双格式：v1 库写平铺 {grid_key: tag}；v2 库（user_version>=2）写 v3 doc
+    （(device_id, place_id) 主键）。位置事实读取经 location_reader 双读层。
+    """
+    from gacore.langTrack import location_reader as lr
     from gacore.langTrack.geocode import _amap_key, reverse_geocode
 
-
-    key = _amap_key()
-    labels = load_labels()
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    # 待确认候选点优先（P1-1 画像确认入口），再列已确认点供复核
-    rows = conn.execute(
-        "SELECT grid_key, lat, lon, visit_count, candidate_label, "
-        "confidence_home, confidence_work, poi, address, matched_level, label "
-        "FROM places "
-        "WHERE label='未知' AND candidate_label IS NOT NULL "
-        "ORDER BY visit_count DESC LIMIT 6"
-    ).fetchall()
-    confirmed_rows = conn.execute(
-        "SELECT grid_key, lat, lon, visit_count, candidate_label, "
-        "confidence_home, confidence_work, poi, address, matched_level, label "
-        "FROM places WHERE label IN ('家','公司') "
-        "ORDER BY visit_count DESC LIMIT 4"
-    ).fetchall()
-    conn.close()
-
-    print("=== 常驻点标签确认 ===")
-    print("输入标签: 家 / 公司 / 未知（直接回车=保持不变）")
-    print("候选为 ETL 置信度推断，确认后正式写入画像\n")
-
-    if not rows and not confirmed_rows:
-        print("（无常驻点可确认）")
-        return
-
-    if rows:
-        print("-- 待确认候选（ETL 推断，请确认是否定名） --")
-        for r in rows:
-            info = reverse_geocode(r["lat"], r["lon"], key)
-            addr = info.get("formatted", "") if info else (r["address"] or "")
-            poi = info.get("poi", "") if info else (r["poi"] or "")
-            cur = labels.get(r["grid_key"], "未知")
-            cand = r["candidate_label"] or "-"
-            conf = f"(家 {r['confidence_home']:.2f} / 公司 {r['confidence_work']:.2f})"
-            print(f"  ({r['lat']:.4f},{r['lon']:.4f}) 访问{r['visit_count']}次 候选:{cand} {conf}")
-            print(f"    {poi} | {addr}")
-            answer = input(f"    标签 [{cur}] (家/公司/未知/回车): ").strip()
-            if answer in ("家", "公司", "未知"):
-                labels[r["grid_key"]] = answer
-
-    if confirmed_rows:
-        print("\n-- 已确认点（可复核修改） --")
-        for r in confirmed_rows:
-            poi = r["poi"] or ""
-            cur = labels.get(r["grid_key"], r["label"])
-            conf = f"(家 {r['confidence_home']:.2f} / 公司 {r['confidence_work']:.2f})"
-            print(f"  [{r['label']}] ({r['lat']:.4f},{r['lon']:.4f}) 访问{r['visit_count']}次 {conf} {poi}")
-            answer = input(f"    标签 [{cur}] (家/公司/未知/回车): ").strip()
-            if answer in ("家", "公司", "未知"):
-                labels[r["grid_key"]] = answer
-
-    save_labels(labels)
-    n = apply_labels()
-    print(f"\n已保存 {len(labels)} 个标签, 更新 {n} 个常驻点")
+    key = _amap_key()
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    v2 = lr.is_v2(conn)
+    # 待确认候选点优先（P1-1 画像确认入口），再列已确认点供复核
+    rows = lr.read_places(conn, candidate_only=True, limit=6)
+    confirmed_rows = lr.read_places(conn, label_in=("家", "公司"), limit=4)
+    conn.close()
+
+    # 当前标签：v1 → {grid_key: tag}；v3 → {(device_id, place_id): row}
+    try:
+        _, label_rows = load_label_doc(CONFIG_PATH)
+    except LabelFileError as e:
+        print(f"[label] 标签文件不可读: {e}")
+        return
+    v3_rows = [r for r in label_rows if "place_id" in r and "device_id" in r]
+    grid_labels = {r["grid_key"]: r["tag"] for r in label_rows if r.get("grid_key")}
+    v3_map = {(r["device_id"], r["place_id"]): r for r in v3_rows}
+
+    def _cur_tag(p: dict) -> str:
+        if v2 and p.get("place_id"):
+            row = v3_map.get((p["device_id"], p["place_id"]))
+            return row["tag"] if row else "未知"
+        return grid_labels.get(p["grid_key"], "未知")
+
+    def _upsert(p: dict, tag: str) -> None:
+        if v2 and p.get("place_id"):
+            v3_map[(p["device_id"], p["place_id"])] = {
+                "device_id": p["device_id"],
+                "place_id": p["place_id"],
+                "anchor_grid_key": p["grid_key"],
+                "tag": tag,
+                "updated_at": now_cst(),
+            }
+        else:
+            grid_labels[p["grid_key"]] = tag
+
+    print("=== 常驻点标签确认 ===")
+    print("输入标签: 家 / 公司 / 未知（直接回车=保持不变）")
+    print("候选为 ETL 置信度推断，确认后正式写入画像\n")
+
+    if not rows and not confirmed_rows:
+        print("（无常驻点可确认）")
+        return
+
+    if rows:
+        print("-- 待确认候选（ETL 推断，请确认是否定名） --")
+        for r in rows:
+            info = reverse_geocode(r["lat"], r["lon"], key)
+            addr = info.get("formatted", "") if info else (r["address"] or "")
+            poi = info.get("poi", "") if info else (r["poi"] or "")
+            cur = _cur_tag(r)
+            cand = r["candidate_label"] or "-"
+            conf = f"(家 {r['confidence_home']:.2f} / 公司 {r['confidence_work']:.2f})"
+            print(f"  ({r['lat']:.4f},{r['lon']:.4f}) 访问{r['visit_count']}次 候选:{cand} {conf}")
+            print(f"    {poi} | {addr}")
+            answer = input(f"    标签 [{cur}] (家/公司/未知/回车): ").strip()
+            if answer in ("家", "公司", "未知"):
+                _upsert(r, answer)
+
+    if confirmed_rows:
+        print("\n-- 已确认点（可复核修改） --")
+        for r in confirmed_rows:
+            poi = r["poi"] or ""
+            cur = _cur_tag(r)
+            conf = f"(家 {r['confidence_home']:.2f} / 公司 {r['confidence_work']:.2f})"
+            print(f"  [{r['label']}] ({r['lat']:.4f},{r['lon']:.4f}) 访问{r['visit_count']}次 {conf} {poi}")
+            answer = input(f"    标签 [{cur}] (家/公司/未知/回车): ").strip()
+            if answer in ("家", "公司", "未知"):
+                _upsert(r, answer)
+
+    if v2:
+        write_labels_v3_atomic(CONFIG_PATH, list(v3_map.values()))
+        n = apply_labels_v3(DB_PATH, list(v3_map.values()))
+    else:
+        save_labels(grid_labels)
+        n = apply_labels()
+    print(f"\n已保存 {len(v3_map) if v2 else len(grid_labels)} 个标签, 更新 {n} 个常驻点")
 
 
 def main() -> None:

@@ -2111,3 +2111,25 @@ QQ 机器人「韩立」已有完整 agent 回路，但面对随口话（“吃�
 
 ### 待办更新
 - [x] Task 4：迁移稳定 ID、人工 tag 与 geocode 缓存（label v3 两阶段切换 + 35 用例通过）。
+
+
+## 2026-09-01：位置智能增强 Task 5（v1/v2 双读消费者，不执行激活）
+
+### 背景
+位置智能增强计划 Task 5：所有消费者（fact_card / persona / report / label CLI）在 activate 前同时兼容迁移前后 schema——位置事实读取统一收敛到 location_reader 双读层（v1 按 (device_id,grid_key) JOIN、v2 按 (device_id,place_id) JOIN），etl.run 增加 v2 分支守卫，异常检测/候选推断/报告全链路设备隔离（多设备必须显式选择，禁止合并画像）。本任务禁止执行 activate，只证明消费者代码兼容 shadow/正式两形态。
+
+### 已完成
+1. **`src/gacore/langTrack/location_reader.py`（新增）**：v1/v2 双读层唯一入口——`read_places/read_stays/read_trips/read_anomalies/read_place_cells/place_grid_map` 统一行结构（兼容契约只增不删：v1 下 place_id/from_place_id/to_place_id 恒 None，point_count/visit_episodes 映射 visit_count；stay 行内嵌 place_label/poi/poi_fallback/address/behavior/district，JOIN 只在本模块一处实现）。列级容错：`PRAGMA table_info` 探测实际列，缺失列补 `NULL AS col` 保持行结构稳定；表缺失/坏查询返回空列表不拖垮手机事实；`place_grid_map` 在 v2 下展开 place_cells 成员网格，供"按原始网格找地点"的消费者获得一致语义。
+2. **`src/gacore/langTrack/fact_card.py` / `persona.py` / `report.py` / `label_places.py`（修改）**：全部直接 SQL 改经双读层；label CLI 的 v2 标签行按 (device_id,grid_key) 设备隔离更新。
+3. **`src/gacore/langTrack/location_migration.py`（修改）**：`rebuild_location_v2`——v2 激活后 etl.run 走全量重建分支：复用 `build_location_shadow` 计算源；place_id 沿用正式表现有 ID（`resolve_place_ids` + `_rewrite_shadow_place_ids` 统一改写）；统计列 UPSERT 保留人工标签与达标 geocode 缓存（中心偏移>50m 失效）；删除无 stay 支持的地点；sqlite_sequence 重置保证连跑幂等（含自增 id 逐行一致）。
+4. **`src/gacore/langTrack/etl.py`（修改）**：`run()` 头部按 `PRAGMA user_version` 分支——v2 时位置事实只走 `rebuild_location_v2`，`_migrate_fact_tables`/`_stamp_fact_tables` 跳过位置表（schema 冻结）；`_build_location_v1` 封装 v1 管线。Task 5c 设备隔离：`_migrate_anomalies_unique`（旧 UNIQUE(day,kind,grid_key) 跨设备吞行 → 加入 device_id，重建迁移保留历史行）；`detect_anomalies` 家/公司按 (device_id, 地点键) 匹配（v1 键 grid_key / v2 键 place_id——stay.grid_key 可能只是成员网格）；`_group_stays_by_day` 按 (day,device_id) 分组；`infer_home_work_candidates` 全 (device_id,grid_key) 键统计。Task 5d 设备隔离：`report()`/`_fusion`/`_outings`/`_consumption`/`_rhythm_weather` 全链路 device_id 过滤，`resolve_report_device` 多设备未指定抛 `MultiDeviceError`（单设备自动采用，CLI `--device`/`--list-devices`，退出码 2），多设备同日快照文件名带设备段不互相覆盖。
+5. **测试（五个新文件 99 用例）**：`test_langTrack_location_reader.py`（37：v1/v2 字段集一致、v1 兼容映射、v2 place_id JOIN（成员网格≠代表网格不误挂）、设备隔离、最小 schema 容错）；`test_langTrack_anomalies.py`（14：唯一键迁移、v1/v2 家公司隔离、跨设备同日同类同网格并存、候选推断键隔离、路由变化跨设备不吞行、v2 标签行隔离）；`test_langTrack_location_rebuild.py`（9：rebuild 守卫/ID 沿用/缓存失效/双跑幂等/etl.run v2 分支）；`test_langTrack_report_device.py`（16：多设备必须选择、屏幕时间/通知高峰/persona 不合并、快照设备段、CLI 退出码）；`test_langTrack_shape_snapshots.py`（23：同一组语义数据跑 v1/v2 两形态——FactCard 顶层键集与 StayBrief/TripBrief/PlaceBrief/AnomalyBrief/CurrentKnown 字面契约一致、旧字段 label/from_label/to_label/visits 语义不变、report profile JSON 键路径递归一致）。
+
+### 验证（维护测试日志）
+- Task 5 单测：`test_langTrack_location_reader.py` **37 passed** + `test_langTrack_anomalies.py` **14 passed** + `test_langTrack_location_rebuild.py` **9 passed** + `test_langTrack_report_device.py` **16 passed** + `test_langTrack_shape_snapshots.py` **23 passed**，合计 **99 passed**（首跑修复：request.param 在方法内不可得改嵌套 fixture sema_pair；report hours 查询 device_id or "" 误过滤改条件拼接）。
+- 回归：全套 langTrack 组 `pytest tests -k langTrack` **288 passed**；全套 `pytest tests` **767 passed / 12 failed（存量环境问题：test_cli.py pygraphviz 缺失 ×11 + test_qq.py ×1，单独复现与本次改动无关，test_qq/test_cli 均不引用 langTrack）**。
+- `merge_device_aliases` 复核：查询已全 device_id 显式（events 归一 + (device,grid) 合并），v2 places 保留 UNIQUE(device_id,grid_key) 列兼容，且调用位置在 v2 rebuild 分支之前（events 归一是 v2 重建的事实源）。
+
+### 待办更新
+- [x] Task 5：v1/v2 双读消费者（location_reader + rebuild_location_v2 + 设备隔离 + 99 用例通过），未执行 activate。
+- [ ] Task 6：坐标质量与完整高德坐标边界。

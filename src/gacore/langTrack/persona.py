@@ -517,31 +517,13 @@ def _build(conn: sqlite3.Connection, device_id: str | None, days: int) -> dict[s
 
 
 
-    # ---- 4. 生活规律（routine）----
-
-    pfilter = ""
-
-    pparams: list = []
-
-    if device_id:
-
-        pfilter = "AND s.device_id=?"
-
-        pparams = [device_id]
-
+    # ---- 4. 生活规律（routine）---- 位置事实经 location_reader 双读层（v1/v2 兼容）
     try:
-        home = cur.execute(
-            "SELECT s.start_ts FROM stays s JOIN places p ON s.grid_key=p.grid_key "
-            "AND s.device_id=p.device_id WHERE p.label='家' " + pfilter,
-            pparams,
-        ).fetchall()
-        work = cur.execute(
-            "SELECT s.start_ts FROM stays s JOIN places p ON s.grid_key=p.grid_key "
-            "AND s.device_id=p.device_id WHERE p.label='公司' " + pfilter,
-            pparams,
-        ).fetchall()
-    except sqlite3.OperationalError:
-        # 极简库/测试夹具可能无 stays/places 表 -> 规律维度退化为空
+        from gacore.langTrack import location_reader as lr
+        all_stays = lr.read_stays(conn, device_id=device_id, with_place=True)
+        home = [(s["start_ts"],) for s in all_stays if s["place_label"] == "家"]
+        work = [(s["start_ts"],) for s in all_stays if s["place_label"] == "公司"]
+    except Exception:  # noqa: BLE001 - 缺表降级：规律维度退化为空
         home, work = [], []
     work_start = _avg_hhmm(work)
 
@@ -549,22 +531,10 @@ def _build(conn: sqlite3.Connection, device_id: str | None, days: int) -> dict[s
 
     regular = home_n >= 3 and work_n >= 3
 
-    tparams: list = [min_day]
-
-    tfilter = ""
-
-    if device_id:
-
-        tfilter = "AND device_id=?"
-
-        tparams = [min_day, device_id]
-
     try:
-        trips = cur.execute(
-            f"SELECT start_ts FROM trips WHERE day>=? {tfilter}", tparams
-        ).fetchall()
-    except sqlite3.OperationalError:
-        # 极简库/测试夹具可能无 trips 表 -> 通勤稳定性退化为 False
+        from gacore.langTrack import location_reader as lr
+        trips = [(t["start_ts"],) for t in lr.read_trips(conn, device_id=device_id, day_from=min_day)]
+    except Exception:  # noqa: BLE001 - 缺表降级：通勤稳定性退化为 False
         trips = []
     commute_stable = len(trips) >= 3
 
