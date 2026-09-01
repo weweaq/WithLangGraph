@@ -162,9 +162,9 @@ ETL_VERSION = "1.0.0"
 # Task 6 §3.2 坐标质量日表 DDL（只读聚合，v1/v2 共用；ETL 幂等重建）。
 # 独立成常量：_write_daily_quality 写入前幂等补建——build_location_shadow 等
 # 自建连接的库可能未执行过 etl._SCHEMA（P1 修复：旧库跑 --location-shadow 崩溃）。
-_DAILY_QUALITY_DDL = """
--- Task 6 §3.2 坐标质量日表（只读聚合，v1/v2 共用；ETL 幂等重建）
-CREATE TABLE IF NOT EXISTS daily_location_quality (
+# 常量只含单条 CREATE 语句（无 SQL 注释）：_write_daily_quality 用 conn.execute
+# 补建——executescript 会隐式 COMMIT 挂起事务，破坏 v1 管线中途失败的整体回滚。
+_DAILY_QUALITY_DDL = """CREATE TABLE IF NOT EXISTS daily_location_quality (
   day TEXT NOT NULL,
   device_id TEXT NOT NULL,
   points_total INTEGER NOT NULL,
@@ -179,11 +179,10 @@ CREATE TABLE IF NOT EXISTS daily_location_quality (
   created_at TEXT NOT NULL DEFAULT (datetime('now','+8 hours')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now','+8 hours')),
   PRIMARY KEY(day, device_id)
-);
-"""
+)"""
 
 
-_SCHEMA = f"""
+_SCHEMA = ("""
 
 CREATE TABLE IF NOT EXISTS sessions (
 
@@ -511,9 +510,8 @@ CREATE TABLE IF NOT EXISTS grid_pois (
   queried_at INTEGER,
   PRIMARY KEY(grid_lat, grid_lon)
 );
-
-{_DAILY_QUALITY_DDL}
-
+""" + _DAILY_QUALITY_DDL + """
+;
 -- B5 ETL 运行血缘：每次 ETL 运行一条记录
 CREATE TABLE IF NOT EXISTS etl_runs (
   run_id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -550,10 +548,7 @@ CREATE TABLE IF NOT EXISTS etl_state (
   last_run_at  TEXT,
   updated_at   TEXT DEFAULT (datetime('now','+8 hours'))
 );
-
-"""
-
-
+""")
 
 
 def clean_ts(ts: int) -> bool:
@@ -1173,6 +1168,8 @@ def infer_home_work_candidates(conn: sqlite3.Connection) -> int:
 
     import datetime
 
+    from gacore.langTrack import location_facts as lf
+
     for device_id, ts, raw in rows:
 
         try:
@@ -1183,10 +1180,11 @@ def infer_home_work_candidates(conn: sqlite3.Connection) -> int:
 
             continue
 
-        lat, lon = p.get("lat"), p.get("lon")
-        if lat is None or lon is None:
+        # Task 6：共用唯一解析入口（非法坐标/ (0,0) 与位置事实同规则拒绝）
+        pt = lf.parse_location_point(device_id, ts, p)
+        if pt is None:
             continue
-        gk = f"{round(lat * 1000) / 1000:.3f},{round(lon * 1000) / 1000:.3f}"
+        gk = lf.grid_key_of(pt.lat, pt.lon)
         dt = datetime.datetime.fromtimestamp(ts / 1000, tz=_TZ_CST)
         hour = dt.hour
         if hour < 5:
@@ -2108,9 +2106,11 @@ def _write_daily_quality(
     rows 为 location_facts.daily_quality_rows 产物（v1/v2 管线共用本入口，
     表名固定不随 user_version 切换）。写入前幂等补建表——shadow 等自建连接
     的路径可能未执行过 etl._SCHEMA（P1：旧库跑 --location-shadow 崩溃）。
+    用 execute 而非 executescript：后者会隐式 COMMIT 挂起事务，破坏 v1
+    管线中途失败的整体回滚。
     """
-    conn.executescript(_DAILY_QUALITY_DDL)
-    if incremental_active:
+    conn.execute(_DAILY_QUALITY_DDL)
+    if incremental_active and affected_days:
         ph = ",".join("?" * len(affected_days))
         conn.execute(f"DELETE FROM daily_location_quality WHERE day IN ({ph})", list(affected_days))
     else:
@@ -2261,8 +2261,9 @@ def _build_location_v1(conn: sqlite3.Connection, events, incremental_active: boo
 
 
     # places：保留已标注 label（家/公司/未知），只更新统计；新点以"未知"插入
-
-    places = build_places(geom_points)
+    # 用原始点（未过滤）：v1 visit_count 一直是"网格内原始 location 点数"，
+    # 与 v2 point_count 同口径（§2.3）；精度过滤只作用于 stays/trips 几何构建
+    places = build_places(points)
 
     for p in places:
 

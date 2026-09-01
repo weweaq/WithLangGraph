@@ -799,3 +799,18 @@ def to_amap_coord(lat: float, lon: float, coord_system: str) -> tuple[float, flo
     if system == "wgs84":
         return wgs84_to_gcj02(lat, lon)
     return lat, lon
+
+
+_unknown_coord_warned_scopes: set[str] = set()
+
+
+def warn_unknown_coord_once(scope: str) -> None:
+    """§3.3 source=unknown 警告：按原样调用高德（不猜坐标系），每个 scope 只提示一次。
+
+    单点实现供 geocode/routes 共用（测试可用 monkeypatch 重置
+    _unknown_coord_warned_scopes 为空集）。
+    """
+    if scope not in _unknown_coord_warned_scopes:
+        _unknown_coord_warned_scopes.add(scope)
+        print(f"[{scope}] 坐标制为 unknown：坐标原样调用高德（如有偏移请在 "
+              "data/location_coord_systems.json 声明设备坐标系）")

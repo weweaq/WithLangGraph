@@ -28,7 +28,7 @@ from pathlib import Path
 
 import datetime  # noqa: E402  (routes 仅在此模块用 datetime，局部已无顶层导入)
 
-from gacore.langTrack.location_facts import to_amap_coord
+from gacore.langTrack.location_facts import to_amap_coord, warn_unknown_coord_once
 
 _TZ_CST = datetime.timezone(datetime.timedelta(hours=8))
 
@@ -177,33 +177,25 @@ def route_key_of(polyline_points: list[tuple[float, float]]) -> str:
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
 
 
-_unknown_coord_warned = False
-
-
-def _warn_unknown_coord(scope: str) -> None:
-    """§3.3 source=unknown 警告：按原样调用高德（不猜坐标系），模块级只提示一次。"""
-    global _unknown_coord_warned
-    if not _unknown_coord_warned:
-        _unknown_coord_warned = True
-        print(f"[{scope}] 坐标制为 unknown：坐标原样调用高德（如有偏移请在 "
-              "data/location_coord_systems.json 声明设备坐标系）")
-
-
 def direction_polyline(
     lat1: float, lon1: float, lat2: float, lon2: float,
     key: str, mode: str = "walking",
     coord_system: str = "unknown",
+    coord_system_end: str | None = None,
 ) -> list[tuple[float, float]] | None:
     """高德路径规划：返回路线坐标点列表 [(lat, lon), ...]；失败返回 None。
 
-    起终点按 coord_system 经 to_amap_coord 转换后请求（§3.3：所有高德入口
-    统一转换）；返回的 polyline 固定为高德 GCJ02 坐标（由调用方落
+    起终点按各自 coord_system 经 to_amap_coord 转换后请求（§3.3：所有高德
+    入口统一转换）；coord_system_end 为 None 时终点沿用 coord_system（两端
+    同制）。跨坐标制时段边界的行程两端可分别声明，避免按起点制二次偏移
+    终点。返回的 polyline 固定为高德 GCJ02 坐标（由调用方落
     polyline_coord_system，本函数不落库）。
     """
-    if (coord_system or "unknown").strip().lower() == "unknown":
-        _warn_unknown_coord("routes")
+    cs_end = coord_system_end if coord_system_end is not None else coord_system
+    if (coord_system or "unknown").strip().lower() == "unknown" or (cs_end or "unknown").strip().lower() == "unknown":
+        warn_unknown_coord_once("routes")
     lat1, lon1 = to_amap_coord(lat1, lon1, coord_system)
-    lat2, lon2 = to_amap_coord(lat2, lon2, coord_system)
+    lat2, lon2 = to_amap_coord(lat2, lon2, cs_end)
     url = DIRECTION_URL if mode == "walking" else DIRECTION_URL.replace("/walking", f"/{mode}")
     params = urllib.parse.urlencode({
         "origin": f"{lon1},{lat1}",
@@ -245,8 +237,10 @@ def incremental_encode_trips(db_path: Path = DB_PATH, max_n: int = _MAX_ENCODE_P
 
     成功才写 polyline/route_key/route_mode/route_encoded_at（polyline 为高德
     GCJ02，同步标记 polyline_coord_system='gcj02'，§3.3）；失败跳过留待下次
-    重试。起终点按 trips.endpoint_coord_system 对应配置经 to_amap_coord 转换。
-    单次默认最多 max_n 段（配额节流，远低于 5000 次/日）。返回成功编码数。
+    重试。起终点各自按 (device_id, start_ts/end_ts) 现行配置解析坐标制并经
+    to_amap_coord 转换（跨坐标制时段边界的行程两端独立转换；trips. endpoint_coord_system 单列记录起点制，配置在 ETL 后被修正时以本次
+    重解析为准）。单次默认最多 max_n 段（配额节流，远低于 5000 次/日）。
+    返回成功编码数。
     """
     from gacore.langTrack.etl_config import load_coord_systems, resolve_coord_system
 
@@ -255,7 +249,7 @@ def incremental_encode_trips(db_path: Path = DB_PATH, max_n: int = _MAX_ENCODE_P
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        "SELECT id, device_id, start_ts, start_lat, start_lon, end_lat, end_lon FROM trips "
+        "SELECT id, device_id, start_ts, end_ts, start_lat, start_lon, end_lat, end_lon FROM trips "
         "WHERE route_encoded_at IS NULL ORDER BY start_ts LIMIT ?", (max_n,)
     ).fetchall()
     if not rows:
@@ -268,10 +262,11 @@ def incremental_encode_trips(db_path: Path = DB_PATH, max_n: int = _MAX_ENCODE_P
     for r in rows:
         # 高德个人档 QPS 较低，连续快速调用会触发 CUQPS 限流；每段间隔 0.5s
         time.sleep(0.5)
-        cs = resolve_coord_system(r["device_id"], r["start_ts"], coord_cfg)
+        cs_start = resolve_coord_system(r["device_id"], r["start_ts"], coord_cfg)
+        cs_end = resolve_coord_system(r["device_id"], r["end_ts"], coord_cfg)
         pts = direction_polyline(
             r["start_lat"], r["start_lon"], r["end_lat"], r["end_lon"],
-            key, _ROUTE_MODE, coord_system=cs,
+            key, _ROUTE_MODE, coord_system=cs_start, coord_system_end=cs_end,
         )
         if not pts:
             print(f"[routes] 跳过段 id={r['id']}（规划失败，留待下次）")
@@ -293,7 +288,7 @@ def run(db_path: Path = DB_PATH, force_all: bool = False) -> None:
     _amap_key()  # 提前校验 Key
     if force_all:
         conn = sqlite3.connect(db_path)
-        conn.execute("UPDATE trips SET route_encoded_at=NULL, polyline=NULL, route_key=NULL, route_mode=NULL")
+        conn.execute("UPDATE trips SET route_encoded_at=NULL, polyline=NULL, route_key=NULL, route_mode=NULL, polyline_coord_system=NULL")
         conn.commit()
         conn.close()
     incremental_encode_trips(db_path)

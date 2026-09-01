@@ -2178,12 +2178,23 @@ subagent 独立复审提交 c97d2d5 + 工作区索引修复：无 P1 级正确�
 - **P2 shadow 几何未过滤精度**：v1 管线几何输入为 `geom_points`（§3.1 过滤后），shadow 仍用全量 `all_points`，用户开启 `apply_accuracy_filter=True` 后两者口径分叉。修复：shadow `build_stays/build_trips` 改用 `geom_points`；统计列保持原始点（§2.3 明确 point_count 为原始点数）。测试锁定：单段停留 n_points=7（过滤后）vs point_count=8（原始）、accuracy_known_points=8/avg=80.0（窗口内原始点）。
 - **增量质量行 stale 疑虑（核实非缺陷）**：增量模式 DELETE 仅 affected days，但 `load_events` 为全量、`daily_quality_rows` 产全量行集，UPSERT 覆盖全部 (day,device) 键，无残留；补测试锁定语义（追加事件后受影响日 25→26 合并、未受影响日与首跑一致、无新增键）。
 
+### review-loop 第二轮处置（subagent 复核意见）
+- **P1 `_SCHEMA` 拼接丢分号（第二轮修复引入、全量回归捕获）**：`_DAILY_QUALITY_DDL` 改为单条语句（供 `conn.execute` 幂等补建）后末尾无分号，f-string 改拼接时未补——`executescript(etl._SCHEMA)` 在质量表 DDL 与 `etl_runs` 之间报 `near "CREATE": syntax error`，50 failed/116 errors。修复：拼接处补独立分号行；新增 `TestSchemaDdlInvariants`（单条 execute 可建表 + executescript 整体建库含质量表）锁定双路径契约。
+- **P2 起终点跨坐标制时段边界**：`direction_polyline` 原按起点制转换终点（如起点 wgs84/终点 gcj02 会二次偏移终点）。修复：新增 `coord_system_end` 参数（None 沿用起点制）；`incremental_encode_trips` 按 `(device_id, start_ts/end_ts)` 各自现行解析，配置在 ETL 后被修正时以重解析为准；`run(force_all)` 重置时同步清空 `polyline_coord_system`。
+- **P2 v1 places 统计口径**：`_build_location_v1` 的 `build_places` 误用 `geom_points`，v1 visit_count 一直是"网格内原始 location 点数"，改为原始点 `points` 与 v2 point_count 同口径（§2.3）；精度过滤只作用于 stays/trips 几何。
+- **P2 executescript 隐式 COMMIT**：`_write_daily_quality` 幂等补建原用 `executescript`，会隐式提交挂起事务，破坏 v1 管线中途失败的整体回滚；DDL 去注释后改单条 `conn.execute`。
+- **P3 警告去重**：geocode/routes 各自维护模块级 unknown 警告 flag，下沉为 `location_facts.warn_unknown_coord_once(scope)`（每 scope 一次）；`_probe_batch_support` 探测请求固定 `coord_system="gcj02"`，避免已配置设备误触发 unknown 警告。
+- **P3 配置校验**：`load_coord_systems` 拒绝空 device_id 与空区间（end_ts <= start_ts）。
+- **P3 单一解析入口**：`infer_home_work_candidates` 改用 `location_facts.parse_location_point`/`grid_key_of`（非法坐标、(0,0) 与位置事实同规则拒绝），删除本地重复解析。
+- **P3 增量 guard**：`_write_daily_quality` 增量分支加 `affected_days` 非空 guard，避免空集生成 `IN ()` 非法 SQL。
+
 ### 验证（维护测试日志）
-- langTrack 组：`pytest tests -k langTrack` **345 passed**（Task 5 review 后 305 + 40 新增；其中 37 为主体用例、3 为 review-loop 回归）。
+- langTrack 组：`pytest tests -k langTrack` **349 passed**（Task 5 review 后 305 + Task 6 主体 40 + 第二轮 4：routes 起终点独立坐标制 2 + schema DDL 双路径契约 2）。
+- 全量套件：`pytest tests` **839 passed / 12 failed**——11 个 `test_cli.py` pygraphviz 环境缺失 + 1 个 `test_qq.py` 存量断言，stash 基线复验均为存量问题，与本次改动无关。
 - 坐标语义抽查：geocode/routes 测试断言最终 HTTP 请求 URL 中的 location/origin/destination 坐标（wgs84→GCJ02 转换值、gcj02/unknown 原样、belt POI 网格坐标原样）。
 - ruff：触及文件净新增 0（etl.py/routes.py/geocode.py 各 12/6/8 项与父提交基线逐项一致，仅行号平移；location_facts/location_migration/label_places 及全部测试文件 clean）。
 - 真实库策略：首版保持 `apply_accuracy_filter=False` 只观测（etl_config DEFAULTS），provider/accuracy/coverage 分布待 dashboard 实测后由用户确认开启。
 
 ### 待办更新
-- [x] Task 6：坐标质量与完整高德坐标边界（daily_location_quality + to_amap_coord 全入口 + trips 坐标制两列 + build_trips 参数化 + 40 用例，含 review-loop 回归 3 项）。
+- [x] Task 6：坐标质量与完整高德坐标边界（daily_location_quality + to_amap_coord 全入口 + trips 坐标制两列 + build_trips 参数化 + 44 用例，含 review-loop 两轮回归 7 项）。
 - [ ] Task 7：迁移 FactCard 与 tool 兼容契约。

@@ -397,6 +397,26 @@ class TestShadowBuild:
         conn.close()
 
 
+class TestSchemaDdlInvariants:
+    """_DAILY_QUALITY_DDL / _SCHEMA 拼接契约（review 回归：DDL 拼进 _SCHEMA 丢分号）。
+
+    - _DAILY_QUALITY_DDL 是单条语句：conn.execute 可直接执行（_write_daily_quality 补建路径）；
+    - _SCHEMA 内嵌该 DDL 后仍可 executescript 整体建库，且表齐全（v1 建库路径）。
+    """
+
+    def test_quality_ddl_single_statement_execute(self):
+        conn = sqlite3.connect(":memory:")
+        conn.execute(etl._DAILY_QUALITY_DDL)
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+        assert "daily_location_quality" in names
+
+    def test_schema_executescript_embeds_quality_table(self):
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(etl._SCHEMA)
+        names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+        assert {"daily_location_quality", "etl_runs", "trips", "places"} <= names
+
+
 class TestDailyQuality:
     """§3.2 坐标质量日表：shadow 与 v1 管线共表写入（只读聚合，幂等重建）。"""
 

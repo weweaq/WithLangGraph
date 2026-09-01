@@ -133,7 +133,7 @@ class TestAroundUrlCoords:
 
 class TestUnknownWarning:
     def test_unknown_warns_once_per_module(self, fake_urlopen, monkeypatch, capsys):
-        monkeypatch.setattr(geocode, "_unknown_coord_warned", False)
+        monkeypatch.setattr(lf, "_unknown_coord_warned_scopes", set())
         geocode._regeo_one(31.98, 118.78, "k", coord_system="unknown")
         geocode._regeo_one(31.99, 118.79, "k", coord_system="unknown")
         out = capsys.readouterr().out
@@ -142,7 +142,7 @@ class TestUnknownWarning:
         assert _location_coords(fake_urlopen[0]) == [(31.98, 118.78)]
 
     def test_known_system_no_warning(self, fake_urlopen, monkeypatch, capsys):
-        monkeypatch.setattr(geocode, "_unknown_coord_warned", False)
+        monkeypatch.setattr(lf, "_unknown_coord_warned_scopes", set())
         geocode._regeo_one(31.98, 118.78, "k", coord_system="gcj02")
         assert "坐标制为 unknown" not in capsys.readouterr().out
 

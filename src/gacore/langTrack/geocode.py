@@ -26,7 +26,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from gacore.langTrack.location_facts import to_amap_coord
+from gacore.langTrack.location_facts import to_amap_coord, warn_unknown_coord_once
 
 DB_PATH = Path(__file__).resolve().parents[3] / "data" / "langTrack.db"
 REVERSED_GEO_URL = "https://restapi.amap.com/v3/geocode/regeo"
@@ -116,22 +116,10 @@ def _amap_key() -> str:
     return key
 
 
-_unknown_coord_warned = False
-
-
-def _warn_unknown_coord() -> None:
-    """§3.3 source=unknown 警告：按原样调用高德（不猜坐标系），模块级只提示一次。"""
-    global _unknown_coord_warned
-    if not _unknown_coord_warned:
-        _unknown_coord_warned = True
-        print("[geocode] 坐标制为 unknown：坐标原样调用高德（如有偏移请在 "
-              "data/location_coord_systems.json 声明设备坐标系）")
-
-
 def _to_amap(lat: float, lon: float, coord_system: str) -> tuple[float, float]:
     """入口统一转换 + unknown 警告（§3.3：所有高德入口收到的坐标先经 to_amap_coord）。"""
     if (coord_system or "unknown").strip().lower() == "unknown":
-        _warn_unknown_coord()
+        warn_unknown_coord_once("geocode")
     return to_amap_coord(lat, lon, coord_system)
 
 
@@ -229,8 +217,10 @@ def _probe_batch_support(key: str) -> bool:
     global _SUPPORT_BATCH
     if _SUPPORT_BATCH is not None:
         return _SUPPORT_BATCH
-    pts = [(31.99, 118.78), (31.99 + 0.001, 118.78)]
-    out, failed = _regeo_request(pts, key)
+    pts = [(31.99, 118.78), (31.99 + 0.001, 118.78)]
+    # 探测点为硬编码测试坐标，固定按 gcj02 原样放行（identity），避免误触发
+    # unknown 坐标制警告——业务数据是否声明坐标系与探测无关
+    out, failed = _regeo_request(pts, key, coord_system="gcj02")
     _SUPPORT_BATCH = (not failed)
     if not _SUPPORT_BATCH:
         print("[geocode] 当前 Key 不支持多点批量 regeo（返回单点结构），已降级为逐点编码")

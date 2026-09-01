@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import pytest
 
 from gacore.langTrack import etl, etl_config, routes
+from gacore.langTrack import location_facts as lf
 from gacore.langTrack.etl_config import CoordSystemConfigError
 from gacore.langTrack.location_facts import LocationPoint
 from gacore.langTrack.location_facts import to_amap_coord as _conv
@@ -197,7 +198,7 @@ class TestDirectionPolyline:
     def test_unknown_passthrough_and_warns_once(
         self, fake_direction, monkeypatch, capsys
     ):
-        monkeypatch.setattr(routes, "_unknown_coord_warned", False)
+        monkeypatch.setattr(lf, "_unknown_coord_warned_scopes", set())
         routes.direction_polyline(31.98, 118.78, 31.99, 118.79, "k", coord_system="unknown")
         routes.direction_polyline(31.98, 118.78, 31.99, 118.79, "k", coord_system="unknown")
         out = capsys.readouterr().out
@@ -206,9 +207,25 @@ class TestDirectionPolyline:
         assert o == (31.98, 118.78)
 
     def test_known_system_no_warning(self, fake_direction, monkeypatch, capsys):
-        monkeypatch.setattr(routes, "_unknown_coord_warned", False)
+        monkeypatch.setattr(lf, "_unknown_coord_warned_scopes", set())
         routes.direction_polyline(31.98, 118.78, 31.99, 118.79, "k", coord_system="wgs84")
         assert "坐标制为 unknown" not in capsys.readouterr().out
+
+    def test_mixed_endpoint_systems(self, fake_direction):
+        """跨坐标制时段边界：起终点各自按自己的 coord_system 转换。"""
+        routes.direction_polyline(
+            31.98, 118.78, 31.99, 118.79, "k",
+            coord_system="wgs84", coord_system_end="gcj02",
+        )
+        o, d = _origin_dest(fake_direction[0])
+        assert o == _conv(31.98, 118.78, "wgs84")
+        assert d == (31.99, 118.79)  # gcj02 原样，不被起点制二次偏移
+
+    def test_end_system_defaults_to_start(self, fake_direction):
+        routes.direction_polyline(31.98, 118.78, 31.99, 118.79, "k", coord_system="wgs84")
+        o, d = _origin_dest(fake_direction[0])
+        assert o == _conv(31.98, 118.78, "wgs84")
+        assert d == _conv(31.99, 118.79, "wgs84")
 
 
 # ---------------------------------------------------------------------------

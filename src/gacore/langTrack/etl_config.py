@@ -115,15 +115,24 @@ def load_coord_systems(path: Path | None = None) -> dict:
         source = pr.get("source")
         if source not in VALID_COORD_SYSTEMS:
             raise CoordSystemConfigError(f"periods[{i}].source invalid: {source!r}")
+        device_id = pr.get("device_id")
+        if not isinstance(device_id, str) or not device_id.strip():
+            raise CoordSystemConfigError(
+                f"periods[{i}].device_id missing/empty (any non-empty device string)"
+            )
         start_ts = pr.get("start_ts")
         end_ts = pr.get("end_ts")
         if not isinstance(start_ts, (int, float)) or isinstance(start_ts, bool):
             raise CoordSystemConfigError(f"periods[{i}].start_ts must be a number")
         if end_ts is not None and (not isinstance(end_ts, (int, float)) or isinstance(end_ts, bool)):
             raise CoordSystemConfigError(f"periods[{i}].end_ts must be a number or null")
+        if end_ts is not None and end_ts <= start_ts:
+            raise CoordSystemConfigError(
+                f"periods[{i}] empty interval: end_ts ({end_ts}) <= start_ts ({start_ts})"
+            )
         periods.append(
             {
-                "device_id": str(pr.get("device_id", "")),
+                "device_id": device_id,
                 "start_ts": start_ts,
                 "end_ts": end_ts,
                 "source": source,
