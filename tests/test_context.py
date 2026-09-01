@@ -15,7 +15,14 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 
 import gacore.context as ctx
 from gacore.config import Config
-from gacore.context import build_system_prompt, build_turn_prompt, extract_summaries, fold_history, periodic_hints, stamp_history_lines
+from gacore.context import (
+    build_system_prompt,
+    build_turn_prompt,
+    extract_summaries,
+    fold_history,
+    periodic_hints,
+    stamp_history_lines,
+)
 
 _PROJECT_ROOT: Final = Path(__file__).resolve().parents[1]
 
@@ -53,10 +60,10 @@ _FAKE_CARD_EMPTY = {
 def _no_real_langtrack_db(monkeypatch: pytest.MonkeyPatch) -> None:
     """禁止任何 prompt 用例触碰真实 data/langTrack.db：默认卡片为空且不抛异常。"""
 
-    def _fake_build(*args, **kwargs):  # noqa: ARG001
+    def _fake_build(*args, **kwargs):
         return _FAKE_CARD_EMPTY
 
-    def _fake_render(card, *args, **kwargs):  # noqa: ARG001
+    def _fake_render(card, *args, **kwargs):
         return str(card.get("compact") or "")
 
     monkeypatch.setattr(ctx.fact_card, "build", _fake_build)
@@ -282,10 +289,10 @@ def test_build_turn_prompt_marks_old_history_timestamps(cfg_with_assets: Config)
 
 
 def _set_card(monkeypatch: pytest.MonkeyPatch, card: dict) -> None:
-    def _fake_build(*args, **kwargs):  # noqa: ARG001
+    def _fake_build(*args, **kwargs):
         return card
 
-    def _fake_render(c, *args, **kwargs):  # noqa: ARG001
+    def _fake_render(c, *args, **kwargs):
         return str(c.get("compact") or "")
 
     monkeypatch.setattr(ctx.fact_card, "build", _fake_build)
@@ -322,7 +329,7 @@ def test_fact_card_build_failure_degrades_without_breaking_prompt(
 ) -> None:
     """Given a build that raises, the prompt must still be assembled (缺库不能弄死 QQ)."""
 
-    def _boom(*args, **kwargs):  # noqa: ARG001
+    def _boom(*args, **kwargs):
         raise RuntimeError("db locked")
 
     monkeypatch.setattr(ctx.fact_card, "build", _boom)

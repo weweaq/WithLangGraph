@@ -23,9 +23,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-import pytest  # noqa: E402
 
-import gacore.langTrack.fact_card as fc  # noqa: E402
+import gacore.langTrack.fact_card as fc
 
 _TZ = timezone(timedelta(hours=8))
 
@@ -54,13 +53,11 @@ def _make_db(device_id: str = "dev1", day: str = "2026-08-18", with_device_col: 
             "sleep_start_hhmm INTEGER, sleep_end_hhmm INTEGER, sleep_duration_min INTEGER,"
             "time_app_json TEXT)"
         )
-        daily_cols = "device_id,day,total_screen_ms,app_ranking_json,notification_count,notification_clicked,top_notification_apps_json,screen_on_count,screen_off_count,unlock_count,switch_count,location_count,audio_clip_count,sleep_start_hhmm,sleep_end_hhmm,sleep_duration_min,time_app_json"
     else:
         cur.execute(
             "CREATE TABLE daily_stats ("
             "day TEXT, total_screen_ms INTEGER, app_ranking_json TEXT)"
         )
-        daily_cols = "day,total_screen_ms,app_ranking_json"
 
     cur.execute("CREATE TABLE etl_state (device_id TEXT PRIMARY KEY, last_event_ts INTEGER)")
     cur.execute(
@@ -97,13 +94,13 @@ def _make_db(device_id: str = "dev1", day: str = "2026-08-18", with_device_col: 
     notif_apps = json.dumps([{"app": "微信", "n": 5}, {"app": "飞书", "n": 3}])
     if with_device_col:
         cur.execute(
-            f"INSERT INTO daily_stats VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO daily_stats VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (device_id, day, 25_200_000, ranking, 47, 6, notif_apps, 3, 2, 12, 46, 50, 0,
              2340, 390, 480, "[]"),
         )
     else:
         cur.execute(
-            f"INSERT INTO daily_stats VALUES (?,?,?)",
+            "INSERT INTO daily_stats VALUES (?,?,?)",
             (day, 25_200_000, ranking),
         )
     # ETL 水位：17:06（当日未跑完）
@@ -653,7 +650,7 @@ def test_log_built_emits_info(monkeypatch):
     card = fc.build(conn=conn, day="2026-08-18", device_id="dev1", detail="compact")
     assert card["available"] is True
     assert any(m == "fact card built" for m, _ in stub.infos)
-    msg, fields = stub.infos[0]
+    _, fields = stub.infos[0]
     assert fields["day"] == "2026-08-18"
     assert fields["data_as_of_source"] == "etl_state"
     assert fields["card_fp"] == card["card_fp"]

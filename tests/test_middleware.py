@@ -50,10 +50,10 @@ def _no_real_langtrack_db(monkeypatch: pytest.MonkeyPatch) -> None:
         "debug_meta": {"card_fp": "data/langTrack.db", "degrade": "no_data"},
     }
 
-    def _fake_build(*args, **kwargs):  # noqa: ARG001
+    def _fake_build(*args, **kwargs):
         return _empty
 
-    def _fake_render(card, *args, **kwargs):  # noqa: ARG001
+    def _fake_render(card, *args, **kwargs):
         return str(card.get("compact") or "")
 
     monkeypatch.setattr(ctx.fact_card, "build", _fake_build)

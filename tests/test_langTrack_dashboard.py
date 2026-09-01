@@ -11,9 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-import pytest  # noqa: E402
 
-from gacore.langTrack.dashboard import render_dashboard_html  # noqa: E402
+from gacore.langTrack.dashboard import render_dashboard_html
 
 _TZ = timezone(timedelta(hours=8))
 

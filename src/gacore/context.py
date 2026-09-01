@@ -7,6 +7,7 @@ stored in state.messages, so the leading SystemMessage is not duplicated by the 
 
 from __future__ import annotations
 
+import contextlib
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Final
@@ -214,15 +215,13 @@ def build_system_prompt(state: GAState, cfg: Config) -> str:
     # 记忆背景铁律只追加一次（修复 daily/rollover 各自追加造成的重复注入）
     if injected_bg:
         prompt += _MEMORY_BG_RULE
-    try:
+    with contextlib.suppress(Exception):  # 日志失败不影响返回
         _context_logger.info(
             "fact card injected",
             outlet="prompt",
             injected=bool(_fact_text),
             compact_chars=len(_fact_text),
         )
-    except Exception:  # noqa: BLE001 - 日志失败不影响返回
-        pass
     # Multi-option output mode: set by qq.py::_run_agent when proposal_detect() fires;
     # cleared by graph.py::cleanup_images after the turn so it never leaks into later turns.
     mode = (state.get("output_mode") or "").strip()

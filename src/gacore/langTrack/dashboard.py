@@ -8,7 +8,6 @@
 from __future__ import annotations
 
 import datetime
-import json
 import sqlite3
 from html import escape
 from pathlib import Path
@@ -71,7 +70,7 @@ def _fmt_dur(ms: int) -> str:
 
 def _fmt_time(ms: int) -> str:
     """本地时区 HH:MM（用于原 dashboard 会话列表）。"""
-    return datetime.datetime.fromtimestamp(ms / 1000).strftime("%H:%M")
+    return datetime.datetime.fromtimestamp(ms / 1000, tz=_TZ).strftime("%H:%M")
 
 
 def _app_color(idx: int) -> str:
@@ -324,7 +323,7 @@ def render_dashboard_html(conn: sqlite3.Connection, day: str | None = None) -> s
     # 事实卡片：一次 build，全程不触发 ETL
     try:
         card = fact_card.build(conn=conn, day=requested, detail="full", outlet="dashboard")
-    except Exception:
+    except Exception:  # noqa: BLE001 - 缺库/损坏时降级为读取失败
         card = None
 
     if card is None:

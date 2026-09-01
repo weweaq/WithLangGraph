@@ -156,7 +156,7 @@ def test_stats_returns_day_profile(monkeypatch, tmp_path):
     assert r["trips"] and r["trips"][0]["start_hhmm"] == "12:00"  # 嵌入 stay 内，不配 from_label
     assert isinstance(r["trips"][0]["from_label"], str)
     assert r["anomalies"] and r["anomalies"][0]["kind"] == "new_place"
-    assert "compact" in r and r["compact"]
+    assert r.get("compact")
     assert r["compact_sections"] and r["compact_lines"]
     assert isinstance(r["compact_omitted"], dict)
     assert r["card_fp"]

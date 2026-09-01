@@ -18,23 +18,13 @@
 
 from __future__ import annotations
 
-
-
 import sqlite3
-
 import subprocess
-
 import sys
-
 from pathlib import Path
-
 from typing import Final, TypedDict
 
-
-
 from langchain_core.tools import tool
-
-
 
 from gacore.jsonl_logger import get_logger
 from gacore.langTrack.fact_card import (
@@ -43,10 +33,10 @@ from gacore.langTrack.fact_card import (
     PlaceBrief,
     StayBrief,
     TripBrief,
+)
+from gacore.langTrack.fact_card import (
     build as build_fact_card,
 )
-
-
 
 logger = get_logger("tools.langTrack_tools")
 

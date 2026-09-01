@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import hashlib
 import json
@@ -401,7 +402,7 @@ def _degrade(card: FactCard, error_type: str, error: str, t0: float, outlet: str
     card["compact_omitted"] = {}
     card["compact_sections"] = []
     card["card_fp"] = ""
-    try:
+    with contextlib.suppress(Exception):
         logger.warning(
             "fact card degraded",
             outlet=outlet,
@@ -412,8 +413,6 @@ def _degrade(card: FactCard, error_type: str, error: str, t0: float, outlet: str
             elapsed_ms=round((time.time() - t0) * 1000, 1),
             available=False,
         )
-    except Exception:  # noqa: BLE001 - 日志失败吞掉
-        pass
     return card
 
 
@@ -643,7 +642,7 @@ def _fill_card(
 
 
 def _stay_label(stay_tuple, places_map: dict) -> str:
-    s, cs, ce = stay_tuple
+    s, _, _ = stay_tuple
     place = places_map.get(s["grid_key"]) if s["grid_key"] else None
     return _resolve_label(place, place.get("poi") if place else None)
 
@@ -880,7 +879,7 @@ def render_compact(card: FactCard) -> str:
 
 def _log_built(card: FactCard, t0: float, outlet: str) -> None:
     """build 完成（含 compact 为空但有 sections）打一条 info；日志失败不影响主路径。"""
-    try:
+    with contextlib.suppress(Exception):
         ck = card.get("current_known")
         anoms = card.get("anomalies") or []
         logger.info(
@@ -915,5 +914,3 @@ def _log_built(card: FactCard, t0: float, outlet: str) -> None:
             card_fp=card.get("card_fp", ""),
             omitted=card.get("compact_omitted", {}),
         )
-    except Exception:  # noqa: BLE001 - 日志失败吞掉
-        pass
