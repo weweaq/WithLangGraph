@@ -2140,7 +2140,7 @@ QQ 机器人「韩立」已有完整 agent 回路，但面对随口话（“吃�
 subagent 独立复审提交 c97d2d5 + 工作区索引修复：无 P1 级正确性缺陷（SQL 注入面、None 容错、rebuild 幂等、设备过滤全链路覆盖、zip 对齐均通过实证）；发现 1 项配套测试无效（P1-1）+ P2×8 + P3×7，已全部处置。
 
 ### 已修复
-1. **P1-1 索引丢失 bug（`etl.py`）**：`_migrate_anomalies_unique` 的 `CREATE INDEX idx_anomalies_day` 原在 `DROP TABLE anomalies_old` 之前执行——RENAME 后旧表索引仍占用索引名，`IF NOT EXISTS` 静默跳过，随后 DROP 旧表连带删索引 → 新表索引丢失（`read_anomalies(day=)` 与 report/fact_card 的 day 过滤退化为全表扫）。修复：建索引移到删旧表之后；回归测试 `test_migration_keeps_day_index` 的夹具补建旧表索引（subagent 实证：夹具不建索引时修复前测试也通过，测试无效）。
+1. **P1-1 索引丢失 bug（`etl.py`）**：`_migrate_anomalies_unique` 的 `CREATE INDEX idx_anomalies_day` 原在 `DROP TABLE anomalies_old` 之前执行——RENAME 后旧表索引仍占用索引名，`IF NOT EXISTS` 静默跳过，随后 DROP 旧表连带删索引 → 新表丢失命名索引（复核实证：查询计划回退到 UNIQUE 自动索引 `sqlite_autoindex_anomalies_1`，day 恰为其首列仍走索引搜索，未全表扫，但显式索引契约破坏、执行计划漂移）。修复：建索引移到删旧表之后；回归测试 `test_migration_keeps_day_index` 的夹具补建旧表索引（subagent 实证：夹具不建索引时修复前测试也通过，测试无效）。
 2. **P2-2 new_place 阈值语义对齐（`etl.py`）**：v2 下 `visit_count<=3` 是 stay 段数（可达三次到访），v1 是原始定位点数——同一份数据迁移后 new_place 会明显变多。改用 `point_count`（v2）对齐 v1"原始点数≤3"语义，docstring 同步；新增 `test_new_place_threshold_uses_point_count`。
 3. **P2-7 迁移事务（`etl.py`）**：`_migrate_anomalies_unique` 的 RENAME→CREATE→INSERT→DROP 包 `BEGIN IMMEDIATE`（`in_transaction` 判断兼容外层活动事务），中途崩溃不再残留 `anomalies_old`（否则下次 `_SCHEMA` 先建空新表会让迁移函数提前 return、旧表数据滞留）。
 4. **P2-3/4/5 `report.py` 去重**：新增 `_dev_bind`（SQL 片段与参数成对返回）替换 11 处 `_dev_where`+手写参数 splat——两处分离必须严格同步，开发期曾因此栽过 `device_id or ''` 误过滤；`_table_cols` 删除，复用 reader 公开的 `table_columns`；`_outings` 家/公司网格从已取的 `grid_places` 派生，省一次 places+place_cells 全量重读。
@@ -2157,3 +2157,4 @@ subagent 独立复审提交 c97d2d5 + 工作区索引修复：无 P1 级正确�
 
 ### 待办更新
 - [x] Task 5 review-loop：subagent 审核（无 P1 正确性缺陷）+ P1-1/P2×8/P3×7 全部处置 + 305 用例通过 + lint 净减。
+- [x] Task 5 review-loop 复核（第二轮 subagent）：10 项意见全部正确完整处置——两项关键回归测试对修复前代码反验确认有效（test_migration_keeps_day_index / test_new_place_threshold_uses_point_count 均在旧代码上失败）；305 passed / 795+12（存量）/ ruff 声明全部实证吻合；未发现修复引入的新问题，**PASS**。唯一修正：索引丢失影响为执行计划回退 UNIQUE 自动索引（day 为首列仍走索引搜索），非全表扫，文档措辞已更正。
