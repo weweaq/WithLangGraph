@@ -244,7 +244,6 @@ def _place_of_stay(stay: dict) -> dict | None:
         return None
     return {
         "label": stay.get("place_label") or "",
-        "visit_count": 0,
         "poi": stay.get("place_poi") or "",
         "behavior": stay.get("place_behavior") or "",
         "district": stay.get("place_district") or "",

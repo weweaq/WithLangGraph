@@ -415,3 +415,98 @@ class TestCliOrchestration:
         monkeypatch.setattr("sys.argv", ["etl", "--db", str(db), "--location-recover"])
         etl.main()
         assert "none" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# confirm 交互（多设备候选隔离展示 + v3 标签分别落库）
+# ---------------------------------------------------------------------------
+
+def _confirm_v2_db(tmp_path: Path) -> Path:
+    """v2 库：两设备各一个待确认候选（label=未知 且 candidate_label 非空）。"""
+    p = tmp_path / "confirm.db"
+    conn = sqlite3.connect(p)
+    conn.execute(
+        """
+        CREATE TABLE places (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          device_id TEXT NOT NULL,
+          place_id TEXT NOT NULL,
+          grid_key TEXT NOT NULL,
+          lat REAL, lon REAL,
+          label TEXT, first_seen INTEGER, last_seen INTEGER,
+          point_count INTEGER DEFAULT 0, visit_count INTEGER DEFAULT 0,
+          stay_ms INTEGER DEFAULT 0, is_primary INTEGER DEFAULT 0,
+          poi TEXT, address TEXT,
+          candidate_label TEXT, confidence_home REAL, confidence_work REAL,
+          updated_at TEXT
+        )
+        """
+    )
+    conn.executemany(
+        "INSERT INTO places(device_id, place_id, grid_key, lat, lon, label, "
+        "point_count, visit_count, stay_ms, candidate_label, confidence_home, confidence_work) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        [
+            ("dev1", "p1", "31.992,118.783", 31.992, 118.783, "未知", 40, 8, 1000, "家", 0.9, 0.1),
+            ("dev2", "p2", "31.992,118.783", 31.992, 118.783, "未知", 30, 6, 800, "家", 0.8, 0.2),
+        ],
+    )
+    conn.execute("PRAGMA user_version = 2")
+    conn.commit()
+    conn.close()
+    return p
+
+
+class TestConfirmMultiDevice:
+    def test_candidates_shown_per_device_and_tagged_separately(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        db = _confirm_v2_db(tmp_path)
+        labels = tmp_path / "place_labels.json"
+        monkeypatch.setattr(lp, "DB_PATH", db)
+        monkeypatch.setattr(lp, "CONFIG_PATH", labels)
+
+        from gacore.langTrack import geocode
+        monkeypatch.setattr(geocode, "_amap_key", lambda: "test-key")
+        monkeypatch.setattr(geocode, "reverse_geocode", lambda lat, lon, key: None)
+
+        answers = iter(["家", "公司"])
+        monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+
+        lp.confirm()
+        out = capsys.readouterr().out
+
+        # 多设备：候选行必须带设备段，否则用户无法区分同网格两台设备的候选
+        assert "·设备dev1" in out
+        assert "·设备dev2" in out
+
+        version, rows = lp.load_label_doc(labels)
+        assert version == 3
+        by_key = {(r["device_id"], r["place_id"]): r["tag"] for r in rows}
+        assert by_key == {("dev1", "p1"): "家", ("dev2", "p2"): "公司"}
+
+        conn = sqlite3.connect(db)
+        labels_in_db = dict(conn.execute(
+            "SELECT device_id || '/' || place_id, label FROM places"
+        ))
+        conn.close()
+        assert labels_in_db == {"dev1/p1": "家", "dev2/p2": "公司"}
+
+    def test_single_device_no_device_suffix(self, tmp_path, monkeypatch, capsys):
+        db = _confirm_v2_db(tmp_path)
+        conn = sqlite3.connect(db)
+        conn.execute("DELETE FROM places WHERE device_id='dev2'")
+        conn.commit()
+        conn.close()
+        labels = tmp_path / "place_labels.json"
+        monkeypatch.setattr(lp, "DB_PATH", db)
+        monkeypatch.setattr(lp, "CONFIG_PATH", labels)
+
+        from gacore.langTrack import geocode
+        monkeypatch.setattr(geocode, "_amap_key", lambda: "test-key")
+        monkeypatch.setattr(geocode, "reverse_geocode", lambda lat, lon, key: None)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")
+
+        lp.confirm()
+        out = capsys.readouterr().out
+        assert "·设备" not in out

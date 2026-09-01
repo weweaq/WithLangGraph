@@ -357,3 +357,92 @@ class TestMinimalSchema:
         assert len(rows) == 1
         assert set(rows[0]) == ANOMALY_FIELDS
         assert rows[0]["place_id"] is None
+
+
+class TestReadPlaceCells:
+    def test_v2_place_id_filter(self, loc_db):
+        if not lr.is_v2(loc_db):
+            assert lr.read_place_cells(loc_db, device_id="dev1", place_id="pid_home") == []
+            return
+        rows = lr.read_place_cells(loc_db, device_id="dev1", place_id="pid_home")
+        assert {r["grid_key"] for r in rows} == {HOME_GK, HOME_MEMBER_GK}
+        assert all(r["place_id"] == "pid_home" for r in rows)
+
+    def test_device_isolation(self, loc_db):
+        rows = lr.read_place_cells(loc_db, device_id="dev2")
+        if lr.is_v2(loc_db):
+            assert {r["place_id"] for r in rows} == {"pid_home2"}
+        else:
+            assert rows == []
+
+
+class TestPlaceGridMap:
+    def test_v2_member_grid_expanded(self, loc_db):
+        m = lr.place_grid_map(loc_db, device_id="dev1")
+        if lr.is_v2(loc_db):
+            # 成员网格（非代表网格）也必须能找到 place
+            assert m[HOME_MEMBER_GK]["place_id"] == "pid_home"
+            assert m[HOME_GK]["place_id"] == "pid_home"
+            assert m[WORK_GK]["place_id"] == "pid_work"
+        else:
+            assert set(m) == {HOME_GK, WORK_GK}
+            assert m[HOME_GK]["label"] == "家"
+
+    def test_device_isolation(self, loc_db):
+        m = lr.place_grid_map(loc_db, device_id="dev2")
+        # dev2 与 dev1 同网格 HOME_GK，映射互不串扰
+        if lr.is_v2(loc_db):
+            assert set(m) == {HOME_GK}
+            assert m[HOME_GK]["place_id"] == "pid_home2"
+        else:
+            assert set(m) == {HOME_GK}
+
+    def test_same_grid_takes_highest_visit_count(self):
+        """同设备同网格多 place：取 visit_count 最高者（先占位者胜的降序保证）。"""
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            """
+            CREATE TABLE places (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL,
+                place_id TEXT,
+                grid_key TEXT,
+                lat REAL, lon REAL, label TEXT,
+                first_seen INTEGER, last_seen INTEGER,
+                point_count INTEGER DEFAULT 0,
+                visit_count INTEGER DEFAULT 0,
+                stay_ms INTEGER DEFAULT 0,
+                is_primary INTEGER DEFAULT 0,
+                poi TEXT
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO places(device_id, place_id, grid_key, lat, lon, label, "
+            "first_seen, last_seen, point_count, visit_count, stay_ms, is_primary, poi) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                ("dev1", "pid_small", HOME_GK, 31.992, 118.783, "未知", DAY_START, DAY_END, 10, 2, 20, 0, "小地点"),
+                ("dev1", "pid_big", HOME_GK, 31.992, 118.783, "未知", DAY_START, DAY_END, 50, 9, 100, 1, "大地点"),
+            ],
+        )
+        # 插入顺序故意让小 place 在前，验证排序仍由 visit_count 决定
+        conn.execute("PRAGMA user_version = 2")
+        conn.commit()
+        m = lr.place_grid_map(conn, device_id="dev1")
+        conn.close()
+        assert m[HOME_GK]["place_id"] == "pid_big"
+
+
+class TestDayFromFilter:
+    """persona 实际使用的 day_from 过滤（v1/v2 行为一致）。"""
+
+    def test_stays_day_from(self, loc_db):
+        assert len(lr.read_stays(loc_db, day_from=DAY)) == 3
+        assert len(lr.read_stays(loc_db, device_id="dev1", day_from=DAY)) == 2
+        assert lr.read_stays(loc_db, day_from="2099-01-01") == []
+
+    def test_trips_day_from(self, loc_db):
+        assert len(lr.read_trips(loc_db, day_from=DAY)) == 1
+        assert lr.read_trips(loc_db, day_from="2099-01-01") == []

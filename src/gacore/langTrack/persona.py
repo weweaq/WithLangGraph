@@ -433,7 +433,7 @@ def _build(conn: sqlite3.Connection, device_id: str | None, days: int) -> dict[s
 
                 ).fetchone()[0]
 
-            except sqlite3.Error:  # noqa: BLE001
+            except sqlite3.Error:
 
                 _rtf_days = 0
 
@@ -481,7 +481,7 @@ def _build(conn: sqlite3.Connection, device_id: str | None, days: int) -> dict[s
 
                     ).fetchone()[0]
 
-                except sqlite3.Error:  # noqa: BLE001
+                except sqlite3.Error:
 
                     _bs_days = 0
 
@@ -523,7 +523,7 @@ def _build(conn: sqlite3.Connection, device_id: str | None, days: int) -> dict[s
         all_stays = lr.read_stays(conn, device_id=device_id, with_place=True)
         home = [(s["start_ts"],) for s in all_stays if s["place_label"] == "家"]
         work = [(s["start_ts"],) for s in all_stays if s["place_label"] == "公司"]
-    except Exception:  # noqa: BLE001 - 缺表降级：规律维度退化为空
+    except Exception:  # noqa: BLE001 缺表降级：规律维度退化为空
         home, work = [], []
     work_start = _avg_hhmm(work)
 
@@ -534,7 +534,7 @@ def _build(conn: sqlite3.Connection, device_id: str | None, days: int) -> dict[s
     try:
         from gacore.langTrack import location_reader as lr
         trips = [(t["start_ts"],) for t in lr.read_trips(conn, device_id=device_id, day_from=min_day)]
-    except Exception:  # noqa: BLE001 - 缺表降级：通勤稳定性退化为 False
+    except Exception:  # noqa: BLE001 缺表降级：通勤稳定性退化为 False
         trips = []
     commute_stable = len(trips) >= 3
 

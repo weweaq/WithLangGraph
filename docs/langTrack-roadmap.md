@@ -2133,3 +2133,27 @@ QQ 机器人「韩立」已有完整 agent 回路，但面对随口话（“吃�
 ### 待办更新
 - [x] Task 5：v1/v2 双读消费者（location_reader + rebuild_location_v2 + 设备隔离 + 99 用例通过），未执行 activate。
 - [ ] Task 6：坐标质量与完整高德坐标边界。
+
+## 2026-09-01：位置智能增强 Task 5 review-loop（subagent 审核 + 修复 + 自测）
+
+### 审核结论
+subagent 独立复审提交 c97d2d5 + 工作区索引修复：无 P1 级正确性缺陷（SQL 注入面、None 容错、rebuild 幂等、设备过滤全链路覆盖、zip 对齐均通过实证）；发现 1 项配套测试无效（P1-1）+ P2×8 + P3×7，已全部处置。
+
+### 已修复
+1. **P1-1 索引丢失 bug（`etl.py`）**：`_migrate_anomalies_unique` 的 `CREATE INDEX idx_anomalies_day` 原在 `DROP TABLE anomalies_old` 之前执行——RENAME 后旧表索引仍占用索引名，`IF NOT EXISTS` 静默跳过，随后 DROP 旧表连带删索引 → 新表索引丢失（`read_anomalies(day=)` 与 report/fact_card 的 day 过滤退化为全表扫）。修复：建索引移到删旧表之后；回归测试 `test_migration_keeps_day_index` 的夹具补建旧表索引（subagent 实证：夹具不建索引时修复前测试也通过，测试无效）。
+2. **P2-2 new_place 阈值语义对齐（`etl.py`）**：v2 下 `visit_count<=3` 是 stay 段数（可达三次到访），v1 是原始定位点数——同一份数据迁移后 new_place 会明显变多。改用 `point_count`（v2）对齐 v1"原始点数≤3"语义，docstring 同步；新增 `test_new_place_threshold_uses_point_count`。
+3. **P2-7 迁移事务（`etl.py`）**：`_migrate_anomalies_unique` 的 RENAME→CREATE→INSERT→DROP 包 `BEGIN IMMEDIATE`（`in_transaction` 判断兼容外层活动事务），中途崩溃不再残留 `anomalies_old`（否则下次 `_SCHEMA` 先建空新表会让迁移函数提前 return、旧表数据滞留）。
+4. **P2-3/4/5 `report.py` 去重**：新增 `_dev_bind`（SQL 片段与参数成对返回）替换 11 处 `_dev_where`+手写参数 splat——两处分离必须严格同步，开发期曾因此栽过 `device_id or ''` 误过滤；`_table_cols` 删除，复用 reader 公开的 `table_columns`；`_outings` 家/公司网格从已取的 `grid_places` 派生，省一次 places+place_cells 全量重读。
+5. **P2-6 JOIN 判定去重（`location_reader.py`）**：`_stay_place_join` 无 JOIN 时返回 `""`，`read_stays` 用其真值推导 joined，消除与函数内部完全重复的分支条件双写。
+6. **P2-1 候选推断缺口澄清（`etl.py` 注释）**：v2 激活后 `candidate_label/confidence_home/confidence_work` 保持 NULL——v1 版候选推断按全表 grid_key UPDATE 无设备隔离，不适用 v2 键结构；v2 版按 (device_id,place_id) 的推断列入后续任务（label CLI 手动打标签、report 家/公司确认区块走人工标签，不受影响）。
+7. **P3 批量**：`detect_route_changes` docstring 唯一键描述更新（现为含 device_id）；location_reader 模块 docstring 措辞收窄（dashboard 日期导航仅取 day、geocode/routes 是生产者，不经双读层）；report kind_label 映射补 `route_change`；`_group_stays_by_day` 函数内显式设 row_factory；fact_card `_place_of_stay` 删除无读取方的死字段 `"visit_count": 0`；`place_grid_map` 的 `by_id` 单 place_id 键安全性注释（place_id 生成内嵌 device_id）；persona/etl 无效 noqa 清理——noqa 后接 `- 文本` 会被 ruff 判 RUF100，统一改空格格式；report main() 删除未使用 `import datetime`。
+8. **confirm() 多设备修复 + 测试补齐（+17 用例）**：`label_places.confirm()` 多设备库候选行输出加 `·设备X` 段（此前同网格两台设备的候选无法区分）；新增 `TestConfirmMultiDevice`（多设备展示/标签按 (device_id,place_id) 分别落库、单设备不加段）；location_reader 补 `read_place_cells` 过滤参数、`place_grid_map` tie-break（同网格多 place 取 visit_count 最高）与设备隔离、`read_stays/read_trips` 的 `day_from` 过滤（persona 实际使用路径）。
+
+### 验证（维护测试日志）
+- langTrack 组：`pytest tests -k langTrack` **305 passed**（Task 5 提交时 288 + review 新增 17：location_reader 37→50、anomalies 14→16、label_places 22→24）。
+- 全套：`pytest tests` 795 passed / 12 failed 均为存量环境问题（test_cli.py pygraphviz 缺失 ×11 + test_qq.py ×1；git stash 后在 HEAD 上复现同样失败，且两文件不引用 langTrack）。
+- ruff：本次触及文件 25 项发现全为存量（HEAD 同文件 28 项；本次净减 3：清 2 RUF100 + 1 F401；ruff --fix 误删的有效 noqa 已用空格格式恢复，BLE001 计数与 HEAD 持平）。
+- CRLF 规范：触碰文件统一仓库换行形态（PowerShell 写入曾引入 BOM/LF，已还原；11 个仅换行差异文件 checkout 还原为零 diff）。
+
+### 待办更新
+- [x] Task 5 review-loop：subagent 审核（无 P1 正确性缺陷）+ P1-1/P2×8/P3×7 全部处置 + 305 用例通过 + lint 净减。

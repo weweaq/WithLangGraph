@@ -1,8 +1,9 @@
 """langTrack 位置事实 v1/v2 双读层（Task 5）。
 
-所有消费者（fact_card / dashboard / report / persona / tools / geocode /
-routes / label CLI）读取 places / stays / trips / anomalies 一律经本模块，
-禁止在消费者里直接 JOIN 事实表：
+读取类消费者（fact_card / report / persona / label CLI / dashboard 的位置
+事实段 / tools 的位置查询）读取 places / stays / trips / anomalies 一律经
+本模块，禁止在消费者里直接 JOIN 事实表。（例外：dashboard 日期导航仅取
+day 列、geocode / routes 作为生产者直写直读，不经本模块。）
 
 - v1（PRAGMA user_version < 2）：stays ↔ places 按 (device_id, grid_key) 关联；
 - v2（user_version >= 2）：按 (device_id, place_id) 关联，stays.grid_key 只是
@@ -65,8 +66,8 @@ def is_v2(conn: sqlite3.Connection) -> bool:
     return schema_version(conn) >= 2
 
 
-def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    """表存在返回实际列名集合；表缺失返回空集。"""
+def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """表存在返回实际列名集合；表缺失返回空集（列级容错，双读层内外共用）。"""
     try:
         return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     except sqlite3.OperationalError:
@@ -143,7 +144,7 @@ def read_places(
     limit: int | None = None,
 ) -> list[dict]:
     """读取 places 统一行。label_in 过滤人工标签；candidate_only 只取待确认候选。"""
-    actual = _table_columns(conn, "places")
+    actual = table_columns(conn, "places")
     if not actual:
         return []
     v2 = is_v2(conn)
@@ -187,15 +188,15 @@ def _place_join_cols(place_cols: set[str]) -> str:
 
 
 def _stay_place_join(v2: bool, stay_cols: set[str], place_cols: set[str]) -> str:
-    """stay ↔ place JOIN 片段；关联键缺失或 places 表缺失时退化为无 JOIN。"""
+    """stay ↔ place JOIN 片段；关联键缺失或 places 表缺失时返回 ""（无 JOIN）。"""
     if not place_cols:
-        return " FROM stays s"
+        return ""
     if v2 and "place_id" in stay_cols and "place_id" in place_cols:
         on = "s.place_id=p.place_id"
     elif "grid_key" in stay_cols and "grid_key" in place_cols:
         on = "s.grid_key=p.grid_key"
     else:
-        return " FROM stays s"
+        return ""
     return _place_join_cols(place_cols) + f" FROM stays s LEFT JOIN places p ON {on} AND s.device_id=p.device_id"
 
 
@@ -213,24 +214,18 @@ def read_stays(
     overlap=(start_ms, end_ms) 取时间窗相交的段（与 fact_card 语义一致：
     start_ts < win_end AND end_ts > win_start）。
     """
-    stay_cols = _table_columns(conn, "stays")
+    stay_cols = table_columns(conn, "stays")
     if not stay_cols:
         return []
     v2 = is_v2(conn)
-    place_cols = _table_columns(conn, "places") if with_place else set()
-    joined = with_place and bool(place_cols) and (
-        (v2 and "place_id" in stay_cols and "place_id" in place_cols)
-        or ("grid_key" in stay_cols and "grid_key" in place_cols)
-    )
+    place_cols = table_columns(conn, "places") if with_place else set()
+    join_sql = _stay_place_join(v2, stay_cols, place_cols) if with_place else ""
     select = _select_expr("s", _STAY_COLS, stay_cols)
     if v2 and "place_id" in stay_cols:
         select += ", s.place_id"
     else:
         select += ", NULL AS place_id"
-    if with_place and joined:
-        select += _stay_place_join(v2, stay_cols, place_cols)
-    else:
-        select += " FROM stays s"
+    select += join_sql if join_sql else " FROM stays s"
     sql = f"SELECT {select} WHERE 1=1"
     params: list = []
     if device_id is not None:
@@ -269,7 +264,7 @@ def read_stays(
             "day": r["day"],
             "place_id": r["place_id"],
         }
-        if joined:
+        if join_sql:
             row["place_label"] = r["place_label"]
             row["place_poi"] = r["place_poi"]
             row["place_poi_fallback"] = r["place_poi_fallback"]
@@ -296,7 +291,7 @@ def read_trips(
     day: str | None = None,
 ) -> list[dict]:
     """读取 trips 统一行；from/to_place_id 在 v1 恒为 None。"""
-    actual = _table_columns(conn, "trips")
+    actual = table_columns(conn, "trips")
     if not actual:
         return []
     v2 = is_v2(conn)
@@ -353,7 +348,7 @@ def read_anomalies(
     device_id: str | None = None,
 ) -> list[dict]:
     """读取 anomalies 统一行；place_id 在 v1 恒为 None。"""
-    actual = _table_columns(conn, "anomalies")
+    actual = table_columns(conn, "anomalies")
     if not actual:
         return []
     v2 = is_v2(conn)
@@ -396,7 +391,7 @@ def read_place_cells(
     """读取 place_cells 成员网格（v2 独有；v1 / 表缺失返回空列表）。"""
     if not is_v2(conn):
         return []
-    actual = _table_columns(conn, "place_cells")
+    actual = table_columns(conn, "place_cells")
     if not actual:
         return []
     sql = "SELECT device_id, place_id, grid_key FROM place_cells c WHERE 1=1"
@@ -432,6 +427,8 @@ def place_grid_map(
     places = read_places(conn, device_id=device_id, label_in=label_in, order_by_visit=True)
     if not places:
         return {}
+    # place_id=sha1(device_id|grids)[:16] 内嵌设备，单 place_id 作键不会跨设备串扰；
+    # 若未来改变生成规则须改回 (device_id, place_id) 复合键
     by_id = {p["place_id"]: p for p in places if p["place_id"]}
     grid_map: dict[str, dict] = {}
     for p in places:

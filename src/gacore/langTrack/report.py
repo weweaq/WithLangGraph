@@ -46,6 +46,7 @@ import sys
 from collections import defaultdict
 
 from pathlib import Path
+from gacore.langTrack.location_reader import table_columns
 from gacore.langTrack.persona import build as build_persona
 
 
@@ -99,19 +100,11 @@ class MultiDeviceError(RuntimeError):
     """多设备库未选择设备：report 禁止跨设备合并画像（Task 5d）。"""
 
 
-def _table_cols(conn: sqlite3.Connection, table: str) -> set[str]:
-    """表存在返回实际列名集合；表缺失返回空集（容错语义同 location_reader）。"""
-    try:
-        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-    except sqlite3.OperationalError:
-        return set()
-
-
 def devices_of_day(conn: sqlite3.Connection, day: str) -> list[str]:
     """当日有数据的设备（daily_stats / sessions / stays / anomalies 并集，含最小 schema 容错）。"""
     devs: set[str] = set()
     for table in ("daily_stats", "sessions", "stays", "anomalies"):
-        cols = _table_cols(conn, table)
+        cols = table_columns(conn, table)
         if "device_id" not in cols or "day" not in cols:
             continue
         try:
@@ -141,9 +134,14 @@ def resolve_report_device(
     return devs[0] if devs else None
 
 
-def _dev_where(device_id: str | None) -> str:
-    """单表 device 过滤片段：仅当显式选定设备时拼接（None 表示单设备/无数据全库）。"""
-    return " AND device_id=?" if device_id is not None else ""
+def _dev_bind(device_id: str | None) -> tuple[str, list]:
+    """(SQL 片段, 参数) 成对返回，杜绝拼接与参数列表不同步：
+
+    显式设备 → (" AND device_id=?", [device_id])；None（单设备/全库空态）→ ("", [])。
+    """
+    if device_id is None:
+        return "", []
+    return " AND device_id=?", [device_id]
 
 
 
@@ -160,13 +158,14 @@ def _fusion(conn: sqlite3.Connection, day: str, device_id: str | None = None) ->
     # 位置事实经 location_reader 双读层（v1: grid_key JOIN / v2: place_id JOIN）
     from gacore.langTrack import location_reader as lr
 
+    dev_frag, dev_args = _dev_bind(device_id)
     stays = lr.read_stays(conn, overlap=(day_start_ms, day_end_ms), device_id=device_id)
 
     sessions = conn.execute(
 
-        f"SELECT start_ms, duration_ms, app FROM sessions WHERE day=?{_dev_where(device_id)} "
+        f"SELECT start_ms, duration_ms, app FROM sessions WHERE day=?{dev_frag} "
         "ORDER BY start_ms",
-        (day, *([device_id] if device_id is not None else [])),
+        [day, *dev_args],
 
     ).fetchall()
 
@@ -329,6 +328,8 @@ def _outings(conn: sqlite3.Connection, day: str, device_id: str | None = None) -
 
     from gacore.langTrack import location_reader as lr
 
+    dev_frag, dev_args = _dev_bind(device_id)
+
     # 位置事实经双读层：stays 内嵌 place（v2 按 place_id JOIN）；网格→place 用 place_grid_map
     stays = lr.read_stays(conn, overlap=(day_start_ms, day_end_ms), device_id=device_id)
 
@@ -336,7 +337,8 @@ def _outings(conn: sqlite3.Connection, day: str, device_id: str | None = None) -
 
     known_grids = {s["grid_key"] for s in stays}
 
-    known_grids |= set(lr.place_grid_map(conn, device_id=device_id, label_in=("家", "公司")))
+    # 家/公司网格直接从 grid_places 派生，避免重读 places + place_cells
+    known_grids |= {g for g, p in grid_places.items() if p["label"] in ("家", "公司")}
 
     work_windows = []
 
@@ -353,8 +355,8 @@ def _outings(conn: sqlite3.Connection, day: str, device_id: str | None = None) -
     for r in conn.execute(
 
         f"SELECT ts, payload FROM events WHERE type='location' AND ts>=? AND ts<?"
-        f"{_dev_where(device_id)} ORDER BY ts",
-        (day_start_ms, day_end_ms, *([device_id] if device_id is not None else [])),
+        f"{dev_frag} ORDER BY ts",
+        [day_start_ms, day_end_ms, *dev_args],
 
     ):
 
@@ -648,11 +650,13 @@ def _rhythm_weather(conn: sqlite3.Connection, day: str, device_id: str | None = 
 
     result: dict = {"rhythm": None, "weather": None}
 
+    dev_frag, dev_args = _dev_bind(device_id)
+
     days = [r["day"] for r in conn.execute(
 
-        f"SELECT DISTINCT day FROM daily_stats WHERE 1=1{_dev_where(device_id)} "
+        f"SELECT DISTINCT day FROM daily_stats WHERE 1=1{dev_frag} "
         "ORDER BY day DESC LIMIT 7",
-        ([device_id] if device_id is not None else []),
+        list(dev_args),
 
     )]
 
@@ -668,8 +672,8 @@ def _rhythm_weather(conn: sqlite3.Connection, day: str, device_id: str | None = 
 
     stats = conn.execute(
 
-        f"SELECT day, total_screen_ms FROM daily_stats WHERE day>=?{_dev_where(device_id)}",
-        (start_day, *([device_id] if device_id is not None else [])),
+        f"SELECT day, total_screen_ms FROM daily_stats WHERE day>=?{dev_frag}",
+        [start_day, *dev_args],
 
     ).fetchall()
 
@@ -830,6 +834,8 @@ def report(
 
     device_id = resolve_report_device(conn, day, device_id)
 
+    dev_frag, dev_args = _dev_bind(device_id)
+
     print("=" * 52)
 
     dev_part = f" · 设备 {device_id}" if device_id else ""
@@ -846,8 +852,8 @@ def report(
 
     row = conn.execute(
 
-        f"SELECT * FROM daily_stats WHERE day=?{_dev_where(device_id)}",
-        (day, *([device_id] if device_id is not None else [])),
+        f"SELECT * FROM daily_stats WHERE day=?{dev_frag}",
+        [day, *dev_args],
 
     ).fetchone()
 
@@ -872,9 +878,9 @@ def report(
 
     top = conn.execute(
 
-        f"SELECT app, duration_ms, start_ms FROM sessions WHERE day=?{_dev_where(device_id)} "
+        f"SELECT app, duration_ms, start_ms FROM sessions WHERE day=?{dev_frag} "
         "ORDER BY duration_ms DESC LIMIT 3",
-        (day, *([device_id] if device_id is not None else [])),
+        [day, *dev_args],
 
     ).fetchall()
 
@@ -918,8 +924,8 @@ def report(
 
         "SELECT strftime('%H', ts/1000,'unixepoch','+8 hours') h, COUNT(*) n "
         "FROM events WHERE type='notification' AND date(ts/1000,'unixepoch','+8 hours')=?"
-        f"{_dev_where(device_id)} GROUP BY h ORDER BY h",
-        (day, *([device_id] if device_id is not None else [])),
+        f"{dev_frag} GROUP BY h ORDER BY h",
+        [day, *dev_args],
 
     ).fetchall()
 
@@ -962,8 +968,8 @@ def report(
         "AND date(ts/1000,'unixepoch','+8 hours')=? "
 
         "AND strftime('%H', ts/1000,'unixepoch','+8 hours') BETWEEN '22' AND '23'"
-        f"{_dev_where(device_id)}",
-        (day, *([device_id] if device_id is not None else [])),
+        f"{dev_frag}",
+        [day, *dev_args],
 
     ).fetchone()["n"]
 
@@ -974,8 +980,8 @@ def report(
         "AND date(ts/1000,'unixepoch','+8 hours')=? "
 
         "AND strftime('%H', ts/1000,'unixepoch','+8 hours') BETWEEN '00' AND '05'"
-        f"{_dev_where(device_id)}",
-        (day, *([device_id] if device_id is not None else [])),
+        f"{dev_frag}",
+        [day, *dev_args],
 
     ).fetchone()["n"]
 
@@ -1103,6 +1109,8 @@ def report(
 
                 "off_schedule": "缺席办公",
 
+                "route_change": "路线变化",
+
             }.get(a["kind"], a["kind"])
 
             anomaly_list.append({"kind": a["kind"], "poi": a["poi"], "detail": a["detail"]})
@@ -1210,9 +1218,9 @@ def report(
 
                 for s in conn.execute(
 
-                    f"SELECT app, duration_ms, start_ms FROM sessions WHERE day=?{_dev_where(device_id)} "
+                    f"SELECT app, duration_ms, start_ms FROM sessions WHERE day=?{dev_frag} "
                     "ORDER BY duration_ms DESC LIMIT 3",
-                    (day, *([device_id] if device_id is not None else [])))
+                    [day, *dev_args])
 
             ],
 
@@ -1266,9 +1274,9 @@ def report(
 
         for s in conn.execute(
 
-            f"SELECT app, duration_ms, start_ms FROM sessions WHERE day=?{_dev_where(device_id)} "
+            f"SELECT app, duration_ms, start_ms FROM sessions WHERE day=?{dev_frag} "
             "ORDER BY start_ms LIMIT 20",
-            (day, *([device_id] if device_id is not None else [])),
+            [day, *dev_args],
 
         ):
 
@@ -1298,8 +1306,6 @@ def main() -> None:
                         help="列出当日有数据的设备后退出")
 
     args = parser.parse_args()
-
-    import datetime
 
     day = args.day or now_cst().strftime("%Y-%m-%d")
     conn = sqlite3.connect(args.db)

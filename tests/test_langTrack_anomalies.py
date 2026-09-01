@@ -136,6 +136,8 @@ class TestMigrateAnomaliesUnique:
             "INSERT INTO anomalies(id, day, kind, device_id, grid_key, poi, detail, ts) "
             "VALUES (1, '2026-08-17', 'late_night_out', 'dev1', '31.9,118.7', 'x', 'd', 1)"
         )
+        # 复现真实生产 v1 库：旧表自带 day 索引（随 RENAME 占名，曾致迁移后索引丢失）
+        conn.execute("CREATE INDEX idx_anomalies_day ON anomalies(day)")
         conn.commit()
         conn.close()
 
@@ -162,6 +164,25 @@ class TestMigrateAnomaliesUnique:
         conn.close()
         assert rows == [(1, "2026-08-17", "late_night_out", "dev1")]
         assert n == 2
+
+    def test_migration_keeps_day_index(self, tmp_path, anomaly_env):
+        """旧表迁移后 idx_anomalies_day 必须落在新表上（曾因重命名索引占名被丢）。"""
+        path = tmp_path / "lt.db"
+        _v1_db(path)
+        self._old_anomalies(path)
+
+        conn = sqlite3.connect(path)
+        etl._migrate_anomalies_unique(conn)
+        idx = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+            " AND name='idx_anomalies_day' AND tbl_name='anomalies'"
+        ).fetchall()
+        plan = conn.execute(
+            "EXPLAIN QUERY PLAN SELECT * FROM anomalies WHERE day='2026-08-17'"
+        ).fetchall()
+        conn.close()
+        assert idx == [("idx_anomalies_day",)]
+        assert any("idx_anomalies_day" in str(r) for r in plan)
 
     def test_idempotent_and_new_schema_skipped(self, tmp_path, anomaly_env):
         """新 schema（_SCHEMA 已含 device_id 键）与二次迁移均为 no-op。"""
@@ -372,6 +393,38 @@ class TestDetectAnomaliesV2:
         assert r is not None
         assert r["place_id"] == "newpid1"
         assert r["formal_pid"] == "newpid1"  # 无孤儿引用
+
+    def test_new_place_threshold_uses_point_count(self, v2_db, anomaly_env):
+        """v2 阈值对齐 v1 语义（原始点数≤3）：visit_count=2 但 point_count 大不报。"""
+        now_ms = int(time.time() * 1000)
+        conn = sqlite3.connect(v2_db)
+        conn.execute(
+            "INSERT INTO places(device_id, place_id, grid_key, lat, lon, label, "
+            "first_seen, point_count, visit_count) "
+            "VALUES ('dev2','pid_few_pts','31.960,118.760',31.960,118.760,'未知',?,2,2)",
+            (now_ms - 86400000,),
+        )
+        # 大地点：visit_count=2（≤3，若误用会报）但原始点数 50
+        conn.execute(
+            "INSERT INTO places(device_id, place_id, grid_key, lat, lon, label, "
+            "first_seen, point_count, visit_count) "
+            "VALUES ('dev2','pid_many_pts','31.965,118.765',31.965,118.765,'未知',?,50,2)",
+            (now_ms - 86400000,),
+        )
+        conn.commit()
+        conn.close()
+
+        conn = sqlite3.connect(v2_db)
+        etl.detect_anomalies(conn)
+        conn.close()
+
+        conn = sqlite3.connect(v2_db)
+        pids = [r[0] for r in conn.execute(
+            "SELECT place_id FROM anomalies WHERE kind='new_place'"
+        )]
+        conn.close()
+        assert "pid_few_pts" in pids
+        assert "pid_many_pts" not in pids
 
     def test_off_schedule_uses_place_id(self, v2_db, anomaly_env):
         """v2 off_schedule：dev1 正午在公司 place → 不报；dev2 报。"""

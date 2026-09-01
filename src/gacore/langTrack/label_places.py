@@ -349,6 +349,13 @@ def confirm() -> None:
         print("（无常驻点可确认）")
         return
 
+    # 多设备库候选按 (device_id, place_id) 独立展示，输出加设备段避免混淆
+    devices = {p["device_id"] for p in rows} | {p["device_id"] for p in confirmed_rows}
+    show_dev = len(devices) > 1
+
+    def _dev_part(p: dict) -> str:
+        return f" ·设备{p['device_id']}" if show_dev else ""
+
     if rows:
         print("-- 待确认候选（ETL 推断，请确认是否定名） --")
         for r in rows:
@@ -358,7 +365,7 @@ def confirm() -> None:
             cur = _cur_tag(r)
             cand = r["candidate_label"] or "-"
             conf = f"(家 {r['confidence_home']:.2f} / 公司 {r['confidence_work']:.2f})"
-            print(f"  ({r['lat']:.4f},{r['lon']:.4f}) 访问{r['visit_count']}次 候选:{cand} {conf}")
+            print(f"  ({r['lat']:.4f},{r['lon']:.4f}){_dev_part(r)} 访问{r['visit_count']}次 候选:{cand} {conf}")
             print(f"    {poi} | {addr}")
             answer = input(f"    标签 [{cur}] (家/公司/未知/回车): ").strip()
             if answer in ("家", "公司", "未知"):
@@ -370,7 +377,7 @@ def confirm() -> None:
             poi = r["poi"] or ""
             cur = _cur_tag(r)
             conf = f"(家 {r['confidence_home']:.2f} / 公司 {r['confidence_work']:.2f})"
-            print(f"  [{r['label']}] ({r['lat']:.4f},{r['lon']:.4f}) 访问{r['visit_count']}次 {conf} {poi}")
+            print(f"  [{r['label']}] ({r['lat']:.4f},{r['lon']:.4f}){_dev_part(r)} 访问{r['visit_count']}次 {conf} {poi}")
             answer = input(f"    标签 [{cur}] (家/公司/未知/回车): ").strip()
             if answer in ("家", "公司", "未知"):
                 _upsert(r, answer)

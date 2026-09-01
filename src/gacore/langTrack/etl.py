@@ -1254,7 +1254,8 @@ def detect_anomalies(conn: sqlite3.Connection, lookback_days: int = 7) -> int:
     """P1-3 新地点/异常事件探测：识别打破规律的点，写入 anomalies 表。
 
     三类异常（作画像叙事节点）：
-    - new_place      首次到访新地点：近 lookback_days 天内 first_seen 且访问次数 <= 3，
+    - new_place      首次到访新地点：近 lookback_days 天内 first_seen 且原始定位点数 <= 3
+                     （v1 visit_count 即点数；v2 point_count，visit_count 是 stay 段数），
                      且非已确认家/公司（如新出现的医院、商场、陌生住宅区）。
     - late_night_out 深夜/凌晨在外：停驻点开始时间落在夜间窗口且不在本设备的家。
     - off_schedule   工作日白天缺席公司：当天有停驻但 13:00 无公司停留
@@ -1305,10 +1306,13 @@ def detect_anomalies(conn: sqlite3.Connection, lookback_days: int = 7) -> int:
     rows: list[tuple] = []
 
     # 1) 新地点（v1/v2 places 行均含 first_seen/visit_count/poi 列；v2 附带 place_id）
+    # 阈值对齐 v1 语义"原始定位点数≤3"：v1 visit_count 即点数；v2 visit_count 是
+    # stay 段数（≤3 可含三次到访），须改用 point_count（成员网格原始点数）。
     for r in conn.execute("SELECT * FROM places"):
         if r["label"] in ("家", "公司"):
             continue
-        if r["first_seen"] and r["first_seen"] >= now_ms - lookback_days * 86400000 and r["visit_count"] <= 3:
+        n_points = r["point_count"] if v2 else r["visit_count"]
+        if r["first_seen"] and r["first_seen"] >= now_ms - lookback_days * 86400000 and n_points <= 3:
             day = datetime.datetime.fromtimestamp(r["first_seen"] / 1000, tz=_TZ_CST).strftime("%Y-%m-%d")
             name = r["poi"] or r["poi_fallback"] or r["grid_key"]
             detail = f"首次到访新地点：{name}（访问 {r['visit_count']} 次）"
@@ -1382,7 +1386,9 @@ def detect_route_changes(conn: sqlite3.Connection) -> int:
 
 
 
-    前置：trips 已完成高德补路（route_key 非空）。anomalies 表 UNIQUE(day, kind, grid_key)，
+    前置：trips 已完成高德补路（route_key 非空）。anomalies 唯一键含 device_id
+
+    （v1 迁移后 UNIQUE(day, kind, device_id, grid_key)；v2 为表达式唯一索引），
 
     故 grid_key 存 'rc:'+route_key[:8] 承载指纹保唯一。返回新增事件数。
 
@@ -1494,6 +1500,7 @@ def _group_stays_by_day(conn: sqlite3.Connection) -> list[tuple[str, str, list[t
     返回 [(day, device_id, [(start_ts, end_ts, grid_key, place_id), ...])]；
     v1 stays 无 place_id 列时以 NULL 占位，条目结构两版本一致。
     """
+    conn.row_factory = sqlite3.Row  # 按名取列，不依赖调用方预设
     has_pid = "place_id" in {r[1] for r in conn.execute("PRAGMA table_info(stays)")}
     pid_sel = "place_id" if has_pid else "NULL AS place_id"
     by_key: dict[tuple[str, str], list] = defaultdict(list)
@@ -1970,30 +1977,41 @@ def _migrate_anomalies_unique(conn: sqlite3.Connection) -> None:
         cols = {r[2] for r in conn.execute(f"PRAGMA index_info({idx[1]})")}
         if "device_id" in cols:
             return  # 已是含 device_id 的唯一键（新库 / 已迁移）
-    conn.execute("DROP TABLE IF EXISTS anomalies_old")
-    conn.execute("ALTER TABLE anomalies RENAME TO anomalies_old")
-    conn.execute(
-        """
-        CREATE TABLE anomalies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            day TEXT NOT NULL,
-            kind TEXT NOT NULL,
-            device_id TEXT NOT NULL,
-            grid_key TEXT,
-            poi TEXT,
-            detail TEXT,
-            ts INTEGER,
-            UNIQUE(day, kind, device_id, grid_key)
+    # 显式事务：RENAME→CREATE→INSERT→DROP 原子执行，中途崩溃不留
+    # anomalies_old 残留（否则下次 _SCHEMA 先建空新表会让本函数提前 return）
+    own_tx = not conn.in_transaction
+    if own_tx:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DROP TABLE IF EXISTS anomalies_old")
+        conn.execute("ALTER TABLE anomalies RENAME TO anomalies_old")
+        conn.execute(
+            """
+            CREATE TABLE anomalies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                day TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                grid_key TEXT,
+                poi TEXT,
+                detail TEXT,
+                ts INTEGER,
+                UNIQUE(day, kind, device_id, grid_key)
+            )
+            """
         )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_anomalies_day ON anomalies(day)")
-    conn.execute(
-        "INSERT INTO anomalies(id, day, kind, device_id, grid_key, poi, detail, ts) "
-        "SELECT id, day, kind, device_id, grid_key, poi, detail, ts FROM anomalies_old"
-    )
-    conn.execute("DROP TABLE anomalies_old")
-    conn.commit()
+        conn.execute(
+            "INSERT INTO anomalies(id, day, kind, device_id, grid_key, poi, detail, ts) "
+            "SELECT id, day, kind, device_id, grid_key, poi, detail, ts FROM anomalies_old"
+        )
+        conn.execute("DROP TABLE anomalies_old")
+        # 旧表索引随重命名仍占用 idx_anomalies_day 名，必须等旧表删除后再建
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_anomalies_day ON anomalies(day)")
+        conn.commit()
+    except Exception:
+        if own_tx:
+            conn.rollback()
+        raise
 
 
 def _stamp_fact_tables(conn: sqlite3.Connection) -> None:
@@ -2356,7 +2374,9 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool
         # v2：全量重建正式 places/place_cells/stays/trips（单一计算来源，保留
         # 人工 tag / geocode 缓存 / 已编码路线）；首版 v2 位置只允许全量，
         # incremental 仅记录。v1 候选推断/top2 基于全表 grid_key UPDATE（无设备
-        # 隔离），v2 下跳过，由显式 device_id/place_id 版本接管。
+        # 隔离），v2 下跳过——v2 版按 (device_id, place_id) 的候选推断尚未实现
+        # （candidate_label/confidence_* 在 v2 下保持 NULL，label CLI 手动打标签
+        # 不受影响），待后续任务补齐。
 
         conn.commit()
 
