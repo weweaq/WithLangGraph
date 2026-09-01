@@ -537,30 +537,291 @@ def rollback_location_v2(conn: sqlite3.Connection, run_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# shadow 构建骨架（Task 3 填充全量重建逻辑）
+# shadow 构建（Task 3：全量位置事实 v2 重建，只写 shadow_* 表）
 # ---------------------------------------------------------------------------
 
-def build_location_shadow(db_path: Path | str) -> int:
+# 从 SCHEMA_V2 派生四张 shadow 表 DDL（表名/索引名前缀 shadow_），
+# 避免 schema 双份维护漂移；只挑 places/stays/trips/place_cells 相关语句。
+def _shadow_ddl() -> str:
+    wanted = ("place_cells_v2", "places_v2", "stays_v2", "trips_v2")
+    stmts = [s.strip() for s in SCHEMA_V2.split(";") if s.strip()]
+    picked = [s for s in stmts if any(w in s for w in wanted)]
+    for old, new in (
+        ("place_cells_v2", "shadow_place_cells_v2"),
+        ("places_v2", "shadow_places_v2"),
+        ("stays_v2", "shadow_stays_v2"),
+        ("trips_v2", "shadow_trips_v2"),
+    ):
+        picked = [s.replace(old, new) for s in picked]
+    return ";\n".join(picked) + ";"
+
+
+def _ensure_shadow_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(_shadow_ddl())
+
+
+def _accuracy_stats(
+    points: list, start_ts: int, end_ts: int
+) -> tuple[int, float | None]:
+    """窗口 [start_ts, end_ts] 内点的 accuracy 统计（points 已按 ts 排序）。
+
+    返回 (accuracy_known_points, avg_accuracy_m)；无已知精度时 avg 为 None。
+    """
+    import bisect
+
+    ts_list = [p.ts for p in points]
+    lo = bisect.bisect_left(ts_list, start_ts)
+    hi = bisect.bisect_right(ts_list, end_ts)
+    known = [p.accuracy_m for p in points[lo:hi] if p.accuracy_m is not None]
+    if not known:
+        return 0, None
+    return len(known), round(sum(known) / len(known), 1)
+
+
+def _top2_primary(places: list[dict]) -> set[str]:
+    """每设备按 stay_ms 取 top2 作为 is_primary 候选（稳定地点的初步候选，非人工事实）。"""
+    by_device: dict[str, list[dict]] = {}
+    for p in places:
+        by_device.setdefault(p["device_id"], []).append(p)
+    primary: set[str] = set()
+    for device_id, plist in by_device.items():
+        plist.sort(key=lambda x: (-x["stay_ms"], x["place_id"]))
+        for p in plist[:2]:
+            primary.add((device_id, p["place_id"]))
+    return primary
+
+
+def build_location_shadow(
+    db_path: Path | str,
+    *,
+    incremental: bool = False,
+    coord_config: dict | None = None,
+) -> int:
     """构建只读对比表 shadow_places_v2/shadow_place_cells_v2/shadow_stays_v2/shadow_trips_v2。
 
-    Task 3 实现全量重建；本骨架只负责建表并标记 full rebuild，不改正式表。
-    返回 shadow_stays_v2 行数（0 = 骨架/空库）。
+    全量从 events 重建（首版 location v2 只允许全量；incremental 参数仅用于记录
+    “location v2 full rebuild”），不修改任何正式表与标签文件：
+
+    1. events → etl.build_stays（v1 停驻检测算法单一来源，stays 参数接 etl_config）；
+    2. stays → location_facts.canonical_places（确定性聚类 + 稳定 place_id）；
+    3. place_cells 成员网格 + point_count（成员网格内原始 location 点数）+
+       visit_count（stay 段数）+ stay_ms（stay 总时长），禁止累加旧 visit_count；
+    4. stays.place_id 回填所属 canonical place；trips 重建并写 from/to_place_id
+       与 endpoint_coord_system；旧 trips 的 polyline/route_key 按
+       (device_id,start_ts,end_ts) 精确匹配迁移，无匹配不迁移；
+    5. 连续运行两次内容一致（幂等，DELETE + INSERT 重建）。
+
+    返回 shadow_stays_v2 行数。
     """
+    from collections import Counter
+
+    from gacore.langTrack import etl, routes
+    from gacore.langTrack import location_facts as lf
+    from gacore.langTrack.etl_config import (
+        CoordSystemConfigError,
+        load_coord_systems,
+        load_etl_config,
+        resolve_coord_system,
+    )
+
     db_path = Path(db_path)
     conn = sqlite3.connect(db_path)
     try:
-        names = _table_names(conn)
-        # 确保 v2 结构存在（shadow 表直接复用 v2 DDL 的名称是正式 *v2，此处不建 shadow；
-        # shadow 构建细节在 Task 3 通过 location_migration.SHADOW_SOURCE_TABLES 落表）。
+        if incremental:
+            print("[etl] location v2 full rebuild (incremental ignored)")
+
+        _ensure_shadow_tables(conn)
         create_location_v2_tables(conn)
-        # 记录“location v2 full rebuild”（首版只允许全量）
+
+        events = etl.load_events(conn)
+        cfg = load_etl_config()
+        stays_cfg = cfg.get("stays", {})
+        trips_cfg = cfg.get("trips", {})
+        if coord_config is None:
+            try:
+                coord_config = load_coord_systems()
+            except CoordSystemConfigError as e:
+                raise LocationMigrationError(f"coord system config error: {e}") from e
+
+        # ---- 1) 停驻段（v1 算法单一来源；跨午夜 stay 不按 day 截断）----
+        stays = etl.build_stays(
+            events,
+            large_radius_m=float(stays_cfg.get("large_radius_m", 120.0)),
+            small_radius_m=float(stays_cfg.get("small_radius_m", 60.0)),
+            min_stay_ms=int(stays_cfg.get("min_duration_ms", 600000)),
+            merge_gap_ms=int(stays_cfg.get("merge_gap_ms", 300000)),
+            merge_radius_m=float(stays_cfg.get("merge_radius_m", 150.0)),
+            max_jump_m=float(stays_cfg.get("max_jump_m", 500.0)),
+            max_speed_mps=float(stays_cfg.get("max_speed_mps", 40.0)),
+        )
+
+        # ---- 2) 规范化坐标点（质量统计 / point_count 分桶共用）----
+        points_by_device: dict[str, list] = {}
+        for device_id, ts, type_, payload in events:
+            if type_ != "location":
+                continue
+            cs = resolve_coord_system(device_id, ts, coord_config)
+            pt = lf.parse_location_point(device_id, ts, payload, coord_system=cs)
+            if pt is not None:
+                points_by_device.setdefault(device_id, []).append(pt)
+        for plist in points_by_device.values():
+            plist.sort(key=lambda p: p.ts)
+
+        # ---- 3) canonical places（stay 聚类；网格键统一 lf.grid_key_of 词汇）----
+        stay_inputs = [
+            lf.StayInput(
+                device_id=s[0], start_ts=s[1], end_ts=s[2], duration_ms=s[3],
+                center_lat=s[4], center_lon=s[5], grid_key=lf.grid_key_of(s[4], s[5]),
+            )
+            for s in stays
+        ]
+        drafts = lf.canonical_places(stay_inputs)
+
+        # seed (device, grid) → place_id；point_count 按成员网格分桶统计
+        place_by_seed: dict[tuple[str, str], str] = {}
+        for d in drafts:
+            for gk in d["member_grid_keys"]:
+                place_by_seed[(d["device_id"], gk)] = d["place_id"]
+        point_count_by_seed: Counter = Counter()
+        for device_id, plist in points_by_device.items():
+            for p in plist:
+                point_count_by_seed[(device_id, lf.grid_key_of(p.lat, p.lon))] += 1
+
+        primary_keys = _top2_primary(drafts)
+
+        place_rows = []
+        cell_rows = []
+        for d in drafts:
+            device_id = d["device_id"]
+            point_count = sum(
+                point_count_by_seed.get((device_id, gk), 0) for gk in d["member_grid_keys"]
+            )
+            place_rows.append(
+                (
+                    device_id, d["place_id"], d["grid_key"], d["lat"], d["lon"],
+                    "未知", d["first_seen"], d["last_seen"],
+                    point_count, d["visit_count"], d["stay_ms"],
+                    1 if (device_id, d["place_id"]) in primary_keys else 0,
+                    resolve_coord_system(device_id, d["first_seen"], coord_config),
+                    "stay_duration_weighted",
+                )
+            )
+            for gk in d["member_grid_keys"]:
+                cell_rows.append((device_id, d["place_id"], gk))
+
+        # ---- 4) shadow stays（place_id 回填 + accuracy 统计）----
+        stay_rows = []
+        for s in stays:
+            device_id = s[0]
+            pts = points_by_device.get(device_id, [])
+            acc_known, avg_acc = _accuracy_stats(pts, s[1], s[2])
+            stay_rows.append(
+                (
+                    device_id, s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9],
+                    s[10], acc_known, avg_acc, s[11],
+                    lf.grid_key_of(s[4], s[5]),
+                    place_by_seed.get((device_id, lf.grid_key_of(s[4], s[5]))),
+                    resolve_coord_system(device_id, s[1], coord_config),
+                    s[13],
+                )
+            )
+
+        # ---- 5) trips（相邻 stay 间隙；from/to place + 坐标制 + 旧缓存迁移）----
+        trips = routes.build_trips(
+            events, stays,
+            min_duration_ms=int(trips_cfg.get("min_duration_ms", 60000)),
+            min_dist_m=float(trips_cfg.get("min_dist_m", 300.0)),
+        )
+
+        # 旧 trips 缓存（polyline 为高德 GCJ02）
+        old_route: dict[tuple, tuple] = {}
+        if "trips" in _table_names(conn):
+            for r in conn.execute(
+                "SELECT device_id, start_ts, end_ts, polyline, route_key, route_mode, "
+                "route_encoded_at FROM trips"
+            ):
+                old_route[(r[0], r[1], r[2])] = (r[3], r[4], r[5], r[6])
+
+        # from/to place：trip 起点前最近 stay、终点后最近 stay（build_trips 由相邻对生成，边界可复现）
+        stays_by_dev: dict[str, list] = {}
+        for s in stays:
+            stays_by_dev.setdefault(s[0], []).append(s)
+        for lst in stays_by_dev.values():
+            lst.sort(key=lambda x: x[1])
+
+        def _place_of(stay) -> str | None:
+            return place_by_seed.get((stay[0], lf.grid_key_of(stay[4], stay[5])))
+
+        trip_rows = []
+        for t in trips:
+            device_id, start_ts, end_ts = t[0], t[1], t[2]
+            lst = stays_by_dev.get(device_id, [])
+            from_place = to_place = None
+            for stay in lst:
+                if stay[2] <= start_ts:
+                    from_place = _place_of(stay)
+                if stay[1] >= end_ts and to_place is None:
+                    to_place = _place_of(stay)
+            poly, rk, mode, enc = old_route.get((device_id, start_ts, end_ts), (None, None, None, None))
+            trip_rows.append(
+                (
+                    device_id, start_ts, end_ts, t[3], t[4], t[5], t[6], t[7],
+                    from_place, to_place,
+                    resolve_coord_system(device_id, start_ts, coord_config),
+                    t[8], t[9], t[10],
+                    poly, "gcj02" if poly else None, rk, mode, enc,
+                )
+            )
+
+        # ---- 6) 幂等落表（DELETE + INSERT，两次运行内容一致）----
+        conn.execute("DELETE FROM shadow_places_v2")
+        conn.execute("DELETE FROM shadow_place_cells_v2")
+        conn.execute("DELETE FROM shadow_stays_v2")
+        conn.execute("DELETE FROM shadow_trips_v2")
+        # 重置 AUTOINCREMENT 序列，保证连 id 在内两次运行逐行一致
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'"
+        ).fetchone():
+            conn.execute("DELETE FROM sqlite_sequence WHERE name LIKE 'shadow_%'")
+        conn.executemany(
+            "INSERT INTO shadow_places_v2(device_id, place_id, grid_key, lat, lon, label, "
+            "first_seen, last_seen, point_count, visit_count, stay_ms, is_primary, "
+            "source_coord_system, center_method) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            place_rows,
+        )
+        conn.executemany(
+            "INSERT INTO shadow_place_cells_v2(device_id, place_id, grid_key) VALUES (?,?,?)",
+            cell_rows,
+        )
+        conn.executemany(
+            "INSERT INTO shadow_stays_v2(device_id, start_ts, end_ts, duration_ms, center_lat, "
+            "center_lon, min_lat, min_lon, max_lat, max_lon, n_points, accuracy_known_points, "
+            "avg_accuracy_m, radius_m, grid_key, place_id, source_coord_system, day) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            stay_rows,
+        )
+        conn.executemany(
+            "INSERT INTO shadow_trips_v2(device_id, start_ts, end_ts, duration_ms, start_lat, "
+            "start_lon, end_lat, end_lon, from_place_id, to_place_id, endpoint_coord_system, "
+            "dist_m, n_points, day, polyline, polyline_coord_system, route_key, route_mode, "
+            "route_encoded_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            trip_rows,
+        )
+
+        # 运行血缘（etl_runs 存在时记录 location_v2_full；mode 即"首版只允许全量"的声明）
+        names = _table_names(conn)
         if "etl_runs" in names:
             conn.execute(
-                "INSERT INTO etl_runs(version, mode, status, started_at) "
-                "VALUES (?, 'location_v2_full', 'running', datetime('now','+8 hours'))",
-                ("2.0.0-shadow",),
+                "INSERT INTO etl_runs(version, mode, status, started_at, finished_at, rows_stays) "
+                "VALUES (?, 'location_v2_full', 'done', datetime('now','+8 hours'), "
+                "datetime('now','+8 hours'), ?)",
+                ("2.0.0-shadow", len(stay_rows)),
             )
-            conn.commit()
-        return 0
+        conn.commit()
+        print(
+            f"[etl] location shadow: places={len(place_rows)} cells={len(cell_rows)} "
+            f"stays={len(stay_rows)} trips={len(trip_rows)}"
+        )
+        return len(stay_rows)
     finally:
         conn.close()

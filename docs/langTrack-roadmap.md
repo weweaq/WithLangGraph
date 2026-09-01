@@ -2054,3 +2054,33 @@ QQ 机器人「韩立」已有完整 agent 回路，但面对随口话（“吃�
 ### 待办更新
 - [x] Task 2：LocationPoint 与 canonical 纯算法（location_facts.py，39 用例通过）。
 - [x] etl_config.py location 块 + trips.max_infer_gap_ms（Task 2 收尾）。
+
+
+## 2026-09-01：位置智能增强 Task 3（shadow 全量位置事实，--location-shadow）
+
+### 背景
+位置智能增强计划 Task 3：`build_location_shadow` 全量从 events 重建只读对比表 shadow_places_v2/shadow_place_cells_v2/shadow_stays_v2/shadow_trips_v2，不修改任何正式表与标签文件。停驻检测复用 v1 算法单一来源（etl.build_stays），canonical 聚类复用 Task 2 纯算法层（location_facts.canonical_places）。
+
+### 已完成
+1. **`src/gacore/langTrack/location_migration.py`（修改）**：落地 `build_location_shadow(db, incremental, coord_config)`：
+   - 停驻段：`etl.build_stays`（参数接 etl_config.stays，跨午夜 stay 不按 day 截断）；
+   - canonical places：stays → `lf.canonical_places` 确定性聚类 + 稳定 place_id；place_cells 记录成员网格；
+   - 三计数语义：`point_count`=成员网格内原始 location 点数（分桶 `lf.grid_key_of`，与 v1 网格词汇一致）、`visit_count`=落入地点的 stay 段数（禁止累加旧 visit_count）、`stay_ms`=关联 stay 裁剪前总时长；
+   - stays 回填 place_id（无孤儿）+ accuracy 统计（accuracy_known_points/avg_accuracy_m）+ source_coord_system；
+   - trips：`routes.build_trips` 重建，from/to_place_id 按相邻 stay 归属、endpoint_coord_system 显式记录；旧 trips 的 polyline/route_key 按 (device_id,start_ts,end_ts) 精确匹配迁移（polyline_coord_system='gcj02'），无匹配不迁移；
+   - 每设备 stay_ms top2 记 is_primary（稳定地点初步候选，非人工事实）；
+   - 幂等落表：DELETE + INSERT + sqlite_sequence 重置（连自增 id 两次运行逐行一致）；
+   - 运行血缘：etl_runs 记录 mode='location_v2_full'；incremental 参数命中时打印 "location v2 full rebuild (incremental ignored)"（首版只允许全量）。
+   - `_shadow_ddl()` 从 SCHEMA_V2 派生四张 shadow 表 DDL（表名/索引名前缀 shadow_），schema 单一来源避免双份维护漂移。
+2. **`src/gacore/langTrack/etl.py`（修改）**：`--location-shadow` 调用透传 `incremental=args.incremental`。
+3. **`src/gacore/langTrack/etl_config.py`（微调）**：period 重叠检测 zip → itertools.pairwise（RUF007）。
+4. **`tests/test_langTrack_etl_location.py`（新增 12 用例）**：TestShadowBuild 覆盖——正式表/user_version/标签文件零变化、全量重建与跨午夜不截断、三计数语义与设备隔离（同 grid 两设备 place_id 不同）、stays.place_id 无孤儿且 cells 覆盖全部成员网格、trips from/to_place_id + 端点坐标制 + 旧缓存精确匹配迁移、无精确匹配缓存不迁移、双跑幂等（含自增 id）、路过点不成为 place、每设备 top2 is_primary、incremental 记录 full rebuild、坐标制从 period 配置解析（unknown 不猜）、stay 级 accuracy 统计。
+
+### 验证（维护测试日志）
+- Task 3 单测：`test_langTrack_etl_location.py` **12 passed**（首跑 2 failed，修复两处：work stay_ms 预期从 6_900_000 校正为 6_600_000——w0 为 trip 终点不参与 stay，work stay 从次点起算 12 点 × 10min；幂等快照差异——DELETE+INSERT 后 AUTOINCREMENT 序列继续增长，补 sqlite_sequence 重置）。
+- 回归：`test_langTrack_location_facts.py`（39）+ `test_langTrack_location_migration.py`（14）+ `test_langTrack_fact_card.py`（49）+ 全套 `pytest tests` **647 passed / 12 failed（存量环境问题：test_cli.py pygraphviz 缺失 ×11 + test_qq.py ×1，HEAD 复现一致，非本次引入）**。
+- `ruff check` location_migration/location_facts/etl_config/etl(仅本次改动无新增)/三个测试文件 全部通过（etl.py 存量 10 处 lint 未动）。
+
+### 待办更新
+- [x] Task 3：shadow 全量位置事实（build_location_shadow 幂等重建 + 12 用例通过）。
+- [ ] Task 4：迁移稳定 ID、人工 tag 与 geocode 缓存（label v3 两阶段切换）。

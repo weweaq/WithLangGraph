@@ -2445,7 +2445,7 @@ def main() -> None:
 
     if args.location_shadow:
         from gacore.langTrack import location_migration
-        location_migration.build_location_shadow(args.db)
+        location_migration.build_location_shadow(args.db, incremental=args.incremental)
         return
 
     if args.purge:

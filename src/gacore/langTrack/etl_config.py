@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 from pathlib import Path
 
@@ -70,3 +71,91 @@ def load_etl_config() -> dict:
         except (json.JSONDecodeError, OSError, UnicodeDecodeError):
             cfg = json.loads(json.dumps(DEFAULTS))
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# 坐标制配置（§3.1）：data/location_coord_systems.json，支持设备 + 历史区间
+# ---------------------------------------------------------------------------
+
+COORD_SYSTEMS_PATH = Path(__file__).resolve().parents[3] / "data" / "location_coord_systems.json"
+
+VALID_COORD_SYSTEMS: tuple[str, ...] = ("unknown", "wgs84", "gcj02")
+
+
+class CoordSystemConfigError(ValueError):
+    """坐标制配置错误（非法 source / period 重叠），必须拒绝 ETL 而不是静默猜测。"""
+
+
+def load_coord_systems(path: Path | None = None) -> dict:
+    """读取坐标制配置；文件缺失返回 {"default": "unknown", "periods": []}。
+
+    解析失败（坏 JSON / 非法 source / period 结构错误）抛 CoordSystemConfigError——
+    坐标制错读会导致全链路位移，宁可拒绝也不回退默认。
+    """
+    p = path or COORD_SYSTEMS_PATH
+    if not p.exists():
+        return {"default": "unknown", "periods": []}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        raise CoordSystemConfigError(f"coord systems file unreadable: {e}") from e
+
+    default = raw.get("default", "unknown")
+    if default not in VALID_COORD_SYSTEMS:
+        raise CoordSystemConfigError(f"invalid default coord system: {default!r}")
+
+    periods_raw = raw.get("periods", [])
+    if not isinstance(periods_raw, list):
+        raise CoordSystemConfigError("periods must be a list")
+
+    periods: list[dict] = []
+    for i, pr in enumerate(periods_raw):
+        if not isinstance(pr, dict):
+            raise CoordSystemConfigError(f"periods[{i}] must be an object")
+        source = pr.get("source")
+        if source not in VALID_COORD_SYSTEMS:
+            raise CoordSystemConfigError(f"periods[{i}].source invalid: {source!r}")
+        start_ts = pr.get("start_ts")
+        end_ts = pr.get("end_ts")
+        if not isinstance(start_ts, (int, float)) or isinstance(start_ts, bool):
+            raise CoordSystemConfigError(f"periods[{i}].start_ts must be a number")
+        if end_ts is not None and (not isinstance(end_ts, (int, float)) or isinstance(end_ts, bool)):
+            raise CoordSystemConfigError(f"periods[{i}].end_ts must be a number or null")
+        periods.append(
+            {
+                "device_id": str(pr.get("device_id", "")),
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "source": source,
+            }
+        )
+
+    # 同设备 period 重叠检测（半开区间 [start,end)，end=None 无上界）
+    by_device: dict[str, list[dict]] = {}
+    for pr in periods:
+        by_device.setdefault(pr["device_id"], []).append(pr)
+    for device_id, plist in by_device.items():
+        plist.sort(key=lambda x: x["start_ts"])
+        for a, b in itertools.pairwise(plist):
+            a_end = a["end_ts"]
+            if a_end is None or b["start_ts"] < a_end:
+                raise CoordSystemConfigError(
+                    f"overlapping coord system periods for device {device_id!r}: "
+                    f"[{a['start_ts']},{a_end}) vs [{b['start_ts']},{b['end_ts']})"
+                )
+    return {"default": default, "periods": periods}
+
+
+def resolve_coord_system(device_id: str, ts: int, cfg: dict) -> str:
+    """解析 (device_id, ts) 的坐标制：返回覆盖该时刻的唯一 period source，无匹配用 default。
+
+    period 为半开区间 [start_ts, end_ts)；end_ts=None 表示无上界。
+    """
+    for pr in cfg.get("periods", []):
+        if pr.get("device_id") != device_id:
+            continue
+        start_ts = pr.get("start_ts")
+        end_ts = pr.get("end_ts")
+        if ts >= start_ts and (end_ts is None or ts < end_ts):
+            return pr["source"]
+    return cfg.get("default", "unknown")

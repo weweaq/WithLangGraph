@@ -144,9 +144,13 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def grid_key_of(lat: float, lon: float) -> str:
-    """0.001° 网格键：网格左下角坐标，保留 3 位小数（与 etl.build_places 一致）。"""
-    glat = math.floor(lat / GRID_STEP) * GRID_STEP
-    glon = math.floor(lon / GRID_STEP) * GRID_STEP
+    """0.001° 网格键（与 etl.build_places/build_stays 同一语义：round 最近值，%.3f 格式）。
+
+    全链路（v1 places、v2 shadow、point_count 分桶）必须共用本函数，
+    保证新旧网格词汇一致——Task 4 新旧 place Jaccard matching 依赖同一分桶。
+    """
+    glat = round(lat * 1000) / 1000
+    glon = round(lon * 1000) / 1000
     return f"{glat:.3f},{glon:.3f}"
 
 
