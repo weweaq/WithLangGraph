@@ -669,9 +669,15 @@ def build_location_shadow(
             except CoordSystemConfigError as e:
                 raise LocationMigrationError(f"coord system config error: {e}") from e
 
-        # ---- 1) 停驻段（v1 算法单一来源；跨午夜 stay 不按 day 截断）----
+        # ---- 1) 规范化坐标点（Task 6 共用解析：location_points 单一入口）----
+        all_points = lf.location_points(events, coord_config)
+        points_by_device: dict[str, list] = {}
+        for pt in all_points:
+            points_by_device.setdefault(pt.device_id, []).append(pt)
+
+        # ---- 2) 停驻段（v1 算法单一来源；跨午夜 stay 不按 day 截断）----
         stays = etl.build_stays(
-            events,
+            all_points,
             large_radius_m=float(stays_cfg.get("large_radius_m", 120.0)),
             small_radius_m=float(stays_cfg.get("small_radius_m", 60.0)),
             min_stay_ms=int(stays_cfg.get("min_duration_ms", 600000)),
@@ -681,17 +687,11 @@ def build_location_shadow(
             max_speed_mps=float(stays_cfg.get("max_speed_mps", 40.0)),
         )
 
-        # ---- 2) 规范化坐标点（质量统计 / point_count 分桶共用）----
-        points_by_device: dict[str, list] = {}
-        for device_id, ts, type_, payload in events:
-            if type_ != "location":
-                continue
-            cs = resolve_coord_system(device_id, ts, coord_config)
-            pt = lf.parse_location_point(device_id, ts, payload, coord_system=cs)
-            if pt is not None:
-                points_by_device.setdefault(device_id, []).append(pt)
-        for plist in points_by_device.values():
-            plist.sort(key=lambda p: p.ts)
+        # ---- 2.5) 坐标质量日表（§3.2 只读聚合；v1/v2 共表，全量重建。
+        #      不触碰 places/stays/trips 等位置事实表，与 shadow 只读承诺不冲突）----
+        etl._write_daily_quality(
+            conn, lf.daily_quality_rows(events, coord_config), False, set()
+        )
 
         # ---- 3) canonical places（stay 聚类；网格键统一 lf.grid_key_of 词汇）----
         stay_inputs = [
@@ -754,9 +754,10 @@ def build_location_shadow(
 
         # ---- 5) trips（相邻 stay 间隙；from/to place + 坐标制 + 旧缓存迁移）----
         trips = routes.build_trips(
-            events, stays,
+            all_points, stays,
             min_duration_ms=int(trips_cfg.get("min_duration_ms", 60000)),
             min_dist_m=float(trips_cfg.get("min_dist_m", 300.0)),
+            max_infer_gap_ms=int(trips_cfg.get("max_infer_gap_ms", 7200000)),
         )
 
         # 旧 trips 缓存（polyline 为高德 GCJ02）

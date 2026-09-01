@@ -28,6 +28,8 @@ from pathlib import Path
 
 import datetime  # noqa: E402  (routes 仅在此模块用 datetime，局部已无顶层导入)
 
+from gacore.langTrack.location_facts import to_amap_coord
+
 _TZ_CST = datetime.timezone(datetime.timedelta(hours=8))
 
 DB_PATH = Path(__file__).resolve().parents[3] / "data" / "langTrack.db"
@@ -65,66 +67,69 @@ def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
-def build_trips(events, stays, min_duration_ms: int = TRIP_MIN_DURATION_MS, min_dist_m: float = TRIP_MIN_DIST_M) -> list[tuple]:
-    """识别移动段：相邻两个停留段之间的区间。
-
-    events: [(device_id, ts, type, payload)]；stays: build_stays 的 tuple 列表。
-    规则：
-    - 对每设备按 start_ts 排序 stays，相邻对 (A, B) 的 gap=[A.end_ts, B.start_ts]
-    - gap 内的 location 点即移动采样点；起终点坐标取 gap 内首/末点（无采样点则用 A/B 中心兜底）
-    - 双阈值过滤：duration >= 60s 且起终点直线距离 >= 300m（滤小区内挪动与 GPS 抖动）
-    返回: [(device_id, start_ts, end_ts, duration_ms, start_lat, start_lon,
-            end_lat, end_lon, dist_m, n_points, day)]
-    """
-    # location 点按设备、按时间索引
-    by_dev: dict[str, list[tuple[int, float, float]]] = defaultdict(list)
-    for device_id, ts, type_, p in events:
-        if type_ != "location":
-            continue
-        lat, lon = p.get("lat"), p.get("lon")
-        if lat is None or lon is None:
-            continue
-        by_dev[device_id].append((ts, lat, lon))
-    for evs in by_dev.values():
-        evs.sort(key=lambda e: e[0])
-
-    # stays 按设备、按 start_ts 排序
-    stays_by_dev: dict[str, list[tuple]] = defaultdict(list)
-    for s in stays:
-        stays_by_dev[s[0]].append(s)
-    for lst in stays_by_dev.values():
-        lst.sort(key=lambda s: s[1])
+def build_trips(
+    points,
+    stays,
+    min_duration_ms: int = TRIP_MIN_DURATION_MS,
+    min_dist_m: float = TRIP_MIN_DIST_M,
+    max_infer_gap_ms: int = TRIP_MAX_INFER_GAP_MS,
+) -> list[tuple]:
+    """识别移动段：相邻两个停留段之间的区间。
+
+    points: location_facts.location_points 产物（LocationPoint 列表，Task 6 共用解析）；
+    stays: build_stays 的 tuple 列表。阈值全部使用传入参数（Task 6：不再引用模块
+    常量，与 etl_config trips 节点同一配置来源）。
+    规则：
+    - 对每设备按 start_ts 排序 stays，相邻对 (A, B) 的 gap=[A.end_ts, B.start_ts]
+    - gap 内的 location 点即移动采样点；起终点坐标取 gap 内首/末点（无采样点则用 A/B 中心兜底）
+    - 双阈值过滤：duration >= min_duration_ms 且起终点直线距离 >= min_dist_m（滤小区内挪动与 GPS 抖动）
+    返回: [(device_id, start_ts, end_ts, duration_ms, start_lat, start_lon,
+            end_lat, end_lon, dist_m, n_points, day)]
+    """
+    # location 点按设备、按时间索引
+    by_dev: dict[str, list[tuple[int, float, float]]] = defaultdict(list)
+    for p in points:
+        by_dev[p.device_id].append((p.ts, p.lat, p.lon))
+    for evs in by_dev.values():
+        evs.sort(key=lambda e: e[0])
+
+    # stays 按设备、按 start_ts 排序
+    stays_by_dev: dict[str, list[tuple]] = defaultdict(list)
+    for s in stays:
+        stays_by_dev[s[0]].append(s)
+    for lst in stays_by_dev.values():
+        lst.sort(key=lambda s: s[1])
     trips: list[tuple] = []
-    for device_id, segs in stays_by_dev.items():
-        pts = by_dev.get(device_id, [])
-        # 指针式取 gap 内点（stays 有序、pts 有序）
-        for i in range(len(segs) - 1):
-            a, b = segs[i], segs[i + 1]
-            gap_start, gap_end = a[2], b[1]  # a.end_ts, b.start_ts
-            if gap_end - gap_start < TRIP_MIN_DURATION_MS:
-                continue
-            # gap 内采样点
-            lo = 0
-            in_gap: list[tuple[int, float, float]] = []
-            for j in range(lo, len(pts)):
-                if pts[j][0] >= gap_end:
-                    break
-                if pts[j][0] > gap_start:
-                    in_gap.append(pts[j])
-                lo = j
-            if in_gap:
-                start_ts, start_lat, start_lon = in_gap[0]
-                end_ts, end_lat, end_lon = in_gap[-1]
-            else:
-                # 无采样点：仅当间隔在合理推断时长内才用前后停留中心兜底构造"推断移动段"；
-                # 超长间隔常见于设备采集空窗（如下班后 GPS 停采到深夜），无法证明存在单次
-                # 端到点移动，跳过以免把停留间隔误记为移动时长（08-21 17:51→00:08 6.28h 案例）
-                if gap_end - gap_start > TRIP_MAX_INFER_GAP_MS:
-                    continue
-                start_ts, start_lat, start_lon = gap_start, a[4], a[5]
-                end_ts, end_lat, end_lon = gap_end, b[4], b[5]
-            dist = _haversine(start_lat, start_lon, end_lat, end_lon)
-            if dist < TRIP_MIN_DIST_M:
+    for device_id, segs in stays_by_dev.items():
+        pts = by_dev.get(device_id, [])
+        # 指针式取 gap 内点（stays 有序、pts 有序）
+        for i in range(len(segs) - 1):
+            a, b = segs[i], segs[i + 1]
+            gap_start, gap_end = a[2], b[1]  # a.end_ts, b.start_ts
+            if gap_end - gap_start < min_duration_ms:
+                continue
+            # gap 内采样点
+            lo = 0
+            in_gap: list[tuple[int, float, float]] = []
+            for j in range(lo, len(pts)):
+                if pts[j][0] >= gap_end:
+                    break
+                if pts[j][0] > gap_start:
+                    in_gap.append(pts[j])
+                lo = j
+            if in_gap:
+                start_ts, start_lat, start_lon = in_gap[0]
+                end_ts, end_lat, end_lon = in_gap[-1]
+            else:
+                # 无采样点：仅当间隔在合理推断时长内才用前后停留中心兜底构造"推断移动段"；
+                # 超长间隔常见于设备采集空窗（如下班后 GPS 停采到深夜），无法证明存在单次
+                # 端到点移动，跳过以免把停留间隔误记为移动时长（08-21 17:51→00:08 6.28h 案例）
+                if gap_end - gap_start > max_infer_gap_ms:
+                    continue
+                start_ts, start_lat, start_lon = gap_start, a[4], a[5]
+                end_ts, end_lat, end_lon = gap_end, b[4], b[5]
+            dist = _haversine(start_lat, start_lon, end_lat, end_lon)
+            if dist < min_dist_m:
                 continue
             # 时长统一取端点到点时刻差，保证 duration_ms 与 (end_ts - start_ts) 自洽
             # （原实现时长取 gap 全程，导致有采样旅行段 duration 与端点矛盾，如 08-19 4.12h vs 2.50h）
@@ -172,11 +177,33 @@ def route_key_of(polyline_points: list[tuple[float, float]]) -> str:
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:16]
 
 
-def direction_polyline(
-    lat1: float, lon1: float, lat2: float, lon2: float,
-    key: str, mode: str = "walking",
-) -> list[tuple[float, float]] | None:
-    """高德路径规划：返回路线坐标点列表 [(lat, lon), ...]；失败返回 None。"""
+_unknown_coord_warned = False
+
+
+def _warn_unknown_coord(scope: str) -> None:
+    """§3.3 source=unknown 警告：按原样调用高德（不猜坐标系），模块级只提示一次。"""
+    global _unknown_coord_warned
+    if not _unknown_coord_warned:
+        _unknown_coord_warned = True
+        print(f"[{scope}] 坐标制为 unknown：坐标原样调用高德（如有偏移请在 "
+              "data/location_coord_systems.json 声明设备坐标系）")
+
+
+def direction_polyline(
+    lat1: float, lon1: float, lat2: float, lon2: float,
+    key: str, mode: str = "walking",
+    coord_system: str = "unknown",
+) -> list[tuple[float, float]] | None:
+    """高德路径规划：返回路线坐标点列表 [(lat, lon), ...]；失败返回 None。
+
+    起终点按 coord_system 经 to_amap_coord 转换后请求（§3.3：所有高德入口
+    统一转换）；返回的 polyline 固定为高德 GCJ02 坐标（由调用方落
+    polyline_coord_system，本函数不落库）。
+    """
+    if (coord_system or "unknown").strip().lower() == "unknown":
+        _warn_unknown_coord("routes")
+    lat1, lon1 = to_amap_coord(lat1, lon1, coord_system)
+    lat2, lon2 = to_amap_coord(lat2, lon2, coord_system)
     url = DIRECTION_URL if mode == "walking" else DIRECTION_URL.replace("/walking", f"/{mode}")
     params = urllib.parse.urlencode({
         "origin": f"{lon1},{lat1}",
@@ -213,44 +240,52 @@ def direction_polyline(
     return points or None
 
 
-def incremental_encode_trips(db_path: Path = DB_PATH, max_n: int = _MAX_ENCODE_PER_RUN) -> int:
-    """增量补路：仅对 route_encoded_at IS NULL 的新移动段调高德路径规划。
-
-    成功才写 polyline/route_key/route_mode/route_encoded_at；失败跳过留待下次重试。
-    单次默认最多 max_n 段（配额节流，远低于 5000 次/日）。返回成功编码数。
-    """
-    key = _amap_key()
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT id, start_lat, start_lon, end_lat, end_lon FROM trips "
-        "WHERE route_encoded_at IS NULL ORDER BY start_ts LIMIT ?", (max_n,)
-    ).fetchall()
-    if not rows:
-        print("[routes] 无新增待补路移动段（增量缓存命中，零调用）")
-        conn.close()
-        return 0
-    print(f"[routes] 待补路移动段: {len(rows)} 段（本次上限 {max_n}）")
-    now = int(time.time() * 1000)
-    n = 0
-    for r in rows:
-        # 高德个人档 QPS 较低，连续快速调用会触发 CUQPS 限流；每段间隔 0.5s
-        time.sleep(0.5)
-        pts = direction_polyline(
-            r["start_lat"], r["start_lon"], r["end_lat"], r["end_lon"], key, _ROUTE_MODE
-        )
-        if not pts:
-            print(f"[routes] 跳过段 id={r['id']}（规划失败，留待下次）")
-            continue
-        rk = route_key_of(pts)
-        conn.execute(
-            "UPDATE trips SET polyline=?, route_key=?, route_mode=?, route_encoded_at=? WHERE id=?",
-            (json.dumps(pts, ensure_ascii=False), rk, _ROUTE_MODE, now, r["id"]),
-        )
-        n += 1
-    conn.commit()
-    conn.close()
-    print(f"[routes] 补路完成: {n} 段")
+def incremental_encode_trips(db_path: Path = DB_PATH, max_n: int = _MAX_ENCODE_PER_RUN) -> int:
+    """增量补路：仅对 route_encoded_at IS NULL 的新移动段调高德路径规划。
+
+    成功才写 polyline/route_key/route_mode/route_encoded_at（polyline 为高德
+    GCJ02，同步标记 polyline_coord_system='gcj02'，§3.3）；失败跳过留待下次
+    重试。起终点按 trips.endpoint_coord_system 对应配置经 to_amap_coord 转换。
+    单次默认最多 max_n 段（配额节流，远低于 5000 次/日）。返回成功编码数。
+    """
+    from gacore.langTrack.etl_config import load_coord_systems, resolve_coord_system
+
+    key = _amap_key()
+    coord_cfg = load_coord_systems()  # 配置错误（重叠 period 等）直接拒绝本次补路
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT id, device_id, start_ts, start_lat, start_lon, end_lat, end_lon FROM trips "
+        "WHERE route_encoded_at IS NULL ORDER BY start_ts LIMIT ?", (max_n,)
+    ).fetchall()
+    if not rows:
+        print("[routes] 无新增待补路移动段（增量缓存命中，零调用）")
+        conn.close()
+        return 0
+    print(f"[routes] 待补路移动段: {len(rows)} 段（本次上限 {max_n}）")
+    now = int(time.time() * 1000)
+    n = 0
+    for r in rows:
+        # 高德个人档 QPS 较低，连续快速调用会触发 CUQPS 限流；每段间隔 0.5s
+        time.sleep(0.5)
+        cs = resolve_coord_system(r["device_id"], r["start_ts"], coord_cfg)
+        pts = direction_polyline(
+            r["start_lat"], r["start_lon"], r["end_lat"], r["end_lon"],
+            key, _ROUTE_MODE, coord_system=cs,
+        )
+        if not pts:
+            print(f"[routes] 跳过段 id={r['id']}（规划失败，留待下次）")
+            continue
+        rk = route_key_of(pts)
+        conn.execute(
+            "UPDATE trips SET polyline=?, route_key=?, route_mode=?, route_encoded_at=?, "
+            "polyline_coord_system='gcj02' WHERE id=?",
+            (json.dumps(pts, ensure_ascii=False), rk, _ROUTE_MODE, now, r["id"]),
+        )
+        n += 1
+    conn.commit()
+    conn.close()
+    print(f"[routes] 补路完成: {n} 段")
     return n
 
 
@@ -328,13 +363,16 @@ def encode_belt_pois(db_path: Path = DB_PATH, limit: int = 5) -> int:
         print("[routes] 无新增沿途 POI 待查网格（网格级缓存命中，零调用）")
         conn.close()
         return 0
-    n = 0
-    now = int(time.time() * 1000)
-    for r in cand:
-        time.sleep(0.5)
-        params = urllib.parse.urlencode({
-            "location": f"{r['glon']},{r['glat']}",
-            "key": key, "radius": 300, "offset": 1, "extensions": "base",
+    n = 0
+    now = int(time.time() * 1000)
+    for r in cand:
+        time.sleep(0.5)
+        # 网格坐标来自高德 polyline 量化，已是 GCJ02（§3.3 belt POI 固定按
+        # source="gcj02" 放行，禁止再次 WGS84→GCJ02 造成二次偏移）
+        glat, glon = to_amap_coord(r["glat"], r["glon"], "gcj02")
+        params = urllib.parse.urlencode({
+            "location": f"{glon},{glat}",
+            "key": key, "radius": 300, "offset": 1, "extensions": "base",
         })
         try:
             with urllib.request.urlopen(f"{AROUND_URL}?{params}", timeout=10) as resp:

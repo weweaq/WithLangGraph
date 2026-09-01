@@ -22,10 +22,12 @@ import json
 import os
 import sqlite3
 import time
-import urllib.parse
-import urllib.request
-from pathlib import Path
-
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+from gacore.langTrack.location_facts import to_amap_coord
+
 DB_PATH = Path(__file__).resolve().parents[3] / "data" / "langTrack.db"
 REVERSED_GEO_URL = "https://restapi.amap.com/v3/geocode/regeo"
 AROUND_URL = "https://restapi.amap.com/v3/place/around"
@@ -94,10 +96,10 @@ SIGNAL_KEYWORDS: tuple[tuple[str, str], ...] = (
 )
 
 
-def _amap_key() -> str:
-    key = os.environ.get("AMAP_KEY", "")
-    if not key:
-        # 尝试从 .env 读取：直接按字节找 AMAP_KEY=（ASCII 前缀不受文件编码影响）
+def _amap_key() -> str:
+    key = os.environ.get("AMAP_KEY", "")
+    if not key:
+        # 尝试从 .env 读取：直接按字节找 AMAP_KEY=（ASCII 前缀不受文件编码影响）
         env_path = Path(__file__).resolve().parents[3] / ".env"
         if env_path.exists():
             raw = env_path.read_bytes()
@@ -109,9 +111,28 @@ def _amap_key() -> str:
                 if end >= 0:
                     rest = rest[:end]
                 key = rest.decode("utf-8", errors="ignore").strip().strip('"').strip("'")
-    if not key:
-        raise SystemExit("[geocode] 未配置 AMAP_KEY（.env 中设置，或环境变量）")
-    return key
+    if not key:
+        raise SystemExit("[geocode] 未配置 AMAP_KEY（.env 中设置，或环境变量）")
+    return key
+
+
+_unknown_coord_warned = False
+
+
+def _warn_unknown_coord() -> None:
+    """§3.3 source=unknown 警告：按原样调用高德（不猜坐标系），模块级只提示一次。"""
+    global _unknown_coord_warned
+    if not _unknown_coord_warned:
+        _unknown_coord_warned = True
+        print("[geocode] 坐标制为 unknown：坐标原样调用高德（如有偏移请在 "
+              "data/location_coord_systems.json 声明设备坐标系）")
+
+
+def _to_amap(lat: float, lon: float, coord_system: str) -> tuple[float, float]:
+    """入口统一转换 + unknown 警告（§3.3：所有高德入口收到的坐标先经 to_amap_coord）。"""
+    if (coord_system or "unknown").strip().lower() == "unknown":
+        _warn_unknown_coord()
+    return to_amap_coord(lat, lon, coord_system)
 
 
 def behavior_of(poi_type: str, poi_name: str = "") -> str:
@@ -216,8 +237,12 @@ def _probe_batch_support(key: str) -> bool:
     return _SUPPORT_BATCH
 
 
-def _regeo_one(lat: float, lon: float, key: str) -> dict | None:
-    """单点 regeo(extensions=all)，返回完整语义 dict；失败返回 None。"""
+def _regeo_one(lat: float, lon: float, key: str, coord_system: str = "unknown") -> dict | None:
+    """单点 regeo(extensions=all)，返回完整语义 dict；失败返回 None。
+
+    坐标按 coord_system 经 to_amap_coord 转换后请求（§3.3）。
+    """
+    lat, lon = _to_amap(lat, lon, coord_system)
     params = urllib.parse.urlencode({
         "location": f"{lon},{lat}",
         "key": key,
@@ -236,11 +261,17 @@ def _regeo_one(lat: float, lon: float, key: str) -> dict | None:
     return info if info.get("formatted") else None
 
 
-def _regeo_request(points: list[tuple[float, float]], key: str) -> tuple[dict, list[int]]:
-    """请求一组点（批量 regeo）。返回 ({idx: info}, 失败idx列表)。"""
-    if not points:
-        return {}, []
-    locs = "|".join(f"{lon},{lat}" for lat, lon in points)
+def _regeo_request(
+    points: list[tuple[float, float]], key: str, coord_system: str = "unknown"
+) -> tuple[dict, list[int]]:
+    """请求一组点（批量 regeo）。返回 ({idx: info}, 失败idx列表)。
+
+    组内各点按 coord_system 统一转换（§3.3；调用方保证同组同源坐标系）。
+    """
+    if not points:
+        return {}, []
+    pts = [_to_amap(lat, lon, coord_system) for lat, lon in points]
+    locs = "|".join(f"{lon},{lat}" for lat, lon in pts)
     params = urllib.parse.urlencode({
         "location": locs,
         "key": key,
@@ -277,60 +308,71 @@ def _regeo_request(points: list[tuple[float, float]], key: str) -> tuple[dict, l
     return out, failed
 
 
-def batch_reverse_geocode(points: list[tuple[float, float]], key: str) -> tuple[dict, list[int]]:
-    """高德 regeo 编码入口：优先多点批量（20 点/次，失败按 10/5/1 降级）；
-    若 Key 不支持批量（实测返回单点结构），自动降级为逐点单请求。
-
-    返回 ({idx: info}, 最终失败 idx 列表)。不抛异常，失败点留待下次增量重试。
-    """
-    results: dict[int, dict] = {}
-    pending: list[tuple[int, tuple[float, float]]] = list(enumerate(points))
-    if not pending:
-        return results, []
-    support_batch = _probe_batch_support(key)
-    if not support_batch:
-        # 逐点单请求：每次 1 点，可靠性最高；成本受增量缓存控制（每天仅新增点）
-        failed: list[int] = []
-        for original_idx, (lat, lon) in pending:
-            info = _regeo_one(lat, lon, key)
-            if info:
-                results[original_idx] = info
-            else:
-                failed.append(original_idx)
-        return results, failed
-    for batch_size in BATCH_SIZES:
-        if not pending:
-            break
-        # 按 batch_size 分组
-        groups = [pending[i:i + batch_size] for i in range(0, len(pending), batch_size)]
-        still_failed: list[tuple[int, tuple[float, float]]] = []
-        for group in groups:
-            idxs = [p[0] for p in group]
-            pts = [p[1] for p in group]
-            out, failed_local = _regeo_request(pts, key)
-            for j, original_idx in enumerate(idxs):
-                if j in out:
-                    results[original_idx] = out[j]
-                else:
-                    still_failed.append((original_idx, pts[j]))
-        pending = still_failed
-    failed = [p[0] for p in pending]
-    return results, failed
-
-
-def reverse_geocode(lat: float, lon: float, key: str) -> dict | None:
-    """单点 regeo(extensions=all)，返回完整语义 dict（供 label_places 交互确认展示）。"""
-    out, failed = batch_reverse_geocode([(lat, lon)], key)
-    if failed:
-        return None
-    return out.get(0)
-
-
-def around_search(lat: float, lon: float, key: str, radius: int = 500) -> dict | None:
-    """周边搜索兜底：regeo 无 POI 时按坐标检索最近 POI 补行为语义。
-
-    extensions=all 的 POI 才带商圈字段 business_area（下划线）；base 仅 businessArea（驼峰）且常为空。
-    """
+def batch_reverse_geocode(
+    points: list[tuple[float, float]], key: str, coord_system: str = "unknown"
+) -> tuple[dict, list[int]]:
+    """高德 regeo 编码入口：优先多点批量（20 点/次，失败按 10/5/1 降级）；
+    若 Key 不支持批量（实测返回单点结构），自动降级为逐点单请求。
+
+    本批点须同源坐标系（coord_system 逐组传递；混合来源由调用方分组，
+    见 incremental_encode）。返回 ({idx: info}, 最终失败 idx 列表)。
+    不抛异常，失败点留待下次增量重试。
+    """
+    results: dict[int, dict] = {}
+    pending: list[tuple[int, tuple[float, float]]] = list(enumerate(points))
+    if not pending:
+        return results, []
+    support_batch = _probe_batch_support(key)
+    if not support_batch:
+        # 逐点单请求：每次 1 点，可靠性最高；成本受增量缓存控制（每天仅新增点）
+        failed: list[int] = []
+        for original_idx, (lat, lon) in pending:
+            info = _regeo_one(lat, lon, key, coord_system)
+            if info:
+                results[original_idx] = info
+            else:
+                failed.append(original_idx)
+        return results, failed
+    for batch_size in BATCH_SIZES:
+        if not pending:
+            break
+        # 按 batch_size 分组
+        groups = [pending[i:i + batch_size] for i in range(0, len(pending), batch_size)]
+        still_failed: list[tuple[int, tuple[float, float]]] = []
+        for group in groups:
+            idxs = [p[0] for p in group]
+            pts = [p[1] for p in group]
+            out, failed_local = _regeo_request(pts, key, coord_system)
+            for j, original_idx in enumerate(idxs):
+                if j in out:
+                    results[original_idx] = out[j]
+                else:
+                    still_failed.append((original_idx, pts[j]))
+        pending = still_failed
+    failed = [p[0] for p in pending]
+    return results, failed
+
+
+def reverse_geocode(lat: float, lon: float, key: str, coord_system: str = "unknown") -> dict | None:
+    """单点 regeo(extensions=all)，返回完整语义 dict（供 label_places 交互确认展示）。
+
+    坐标按 coord_system 经 to_amap_coord 转换后请求（§3.3）。
+    """
+    out, failed = batch_reverse_geocode([(lat, lon)], key, coord_system)
+    if failed:
+        return None
+    return out.get(0)
+
+
+def around_search(
+    lat: float, lon: float, key: str, radius: int = 500, coord_system: str = "unknown"
+) -> dict | None:
+    """周边搜索兜底：regeo 无 POI 时按坐标检索最近 POI 补行为语义。
+
+    坐标按 coord_system 经 to_amap_coord 转换后请求（§3.3）。
+    extensions=all 的 POI 才带商圈字段 business_area（下划线）；base 仅 businessArea（驼峰）且常为空。
+    """
+    lat, lon = _to_amap(lat, lon, coord_system)
     params = urllib.parse.urlencode({
         "location": f"{lon},{lat}",
         "key": key,
@@ -367,40 +409,60 @@ def infer_label(info: dict | None) -> str:
     return "未知"
 
 
-def incremental_encode(db_path: Path = DB_PATH, force_all: bool = False) -> int:
-    """增量编码：只对 geocoded_at IS NULL 的常驻点调用高德 regeo（force_all 则全部重编）。
-
-    语义字段全量落库；regeo 无 POI 时 around 兜底补一次；成功才标 geocoded_at，
-    失败点不标记、下次 ETL 重跑自动重试。ETL 重跑时无新增点 → 零 API 调用。
-    返回成功编码数。
-    """
-    key = _amap_key()
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    if force_all:
-        rows = conn.execute("SELECT id, lat, lon, grid_key FROM places").fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT id, lat, lon, grid_key FROM places WHERE geocoded_at IS NULL"
-        ).fetchall()
-    if not rows:
-        print("[geocode] 无新增待编码常驻点（增量缓存命中，零调用）")
-        conn.close()
-        return 0
-    print(f"[geocode] 待编码常驻点: {len(rows)} 个")
-
-    points = [(r["lat"], r["lon"]) for r in rows]
-    results, failed = batch_reverse_geocode(points, key)
-
-    now = int(time.time() * 1000)
-    n = 0
-    for i, r in enumerate(rows):
-        if i not in results:
-            continue
-        info = results[i]
-        # around 兜底：regeo 无 POI 时补一次周边搜索
-        if not info.get("poi"):
-            around = around_search(r["lat"], r["lon"], key)
+def incremental_encode(db_path: Path = DB_PATH, force_all: bool = False) -> int:
+    """增量编码：只对 geocoded_at IS NULL 的常驻点调用高德 regeo（force_all 则全部重编）。
+
+    语义字段全量落库；regeo 无 POI 时 around 兜底补一次；成功才标 geocoded_at，
+    失败点不标记、下次 ETL 重跑自动重试。ETL 重跑时无新增点 → 零 API 调用。
+    每点坐标系按 (device_id, first_seen) 从配置解析，按坐标制分组批量编码
+    （§3.3：混合来源不共用一个转换参数）。返回成功编码数。
+    """
+    from gacore.langTrack.etl_config import load_coord_systems, resolve_coord_system
+
+    key = _amap_key()
+    coord_cfg = load_coord_systems()  # 配置错误（重叠 period 等）直接拒绝本次编码
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    if force_all:
+        rows = conn.execute(
+            "SELECT id, device_id, first_seen, lat, lon, grid_key FROM places"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, device_id, first_seen, lat, lon, grid_key FROM places "
+            "WHERE geocoded_at IS NULL"
+        ).fetchall()
+    if not rows:
+        print("[geocode] 无新增待编码常驻点（增量缓存命中，零调用）")
+        conn.close()
+        return 0
+    print(f"[geocode] 待编码常驻点: {len(rows)} 个")
+
+    row_cs = [
+        resolve_coord_system(r["device_id"], r["first_seen"] or 0, coord_cfg) for r in rows
+    ]
+    groups: dict[str, list[int]] = {}
+    for i, cs in enumerate(row_cs):
+        groups.setdefault(cs, []).append(i)
+    results: dict[int, dict] = {}
+    failed: list[int] = []
+    for cs, idxs in groups.items():
+        pts = [(rows[i]["lat"], rows[i]["lon"]) for i in idxs]
+        out, failed_local = batch_reverse_geocode(pts, key, cs)
+        for j, original_idx in enumerate(idxs):
+            if j in out:
+                results[original_idx] = out[j]
+        failed.extend(idxs[j] for j in failed_local)
+
+    now = int(time.time() * 1000)
+    n = 0
+    for i, r in enumerate(rows):
+        if i not in results:
+            continue
+        info = results[i]
+        # around 兜底：regeo 无 POI 时补一次周边搜索
+        if not info.get("poi"):
+            around = around_search(r["lat"], r["lon"], key, coord_system=row_cs[i])
             if around:
                 info.update(around)
                 # 周边搜索返回 base 结构，补充三级/信号/兜底字段
@@ -454,36 +516,42 @@ def refresh_behavior(db_path: Path = DB_PATH) -> int:
     return n
 
 
-def enrich_business_area(db_path: Path = DB_PATH) -> int:
-    """P2-1 商圈补充：对已编码、business_area 为空且非住宅/楼宇/办公的活动类常驻点，
-    用 around 周边搜索补 business_area（不覆盖已有值）。低频增量，仅首次需配额。
-    """
-    key = _amap_key()
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT id, lat, lon, poi, behavior FROM places "
-        "WHERE geocoded_at IS NOT NULL AND (business_area IS NULL OR business_area='') "
-        "AND behavior IS NOT NULL AND behavior != '' "
-        "AND behavior NOT IN ('住宅/楼宇', '办公')"
-    ).fetchall()
-    if not rows:
-        print("[geocode] 无待补商圈的消费/活动点")
-        conn.close()
-        return 0
-    print(f"[geocode] 待补商圈点: {len(rows)} 个")
-    n = 0
-    for r in rows:
-        ba = ""
-        around = around_search(r["lat"], r["lon"], key, radius=800)
-        if around and around.get("business_area"):
-            ba = around["business_area"]
-        conn.execute("UPDATE places SET business_area=? WHERE id=?", (ba or None, r["id"]))
-        if ba:
-            n += 1
-    conn.commit()
-    conn.close()
-    print(f"[geocode] 商圈补充完成: {n} 个点获得商圈名")
+def enrich_business_area(db_path: Path = DB_PATH) -> int:
+    """P2-1 商圈补充：对已编码、business_area 为空且非住宅/楼宇/办公的活动类常驻点，
+    用 around 周边搜索补 business_area（不覆盖已有值）。低频增量，仅首次需配额。
+
+    每点坐标系按 (device_id, first_seen) 从配置解析（§3.3）。
+    """
+    from gacore.langTrack.etl_config import load_coord_systems, resolve_coord_system
+
+    key = _amap_key()
+    coord_cfg = load_coord_systems()
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT id, device_id, first_seen, lat, lon, poi, behavior FROM places "
+        "WHERE geocoded_at IS NOT NULL AND (business_area IS NULL OR business_area='') "
+        "AND behavior IS NOT NULL AND behavior != '' "
+        "AND behavior NOT IN ('住宅/楼宇', '办公')"
+    ).fetchall()
+    if not rows:
+        print("[geocode] 无待补商圈的消费/活动点")
+        conn.close()
+        return 0
+    print(f"[geocode] 待补商圈点: {len(rows)} 个")
+    n = 0
+    for r in rows:
+        ba = ""
+        cs = resolve_coord_system(r["device_id"], r["first_seen"] or 0, coord_cfg)
+        around = around_search(r["lat"], r["lon"], key, radius=800, coord_system=cs)
+        if around and around.get("business_area"):
+            ba = around["business_area"]
+        conn.execute("UPDATE places SET business_area=? WHERE id=?", (ba or None, r["id"]))
+        if ba:
+            n += 1
+    conn.commit()
+    conn.close()
+    print(f"[geocode] 商圈补充完成: {n} 个点获得商圈名")
     return n
 
 

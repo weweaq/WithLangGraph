@@ -2008,8 +2008,8 @@ QQ 机器人「韩立」已有完整 agent 回路，但面对随口话（“吃�
 - [ ] Task 2：LocationPoint 与 canonical 纯算法（location_facts.py）。
 - [ ] Task 3：shadow 全量位置事实（--location-shadow 幂等重建）。
 - [ ] Task 4：迁移稳定 ID、人工 tag 与 geocode 缓存（label v3 两阶段切换）。
-- [ ] Task 5：v1/v2 双读消费者，不执行激活。
-- [ ] Task 6：坐标质量与完整高德坐标边界。
+- [x] Task 5：v1/v2 双读消费者，不执行激活。
+- [x] Task 6：坐标质量与完整高德坐标边界。
 
 
 ## 2026-09-01：位置智能增强 Task 0（FactCard 已确认正确性问题止血）
@@ -2158,3 +2158,27 @@ subagent 独立复审提交 c97d2d5 + 工作区索引修复：无 P1 级正确�
 ### 待办更新
 - [x] Task 5 review-loop：subagent 审核（无 P1 正确性缺陷）+ P1-1/P2×8/P3×7 全部处置 + 305 用例通过 + lint 净减。
 - [x] Task 5 review-loop 复核（第二轮 subagent）：10 项意见全部正确完整处置——两项关键回归测试对修复前代码反验确认有效（test_migration_keeps_day_index / test_new_place_threshold_uses_point_count 均在旧代码上失败）；305 passed / 795+12（存量）/ ruff 声明全部实证吻合；未发现修复引入的新问题，**PASS**。唯一修正：索引丢失影响为执行计划回退 UNIQUE 自动索引（day 为首列仍走索引搜索），非全表扫，文档措辞已更正。
+
+## 2026-09-01：位置智能增强 Task 6（坐标质量统计与完整高德坐标边界）
+
+### 背景
+位置智能增强计划 Task 6：接入 §3.2 坐标质量日表（daily_location_quality，只观测不过滤）与 §3.3 高德坐标边界——所有高德入口（regeo 单/批、around、business enrichment、label reverse、direction、belt POI）统一经 `to_amap_coord` 转换，坐标制按 (device_id, 时间区间) 从 `data/location_coord_systems.json` 解析，重叠/非法配置拒绝 ETL；trips 落 endpoint/polyline 坐标制两列避免源坐标与 GCJ02 混淆；`build_stays/build_places/build_trips` 共用 LocationPoint 单一解析入口；`build_trips` 阈值真正参数化（含 max_infer_gap 与 etl_config trips 节点同一来源）。
+
+### 已完成
+1. **`src/gacore/langTrack/location_facts.py`（修改）**：`location_points`（events→LocationPoint 全链路唯一解析入口，按 (device,ts) 排序）、`accuracy_filter`（§3.1 仅作用于几何构建输入；默认 `apply_accuracy_filter=False` 只观测，开启时仅过滤已知且超阈值的点，缺 accuracy 按 `accept_missing_accuracy` 配置）、`daily_quality_rows`（§3.2 按 (day,device_id) 聚合：总数/有效数/精度三档/半小时格数/中位采样间隔/提供者分布，直接产出表行）；`to_amap_coord`/`wgs84_to_gcj02`（境外坐标不转换 guard）。
+2. **`src/gacore/langTrack/etl.py`（修改）**：`daily_location_quality` 表（PRIMARY KEY(day,device_id)，v1/v2 共表只读聚合）；trips 新增 `endpoint_coord_system`（NOT NULL DEFAULT 'unknown'）与 `polyline_coord_system` 两列 + `_migrate_trips_coord_columns` 旧库 ALTER 迁移；`_write_daily_quality` 幂等写入（增量只重建 affected days，全量 DELETE 重建，UPSERT 刷新 updated_at）；`_build_location_v1` 集成——入口 `load_coord_systems()` 配置错误直接拒绝 ETL，质量统计全量观测（不过滤），`build_stays/build_places` 输入改 geom_points（精度过滤后），`build_trips` 阈值从 etl_config trips 节点读取，trips 落库写两列（endpoint=resolve 的 source 坐标制、polyline 有缓存时标 'gcj02'）。
+3. **`src/gacore/langTrack/routes.py`（修改）**：`build_trips` 输入改 LocationPoint 列表、三个阈值（min_duration_ms/min_dist_m/max_infer_gap_ms）真正使用传入参数不再引用模块常量；`direction_polyline` 新增 coord_system 参数（起终点经 to_amap_coord 转换，unknown 模块级警告一次）；`incremental_encode_trips` 按 (device_id,start_ts) 逐段解析坐标制、成功补路同步标记 `polyline_coord_system='gcj02'`、坐标制配置错误拒绝本次补路（零请求）、失败段不标记留待重试；`encode_belt_pois` 网格坐标来自高德 polyline 量化，固定按 source="gcj02" 放行（禁止二次 WGS84→GCJ02 偏移）。
+4. **`src/gacore/langTrack/geocode.py`（修改）**：`_to_amap` 入口统一转换 + unknown 模块级警告一次；`_regeo_one/_regeo_request/batch_reverse_geocode/reverse_geocode/around_search` 全部新增 coord_system 参数；`incremental_encode` 每点按 (device_id,first_seen) 解析坐标制、按坐标制分组批量编码（混合来源不共用一个转换参数）、配置错误拒绝编码；`enrich_business_area` 逐点解析坐标制。
+5. **`src/gacore/langTrack/label_places.py`（修改）**：`confirm()` 交互确认的 reverse_geocode 按 (device_id,first_seen) 解析坐标制后转换，配置错误拒绝进入交互确认。
+6. **`src/gacore/langTrack/location_migration.py`（修改）**：shadow 管线共用 `location_points` 单一解析（替换原重复解析循环）；`_write_daily_quality` 共表写入（全量重建，不触碰位置事实表，与 shadow 只读承诺不冲突）。
+7. **测试（+37 用例）**：`test_langTrack_geocode.py`（新建 10：regeo/around URL 坐标转换、unknown 警告一次、incremental 按坐标制分组+配置错误拒绝、enrich 逐点解析）；`test_langTrack_routes.py`（新建 15：build_trips 基础/推断/超长 gap 跳过/双阈值参数/设备隔离，direction URL 转换与警告，补路标记 gcj02/按设备解析/配置错误零请求/失败不标记，belt POI gcj02 原样放行）；`test_langTrack_location_facts.py`（39→48：location_points/accuracy_filter/daily_quality_rows 语义）；`test_langTrack_etl_location.py`（12→15：TestDailyQuality——shadow 与 v1 管线共表写入、跨午夜按自然日拆行、语义列精确断言、双跑幂等、v1 trips 坐标制两列）。
+
+### 验证（维护测试日志）
+- langTrack 组：`pytest tests -k langTrack` **342 passed**（Task 5 review 后 305 + 37 新增）。
+- 坐标语义抽查：geocode/routes 测试断言最终 HTTP 请求 URL 中的 location/origin/destination 坐标（wgs84→GCJ02 转换值、gcj02/unknown 原样、belt POI 网格坐标原样）。
+- ruff：净新增 0——本次触及文件发现 28 项全为 HEAD 存量（同文件基线 28 项），首跑引入的 3 处 I001（etl.py 新导入块 + 两个新测试文件）已修复清零。
+- 真实库策略：首版保持 `apply_accuracy_filter=False` 只观测（etl_config DEFAULTS），provider/accuracy/coverage 分布待 dashboard 实测后由用户确认开启。
+
+### 待办更新
+- [x] Task 6：坐标质量与完整高德坐标边界（daily_location_quality + to_amap_coord 全入口 + trips 坐标制两列 + build_trips 参数化 + 37 用例）。
+- [ ] Task 7：迁移 FactCard 与 tool 兼容契约。

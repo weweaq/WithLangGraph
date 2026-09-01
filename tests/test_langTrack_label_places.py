@@ -468,7 +468,7 @@ class TestConfirmMultiDevice:
 
         from gacore.langTrack import geocode
         monkeypatch.setattr(geocode, "_amap_key", lambda: "test-key")
-        monkeypatch.setattr(geocode, "reverse_geocode", lambda lat, lon, key: None)
+        monkeypatch.setattr(geocode, "reverse_geocode", lambda lat, lon, key, **kw: None)
 
         answers = iter(["家", "公司"])
         monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
@@ -504,7 +504,7 @@ class TestConfirmMultiDevice:
 
         from gacore.langTrack import geocode
         monkeypatch.setattr(geocode, "_amap_key", lambda: "test-key")
-        monkeypatch.setattr(geocode, "reverse_geocode", lambda lat, lon, key: None)
+        monkeypatch.setattr(geocode, "reverse_geocode", lambda lat, lon, key, **kw: None)
         monkeypatch.setattr("builtins.input", lambda prompt="": "")
 
         lp.confirm()

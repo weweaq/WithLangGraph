@@ -412,6 +412,12 @@ CREATE TABLE IF NOT EXISTS trips (
 
   route_encoded_at INTEGER,
 
+  -- Task 6 §3.3：trips 起终点保存 source 坐标，polyline 是高德 GCJ02，
+  -- 两列显式标记坐标域，禁止混为同一坐标系解释
+  endpoint_coord_system TEXT NOT NULL DEFAULT 'unknown',
+
+  polyline_coord_system TEXT,
+
   UNIQUE(device_id, start_ts, end_ts)
 
 );
@@ -473,7 +479,6 @@ CREATE TABLE IF NOT EXISTS contract_coverage (
 
 
 -- P2 沿途 POI（网格级缓存）：每个网格最多一条周边 POI（around 100 次/日，低频克制）
-
 CREATE TABLE IF NOT EXISTS grid_pois (
   grid_lat REAL NOT NULL,
   grid_lon REAL NOT NULL,
@@ -482,6 +487,24 @@ CREATE TABLE IF NOT EXISTS grid_pois (
   distance TEXT,
   queried_at INTEGER,
   PRIMARY KEY(grid_lat, grid_lon)
+);
+
+-- Task 6 §3.2 坐标质量日表（只读聚合，v1/v2 共用；ETL 幂等重建）
+CREATE TABLE IF NOT EXISTS daily_location_quality (
+  day TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  points_total INTEGER NOT NULL,
+  points_valid INTEGER NOT NULL,
+  accuracy_known INTEGER NOT NULL,
+  accuracy_le_50 INTEGER NOT NULL,
+  accuracy_51_150 INTEGER NOT NULL,
+  accuracy_gt_150 INTEGER NOT NULL,
+  observed_half_hour_bins INTEGER NOT NULL,
+  median_interval_sec REAL,
+  providers_json TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now','+8 hours')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now','+8 hours')),
+  PRIMARY KEY(day, device_id)
 );
 
 -- B5 ETL 运行血缘：每次 ETL 运行一条记录
@@ -848,7 +871,7 @@ STAY_MAX_SPEED_MPS = 40.0               # 漂移尖刺：瞬时速度 > 40m/s（
 
 def build_stays(
 
-    events,
+    points,
 
     large_radius_m: float = STAY_LARGE_RADIUS_M,
 
@@ -867,6 +890,9 @@ def build_stays(
 ) -> list[tuple]:
 
     """L1 停驻点检测：滑动窗口 + 中位数中心。
+
+    输入 points 为 location_facts.location_points 产物（LocationPoint 列表，
+    Task 6 起全链路共用解析：非法坐标已在解析层拒绝，本函数不再重复校验）。
 
 
 
@@ -894,21 +920,9 @@ def build_stays(
 
     by_device: dict[str, list[tuple[int, float, float]]] = defaultdict(list)
 
-    for device_id, ts, type_, p in events:
+    for p in points:
 
-        if type_ != "location":
-
-            continue
-
-        lat = p.get("lat")
-
-        lon = p.get("lon")
-
-        if lat is None or lon is None:
-
-            continue
-
-        by_device[device_id].append((ts, lat, lon))
+        by_device[p.device_id].append((p.ts, p.lat, p.lon))
 
     for evs in by_device.values():
 
@@ -1078,11 +1092,11 @@ def build_stays(
 
 
 
-def build_places(events) -> list[tuple]:
+def build_places(points) -> list[tuple]:
 
     """位置网格聚类：0.001° (~110m) 网格，聚合停留次数与时间范围。
 
-
+    输入 points 为 location_facts.location_points 产物（Task 6 共用解析）。
 
     修复：device_id 按事件实际值填充（不再写死空串），多设备按 (device_id, grid) 隔离。
 
@@ -1090,27 +1104,17 @@ def build_places(events) -> list[tuple]:
 
     grid: dict[tuple, dict] = {}
 
-    for device_id, ts, type_, p in events:
+    for p in points:
 
-        if type_ != "location":
-
-            continue
-
-        lat = p.get("lat")
-
-        lon = p.get("lon")
-
-        if lat is None or lon is None:
-
-            continue
+        lat, lon = p.lat, p.lon
 
         gk = (round(lat * 1000) / 1000, round(lon * 1000) / 1000)
 
-        cell = grid.setdefault((device_id, gk), {"lat": lat, "lon": lon, "first": ts, "last": ts, "n": 0})
+        cell = grid.setdefault((p.device_id, gk), {"lat": lat, "lon": lon, "first": p.ts, "last": p.ts, "n": 0})
 
-        cell["first"] = min(cell["first"], ts)
+        cell["first"] = min(cell["first"], p.ts)
 
-        cell["last"] = max(cell["last"], ts)
+        cell["last"] = max(cell["last"], p.ts)
 
         cell["n"] += 1
 
@@ -2089,12 +2093,74 @@ def _update_etl_state(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _write_daily_quality(
+    conn: sqlite3.Connection, rows: list[tuple], incremental_active: bool, affected_days: set[str]
+) -> None:
+    """§3.2 坐标质量日表幂等写入：增量只重建 affected days，全量 DELETE 重建。
+
+    rows 为 location_facts.daily_quality_rows 产物（v1/v2 管线共用本入口，
+    表名固定不随 user_version 切换）。
+    """
+    if incremental_active:
+        ph = ",".join("?" * len(affected_days))
+        conn.execute(f"DELETE FROM daily_location_quality WHERE day IN ({ph})", list(affected_days))
+    else:
+        conn.execute("DELETE FROM daily_location_quality")
+    conn.executemany(
+        "INSERT INTO daily_location_quality(day, device_id, points_total, points_valid, "
+        "accuracy_known, accuracy_le_50, accuracy_51_150, accuracy_gt_150, "
+        "observed_half_hour_bins, median_interval_sec, providers_json) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(day, device_id) DO UPDATE SET "
+        "points_total=excluded.points_total, points_valid=excluded.points_valid, "
+        "accuracy_known=excluded.accuracy_known, accuracy_le_50=excluded.accuracy_le_50, "
+        "accuracy_51_150=excluded.accuracy_51_150, accuracy_gt_150=excluded.accuracy_gt_150, "
+        "observed_half_hour_bins=excluded.observed_half_hour_bins, "
+        "median_interval_sec=excluded.median_interval_sec, "
+        "providers_json=excluded.providers_json, "
+        "updated_at=datetime('now','+8 hours')",
+        rows,
+    )
+    print(f"[etl] daily_location_quality(坐标质量日表): {len(rows)} 行")
+
+
+def _migrate_trips_coord_columns(conn: sqlite3.Connection) -> None:
+    """Task 6：旧库 trips 补坐标制两列（新库 schema 已含；v2 冻结表自带，跳过）。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(trips)")}
+    if "endpoint_coord_system" not in cols:
+        conn.execute("ALTER TABLE trips ADD COLUMN endpoint_coord_system TEXT NOT NULL DEFAULT 'unknown'")
+    if "polyline_coord_system" not in cols:
+        conn.execute("ALTER TABLE trips ADD COLUMN polyline_coord_system TEXT")
+
+
 def _build_location_v1(conn: sqlite3.Connection, events, incremental_active: bool, affected_days: set[str]) -> None:
     """v1 位置管线：stays/trips/places 构建 + 家/公司候选推断 + top2 主点标记。
 
     v2 激活后由 run() 分流跳过（v1 写入会破坏 place_id 语义并复活 visit_count
-    累加事故）；本函数保持 v1 库行为完全不变。结束时提交并关闭传入连接。
+    累加事故）；本函数保持 v1 库行为不变。结束时提交并关闭传入连接。
+
+    Task 6：全链路共用 location_facts.location_points 解析（非法坐标统一拒绝）、
+    §3.1 accuracy filter（默认只观测）、§3.2 日质量表、trips 坐标制两列；
+    坐标制配置错误（坏 JSON / 重叠 period）在入口拒绝 ETL。
     """
+
+    from gacore.langTrack import location_facts as lf
+    from gacore.langTrack.etl_config import load_coord_systems, load_etl_config, resolve_coord_system
+
+    coord_cfg = load_coord_systems()
+    _write_daily_quality(
+        conn, lf.daily_quality_rows(events, coord_cfg), incremental_active, affected_days
+    )
+
+    points = lf.location_points(events, coord_cfg)
+
+    loc_cfg = load_etl_config().get("location", {})
+
+    geom_points = lf.accuracy_filter(points, loc_cfg)
+
+    if len(geom_points) < len(points):
+        dropped = len(points) - len(geom_points)
+        print(f"[etl] accuracy filter: 剔除 {dropped} 点（仅几何构建输入，质量统计仍全量观测）")
 
     # L1：停驻点检测 → stays 表（全量重建）
 
@@ -2104,7 +2170,7 @@ def _build_location_v1(conn: sqlite3.Connection, events, incremental_active: boo
     else:
         conn.execute("DELETE FROM stays")
 
-    stays = build_stays(events)
+    stays = build_stays(geom_points)
     if incremental_active:
         stays = [r for r in stays if r[-1] in affected_days]
 
@@ -2146,7 +2212,14 @@ def _build_location_v1(conn: sqlite3.Connection, events, incremental_active: boo
     else:
         conn.execute("DELETE FROM trips")
 
-    trips = build_trips(events, stays)
+    # Task 6：阈值统一从 etl_config trips 节点读取（与 v2 shadow 同一配置来源）
+    trips_cfg = load_etl_config().get("trips", {})
+    trips = build_trips(
+        geom_points, stays,
+        min_duration_ms=int(trips_cfg.get("min_duration_ms", 60000)),
+        min_dist_m=float(trips_cfg.get("min_dist_m", 300.0)),
+        max_infer_gap_ms=int(trips_cfg.get("max_infer_gap_ms", 7200000)),
+    )
     if incremental_active:
         trips = [t for t in trips if t[10] in affected_days]
 
@@ -2158,13 +2231,19 @@ def _build_location_v1(conn: sqlite3.Connection, events, incremental_active: boo
 
             "INSERT INTO trips(device_id, start_ts, end_ts, duration_ms, start_lat, start_lon, "
 
-            "end_lat, end_lon, dist_m, n_points, day, polyline, route_key, route_mode, route_encoded_at) "
+            "end_lat, end_lon, dist_m, n_points, day, polyline, route_key, route_mode, "
+            "route_encoded_at, endpoint_coord_system, polyline_coord_system) "
 
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 
             (t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], t[9], t[10],
 
-             poly, rk, mode, enc),
+             poly, rk, mode, enc,
+
+             # 起终点为 source 坐标（不转换落库）；polyline 来自高德固定 GCJ02
+             resolve_coord_system(t[0], t[1], coord_cfg),
+
+             "gcj02" if poly else None),
 
         )
 
@@ -2174,7 +2253,7 @@ def _build_location_v1(conn: sqlite3.Connection, events, incremental_active: boo
 
     # places：保留已标注 label（家/公司/未知），只更新统计；新点以"未知"插入
 
-    places = build_places(events)
+    places = build_places(geom_points)
 
     for p in places:
 
@@ -2265,6 +2344,9 @@ def run(db_path: Path = DB_PATH, device_id: str | None = None, run_geocode: bool
 
         # 迁移：anomalies 唯一键加入 device_id（跨设备同日同类异常不再互相吞行）
         _migrate_anomalies_unique(conn)
+
+        # 迁移：Task 6 trips 坐标制两列（v2 冻结表自带，无需迁移）
+        _migrate_trips_coord_columns(conn)
 
     # B migration: ensure fact tables have device_id / created_at / updated_at / etl_version
     # （v2 下内部自动跳过位置事实表，仅处理 sessions/daily_stats）

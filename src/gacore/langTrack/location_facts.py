@@ -1,4 +1,4 @@
-﻿"""location_facts.py —— 位置智能 canonical 纯算法层（零 DB / 文件 / 网络访问）。
+"""location_facts.py —— 位置智能 canonical 纯算法层（零 DB / 文件 / 网络访问）。
 
 本模块只负责“给定规范化坐标点 / 停留段，算出客观事实”，不触碰任何外部 IO：
 
@@ -10,6 +10,8 @@
 - :func:`match_old_new`：新旧 place 全局一对一 matching（§2.3 规则 7-11，旧 ID 认领）。
 - :func:`resolve_place_name` / :func:`format_place`：地点显示契约（§2.6）。
 - :func:`to_amap_coord`：WGS84 → GCJ02 近似转换（未知坐标系原样放行）。
+- :func:`location_points` / :func:`accuracy_filter` / :func:`daily_quality_rows`：
+  Task 6 共用解析 / §3.1 精度过滤 / §3.2 日质量行（几何构建与质量统计共用输入）。
 
 imports 全部位于文件顶部；本模块被 etl / migration / fact_card 等消费方共用，
 禁止在本模块内出现 sqlite3 / open / requests 等副作用调用。
@@ -17,11 +19,18 @@ imports 全部位于文件顶部；本模块被 etl / migration / fact_card 等�
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import itertools
+import json
 import math
+import statistics
 from collections.abc import Iterable
 from typing import NamedTuple, TypedDict
+
+from gacore.langTrack.etl_config import resolve_coord_system
+
+_TZ_CST = datetime.timezone(datetime.timedelta(hours=8))
 
 # ---------------------------------------------------------------------------
 # 常量（与 etl_config 语义对齐；纯算法默认值，配置层可在调用时覆盖）
@@ -209,6 +218,116 @@ def quality_stats(points: Iterable[LocationPoint]) -> dict:
             "max_sample_gap_s": round(max_gap, 1),
         }
     return out
+
+
+def location_points(events, coord_cfg: dict) -> list[LocationPoint]:
+    """events → LocationPoint 共用解析入口（§2.1，Task 6 起全链路唯一解析点）。
+
+    build_stays / build_places / build_trips / 质量统计共用本函数，保证：
+    - 坐标白名单校验单点维护（非法坐标 / (0,0) / 越界统一拒绝）；
+    - coord_system 由 (device_id, ts) + coord_cfg 解析，不从数值自动猜；
+    - 输出按 (device_id, ts) 排序。
+
+    events: [(device_id, ts, type, payload)]；仅解析 location 事件，解析失败的丢弃。
+    """
+    points: list[LocationPoint] = []
+    for device_id, ts, type_, payload in events:
+        if type_ != "location":
+            continue
+        cs = resolve_coord_system(device_id, ts, coord_cfg)
+        pt = parse_location_point(device_id, ts, payload, coord_system=cs)
+        if pt is not None:
+            points.append(pt)
+    points.sort(key=lambda p: (p.device_id, p.ts))
+    return points
+
+
+def accuracy_filter(points: list[LocationPoint], cfg: dict | None = None) -> list[LocationPoint]:
+    """§3.1 坐标精度过滤（作用于几何构建输入；质量统计本身只观测不过滤）。
+
+    cfg 为 etl_config 的 location 节点：
+    - apply_accuracy_filter=False（默认）：只观测，原样返回；
+    - True：仅剔除 accuracy 已知且 > max_accuracy_m 的点；accuracy 缺失按
+      accept_missing_accuracy 决定去留（室内 network 点常缺 accuracy，默认保留）。
+    """
+    c = cfg or {}
+    if not bool(c.get("apply_accuracy_filter", False)):
+        return points
+    max_acc = float(c.get("max_accuracy_m", 150.0))
+    keep_missing = bool(c.get("accept_missing_accuracy", True))
+    out: list[LocationPoint] = []
+    for p in points:
+        if p.accuracy_m is None:
+            if keep_missing:
+                out.append(p)
+            continue
+        if p.accuracy_m <= max_acc:
+            out.append(p)
+    return out
+
+
+def daily_quality_rows(events, coord_cfg: dict) -> list[tuple]:
+    """按 (day, device_id) 聚合坐标质量，直接产出 daily_location_quality 行（§3.2）。
+
+    返回 [(day, device_id, points_total, points_valid, accuracy_known,
+          accuracy_le_50, accuracy_51_150, accuracy_gt_150,
+          observed_half_hour_bins, median_interval_sec, providers_json)]：
+    - points_total：该日该设备全部 location 事件数（含解析失败）；
+    - points_valid：解析成功（LocationPoint）的点数；accuracy 桶基于 valid 点；
+    - 采样间隔在 (device, day) 桶内独立排序计算，不跨设备不跨日混合；<2 点记 None；
+    - day 为东八区自然日，与 etl.day_of 同一语义。
+    """
+    by_key: dict[tuple[str, str], dict] = {}
+    for device_id, ts, type_, payload in events:
+        if type_ != "location":
+            continue
+        day = datetime.datetime.fromtimestamp(ts / 1000, tz=_TZ_CST).strftime("%Y-%m-%d")
+        cell = by_key.setdefault(
+            (day, device_id),
+            {
+                "total": 0, "valid": [], "providers": {},
+                "le50": 0, "q51_150": 0, "gt150": 0, "known": 0, "slots": set(),
+            },
+        )
+        cell["total"] += 1
+        pt = parse_location_point(
+            device_id, ts, payload,
+            coord_system=resolve_coord_system(device_id, ts, coord_cfg),
+        )
+        if pt is None:
+            continue
+        cell["valid"].append(pt)
+        cell["providers"][pt.provider] = cell["providers"].get(pt.provider, 0) + 1
+        acc = pt.accuracy_m
+        if acc is None:
+            pass
+        else:
+            cell["known"] += 1
+            if acc <= 50:
+                cell["le50"] += 1
+            elif acc <= 150:
+                cell["q51_150"] += 1
+            else:
+                cell["gt150"] += 1
+        cell["slots"].add(ts // (30 * 60 * 1000))
+
+    rows: list[tuple] = []
+    for (day, device_id), c in sorted(by_key.items()):
+        pts = sorted(c["valid"], key=lambda p: p.ts)
+        if len(pts) >= 2:
+            gaps = [b.ts - a.ts for a, b in itertools.pairwise(pts)]
+            median_gap = round(statistics.median(gaps) / 1000.0, 1)
+        else:
+            median_gap = None
+        rows.append(
+            (
+                day, device_id, c["total"], len(pts),
+                c["known"], c["le50"], c["q51_150"], c["gt150"],
+                len(c["slots"]), median_gap,
+                json.dumps(c["providers"], ensure_ascii=False, sort_keys=True),
+            )
+        )
+    return rows
 
 
 # ---------------------------------------------------------------------------

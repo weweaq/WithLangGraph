@@ -302,9 +302,11 @@ def confirm() -> None:
     （(device_id, place_id) 主键）。位置事实读取经 location_reader 双读层。
     """
     from gacore.langTrack import location_reader as lr
+    from gacore.langTrack.etl_config import load_coord_systems, resolve_coord_system
     from gacore.langTrack.geocode import _amap_key, reverse_geocode
 
     key = _amap_key()
+    coord_cfg = load_coord_systems()  # 坐标制配置错误时拒绝进入交互确认
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     v2 = lr.is_v2(conn)
@@ -359,7 +361,9 @@ def confirm() -> None:
     if rows:
         print("-- 待确认候选（ETL 推断，请确认是否定名） --")
         for r in rows:
-            info = reverse_geocode(r["lat"], r["lon"], key)
+            # §3.3：label reverse 按点位 (device_id, first_seen) 解析坐标制后转换
+            cs = resolve_coord_system(r["device_id"], r["first_seen"] or 0, coord_cfg)
+            info = reverse_geocode(r["lat"], r["lon"], key, coord_system=cs)
             addr = info.get("formatted", "") if info else (r["address"] or "")
             poi = info.get("poi", "") if info else (r["poi"] or "")
             cur = _cur_tag(r)

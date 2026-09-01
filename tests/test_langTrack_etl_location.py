@@ -395,3 +395,89 @@ class TestShadowBuild:
         assert dev2["accuracy_known_points"] == 0
         assert dev2["avg_accuracy_m"] is None
         conn.close()
+
+
+class TestDailyQuality:
+    """§3.2 坐标质量日表：shadow 与 v1 管线共表写入（只读聚合，幂等重建）。"""
+
+    def _quality(self, db_path) -> dict:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        rows = {
+            (r["day"], r["device_id"]): dict(r)
+            for r in conn.execute("SELECT * FROM daily_location_quality")
+        }
+        conn.close()
+        for r in rows.values():
+            r.pop("created_at")
+            r.pop("updated_at")
+        return rows
+
+    def test_shadow_writes_daily_quality(self, v1_db, shadow_env):
+        lm.build_location_shadow(v1_db)
+        q = self._quality(v1_db)
+        assert set(q) == {
+            ("2026-08-17", "dev1"), ("2026-08-18", "dev1"),
+            ("2026-08-19", "dev1"), ("2026-08-17", "dev2"),
+        }
+        # dev1 08-17：7 home(acc20,gps) + 3 commute(acc缺,network) + 13 work(acc45,gps)
+        # + 2 路过(acc缺,gps) = 25 点全部有效解析
+        d17 = q[("2026-08-17", "dev1")]
+        assert d17["points_total"] == 25
+        assert d17["points_valid"] == 25
+        assert d17["accuracy_known"] == 20
+        assert d17["accuracy_le_50"] == 20
+        assert d17["accuracy_51_150"] == 0
+        assert d17["accuracy_gt_150"] == 0
+        assert json.loads(d17["providers_json"]) == {"gps": 22, "network": 3}
+        assert d17["observed_half_hour_bins"] >= 8  # 8:00-19:00 跨多个半小时格
+        assert d17["median_interval_sec"] is not None
+        # dev1 08-18/08-19：跨午夜 home2 5 点按自然日拆分（23:50 1 点 + 00:00 后 4 点）
+        d18 = q[("2026-08-18", "dev1")]
+        assert d18["points_total"] == 1
+        assert d18["accuracy_known"] == 1
+        assert d18["accuracy_le_50"] == 1
+        assert json.loads(d18["providers_json"]) == {"gps": 1}
+        d19 = q[("2026-08-19", "dev1")]
+        assert d19["points_total"] == 4
+        assert d19["accuracy_known"] == 4
+        assert json.loads(d19["providers_json"]) == {"gps": 4}
+        # dev2 08-17：7 点 network 全部缺 accuracy → known=0 只观测不计档
+        dev2 = q[("2026-08-17", "dev2")]
+        assert dev2["points_total"] == 7
+        assert dev2["accuracy_known"] == 0
+        assert json.loads(dev2["providers_json"]) == {"network": 7}
+
+    def test_shadow_quality_idempotent(self, v1_db, shadow_env):
+        lm.build_location_shadow(v1_db)
+        first = self._quality(v1_db)
+        lm.build_location_shadow(v1_db)
+        assert self._quality(v1_db) == first
+
+    def test_v1_run_writes_quality_and_trips_coord_columns(
+        self, v1_db, shadow_env, monkeypatch
+    ):
+        """v1 管线：日质量表落库；trips 落 endpoint/polyline 坐标制两列。"""
+        from gacore.langTrack import label_places
+        monkeypatch.setattr(
+            label_places, "CONFIG_PATH", Path(v1_db).parent / "none.json"
+        )
+        etl.run(v1_db, run_geocode=False, run_route=False, run_poi=False)
+
+        q = self._quality(v1_db)
+        assert q[("2026-08-17", "dev1")]["points_total"] == 25
+        assert q[("2026-08-17", "dev2")]["points_total"] == 7
+
+        conn = sqlite3.connect(v1_db)
+        conn.row_factory = sqlite3.Row
+        trips = list(conn.execute("SELECT * FROM trips"))
+        conn.close()
+        assert trips
+        # 起终点为 source 坐标制（默认 unknown）；带旧缓存的行 polyline 标 GCJ02
+        assert {t["endpoint_coord_system"] for t in trips} == {"unknown"}
+        cached = [t for t in trips if t["polyline"]]
+        assert cached and all(t["polyline_coord_system"] == "gcj02" for t in cached)
+
+        # 连跑两次幂等（审计列外一致）
+        etl.run(v1_db, run_geocode=False, run_route=False, run_poi=False)
+        assert self._quality(v1_db) == q

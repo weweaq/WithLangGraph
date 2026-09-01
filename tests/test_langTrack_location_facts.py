@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import datetime
+import json
 import math
 
 from gacore.langTrack.location_facts import (
     LocationPoint,
     OldPlace,
     StayInput,
+    accuracy_filter,
     canonical_places,
     cluster_stays,
+    daily_quality_rows,
     format_place,
     grid_key_of,
+    location_points,
     match_old_new,
     parse_location_point,
     quality_stats,
@@ -393,3 +398,131 @@ class TestToAmapCoord:
         lat, lon = wgs84_to_gcj02(31.98, 118.78)
         assert -90 <= lat <= 90
         assert -180 <= lon <= 180
+
+
+# ---------------------------------------------------------------------------
+# Task 6：location_points / accuracy_filter / daily_quality_rows（§2.1/§3.1/§3.2）
+# ---------------------------------------------------------------------------
+
+_EMPTY_CFG = {"default": "unknown", "periods": []}
+
+
+class TestLocationPoints:
+    def test_parses_location_events_only_sorted(self):
+        events = [
+            ("b", 200, "location", {"lat": 31.0, "lon": 118.0}),
+            ("a", 200, "location", {"lat": 31.1, "lon": 118.1}),
+            ("a", 100, "location", {"lat": 31.2, "lon": 118.2}),
+            ("a", 150, "usage", {"pkg": "x"}),
+            ("a", 120, "location", {"lat": 999, "lon": 118.0}),
+        ]
+        pts = location_points(events, _EMPTY_CFG)
+        assert [(p.device_id, p.ts) for p in pts] == [("a", 100), ("a", 200), ("b", 200)]
+
+    def test_coord_system_resolved_per_device_period(self):
+        events = [
+            ("dev1", 500, "location", {"lat": 31.0, "lon": 118.0}),
+            ("dev1", 5000, "location", {"lat": 31.0, "lon": 118.0}),
+            ("dev2", 500, "location", {"lat": 31.0, "lon": 118.0}),
+        ]
+        cfg = {
+            "default": "gcj02",
+            "periods": [
+                {"device_id": "dev1", "start_ts": 1000, "end_ts": None, "source": "wgs84"},
+            ],
+        }
+        pts = location_points(events, cfg)
+        assert pts[0].coord_system == "gcj02"
+        assert pts[1].coord_system == "wgs84"
+        assert pts[2].coord_system == "gcj02"
+
+
+class TestAccuracyFilter:
+    def _pts(self):
+        return [
+            LocationPoint("d", 1, 31.0, 118.0, 20.0, "gps", "unknown"),
+            LocationPoint("d", 2, 31.0, 118.0, 200.0, "gps", "unknown"),
+            LocationPoint("d", 3, 31.0, 118.0, None, "network", "unknown"),
+        ]
+
+    def test_off_observes_only(self):
+        out = accuracy_filter(self._pts(), {"apply_accuracy_filter": False})
+        assert out == self._pts()
+
+    def test_none_cfg_observes_only(self):
+        assert accuracy_filter(self._pts(), None) == self._pts()
+
+    def test_on_drops_known_over_threshold_keeps_missing(self):
+        out = accuracy_filter(
+            self._pts(),
+            {"apply_accuracy_filter": True, "max_accuracy_m": 150.0,
+             "accept_missing_accuracy": True},
+        )
+        assert [p.ts for p in out] == [1, 3]
+
+    def test_on_drops_missing_when_not_accepted(self):
+        out = accuracy_filter(
+            self._pts(),
+            {"apply_accuracy_filter": True, "max_accuracy_m": 150.0,
+             "accept_missing_accuracy": False},
+        )
+        assert [p.ts for p in out] == [1]
+
+
+_TZ = datetime.timezone(datetime.timedelta(hours=8))
+_TS_D1 = int(datetime.datetime(2026, 8, 17, 10, 0, tzinfo=_TZ).timestamp() * 1000)
+_TS_D2 = int(datetime.datetime(2026, 8, 18, 9, 0, tzinfo=_TZ).timestamp() * 1000)
+
+
+class TestDailyQualityRows:
+    def _events(self):
+        return [
+            ("dev1", _TS_D1, "location", {"lat": 31.0, "lon": 118.0, "acc": 20, "provider": "gps"}),
+            ("dev1", _TS_D1 + 31 * 60_000, "location",
+             {"lat": 31.001, "lon": 118.001, "acc": 80, "provider": "network"}),
+            ("dev1", _TS_D1 + 61 * 60_000, "location", {"lat": 999, "lon": 0.0}),
+            ("dev2", _TS_D2, "location", {"lat": 31.0, "lon": 118.0, "acc": 200.0, "provider": "network"}),
+        ]
+
+    def test_row_semantics(self):
+        rows = daily_quality_rows(self._events(), _EMPTY_CFG)
+        by_key = {(r[0], r[1]): r for r in rows}
+        d1 = by_key[("2026-08-17", "dev1")]
+        assert d1[2] == 3          # points_total 含解析失败
+        assert d1[3] == 2          # points_valid
+        assert d1[4] == 2          # accuracy_known
+        assert d1[5] == 1          # accuracy_le_50
+        assert d1[6] == 1          # accuracy_51_150
+        assert d1[7] == 0          # accuracy_gt_150
+        assert d1[8] == 2          # 31 分钟间隔 → 两个 30 分钟格
+        assert d1[9] == 1860.0     # median_interval_sec = 31min
+        assert json.loads(d1[10]) == {"gps": 1, "network": 1}
+
+        d2 = by_key[("2026-08-18", "dev2")]
+        assert d2[3] == 1
+        assert d2[7] == 1          # accuracy_gt_150
+        assert d2[9] is None       # 单点无间隔
+
+    def test_intervals_not_mixed_across_devices_or_days(self):
+        # dev2 的时间点夹在 dev1 两点之间：dev1 的 median 不受影响
+        events = self._events() + [
+            ("dev2", _TS_D1 + 15 * 60_000, "location", {"lat": 31.0, "lon": 118.0}),
+        ]
+        rows = daily_quality_rows(events, _EMPTY_CFG)
+        by_key = {(r[0], r[1]): r for r in rows}
+        assert by_key[("2026-08-17", "dev1")][9] == 1860.0
+        # dev2 当日仅 1 点（另一日在 d2 桶）
+        assert by_key[("2026-08-17", "dev2")][3] == 1
+        assert by_key[("2026-08-17", "dev2")][9] is None
+
+    def test_cross_midnight_points_bucketed_by_day(self):
+        late = int(datetime.datetime(2026, 8, 17, 23, 50, tzinfo=_TZ).timestamp() * 1000)
+        early = int(datetime.datetime(2026, 8, 18, 0, 10, tzinfo=_TZ).timestamp() * 1000)
+        events = [
+            ("d", late, "location", {"lat": 31.0, "lon": 118.0}),
+            ("d", early, "location", {"lat": 31.0, "lon": 118.0}),
+        ]
+        rows = daily_quality_rows(events, _EMPTY_CFG)
+        assert {(r[0], r[3], r[9]) for r in rows} == {
+            ("2026-08-17", 1, None), ("2026-08-18", 1, None),
+        }
