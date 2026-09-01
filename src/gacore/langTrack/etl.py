@@ -2439,7 +2439,14 @@ def main() -> None:
     parser.add_argument("--no-poi", action="store_true", help="跳过沿途 POI 编码(P2)")
 
     parser.add_argument("--incremental", action="store_true", help="incremental rebuild from watermark")
+
+    parser.add_argument("--location-shadow", action="store_true", help="构建位置事实 v2 shadow 对比表(只读,不切换生产表)")
     args = parser.parse_args()
+
+    if args.location_shadow:
+        from gacore.langTrack import location_migration
+        location_migration.build_location_shadow(args.db)
+        return
 
     if args.purge:
 

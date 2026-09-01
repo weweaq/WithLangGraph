@@ -12,6 +12,14 @@ from pathlib import Path
 CONFIG_PATH = Path(__file__).resolve().parents[3] / "data" / "etl_config.json"
 
 DEFAULTS: dict = {
+    "location": {
+        # §3.1 坐标质量过滤：首版只观测（filter=False），dashboard 实测分布后由用户确认开启
+        "max_accuracy_m": 150.0,
+        "accept_missing_accuracy": True,
+        "apply_accuracy_filter": False,
+        # §2.5 geocode 失效阈值：新旧中心偏移超过该值时清空派生字段待重编
+        "regeo_shift_m": 50.0,
+    },
     "stays": {
         "large_radius_m": 120.0,
         "small_radius_m": 60.0,
@@ -24,6 +32,8 @@ DEFAULTS: dict = {
     "trips": {
         "min_duration_ms": 60000,
         "min_dist_m": 300.0,
+        # 相邻 stay 间隙超过该值不推断为 trip（§3.1）
+        "max_infer_gap_ms": 7200000,
     },
     "incremental": {
         "lookback_days": 2,

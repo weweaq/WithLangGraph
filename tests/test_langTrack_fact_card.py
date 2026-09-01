@@ -268,18 +268,19 @@ def test_build_future_day_empty():
     assert card["compact"] == ""
 
 
-def test_build_missing_key_table_degrades():
-    """缺 stays/trips/places 等关键表 → 降级空卡，不抛。"""
+def test_build_missing_optional_tables_keeps_phone_facts():
+    """缺可选事实表（etl_state/stays/trips/places/anomalies）→ 不降级，
+    有 daily_stats 仍能生成手机事实（Task 0 止血契约）。"""
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute("CREATE TABLE daily_stats (device_id TEXT, day TEXT, total_screen_ms INTEGER)")
     conn.execute("INSERT INTO daily_stats VALUES ('dev1','2026-08-18',1000)")
     conn.commit()
-    # 缺 etl_state/stays/trips/places 表：读取缺表 → 降级
+    # 缺 etl_state/stays/trips/places/anomalies 表：读取缺表 → 空列表，不清空手机事实
     card = fc.build(conn=conn, day="2026-08-18", device_id="dev1")
-    assert card["available"] is False
-    assert card["compact"] == ""
-    assert card["persona"] == {}
+    assert card["available"] is True
+    assert card["has_facts"] is True
+    assert "手机累计" in card["compact"]
 
 
 def test_build_never_calls_etl(monkeypatch):
@@ -671,3 +672,79 @@ def test_card_fp_stable_and_unique():
     c2 = fc.build(conn=conn, day="2026-08-18", device_id="dev1", detail="compact")
     assert c1["card_fp"] == c2["card_fp"]
     assert c1["card_fp"] != ""
+
+
+# ---------------------------------------------------------------------------
+# Task 0：止血（无 stats 不报通知 0 / 无事实 compact 为空 / 缺表不清空手机事实）
+# ---------------------------------------------------------------------------
+
+
+def test_no_stats_with_stay_no_notification_zero():
+    """无 daily_stats、有 stay 时，compact 不得含「通知累计：0 条」。"""
+    conn = _make_db()
+    conn.execute("DELETE FROM daily_stats")
+    conn.commit()
+    card = fc.build(conn=conn, day="2026-08-18", device_id="dev1", detail="compact")
+    assert card["available"] is False
+    assert card["has_facts"] is True  # 有 stay 仍算有事实
+    assert "通知累计" not in card["compact"]
+    assert "0 条" not in card["compact"]
+    assert "今日轨迹" in card["compact"]  # 手机事实仍保留
+
+
+def test_no_facts_compact_empty():
+    """has_facts=False（无 stats/stay/trip，仅水位）→ compact 为空。"""
+    conn = _make_db()
+    conn.execute("DELETE FROM daily_stats")
+    conn.execute("DELETE FROM stays")
+    conn.execute("DELETE FROM trips")
+    conn.execute("DELETE FROM anomalies")
+    conn.commit()
+    card = fc.build(conn=conn, day="2026-08-18", device_id="dev1", detail="compact")
+    assert card["has_facts"] is False
+    assert card["compact"] == ""
+    assert card["compact_sections"] == []
+
+
+def test_only_anomaly_compact_empty():
+    """仅 anomaly（无 stats/stay/trip）→ compact 为空，tag 不能单独成卡。"""
+    conn = _make_db()
+    conn.execute("DELETE FROM daily_stats")
+    conn.execute("DELETE FROM stays")
+    conn.execute("DELETE FROM trips")
+    conn.commit()
+    # 保留一条 anomaly（非网格 poi）
+    card = fc.build(conn=conn, day="2026-08-18", device_id="dev1", detail="compact")
+    assert card["anomalies"] != []
+    assert card["has_facts"] is False
+    assert card["compact"] == ""
+    assert card["compact_sections"] == []
+
+
+def test_missing_stays_table_keeps_phone_facts():
+    """缺 stays 表时，已有 daily_stats 仍能生成手机事实（不整卡降级）。"""
+    conn = _make_db()
+    conn.execute("DROP TABLE stays")
+    conn.commit()
+    card = fc.build(conn=conn, day="2026-08-18", device_id="dev1", detail="compact")
+    assert card["available"] is True
+    assert card["has_facts"] is True
+    assert "手机累计" in card["compact"]
+
+
+def test_missing_trips_table_keeps_phone_facts():
+    conn = _make_db()
+    conn.execute("DROP TABLE trips")
+    conn.commit()
+    card = fc.build(conn=conn, day="2026-08-18", device_id="dev1", detail="compact")
+    assert card["available"] is True
+    assert "手机累计" in card["compact"]
+
+
+def test_missing_anomalies_table_keeps_phone_facts():
+    conn = _make_db()
+    conn.execute("DROP TABLE anomalies")
+    conn.commit()
+    card = fc.build(conn=conn, day="2026-08-18", device_id="dev1", detail="compact")
+    assert card["available"] is True
+    assert "手机累计" in card["compact"]

@@ -1986,3 +1986,71 @@ QQ 机器人「韩立」已有完整 agent 回路，但面对随口话（“吃�
 - [x] dashboard 事实审查块（Task 6）。
 - [x] 文档（Task 7：langTrack-tech.md §2/§5.1/§5.4 + 本文件执行记录）。
 - [ ] 部署后观察线上：QQ system prompt 含真实水位/按序轨迹/停留汇总，回复只在相关时引用至多一项；主动问候不念第二份 compact。
+
+
+## 2026-09-01：位置智能增强 Task 1（schema v2 冻结 + 事务迁移骨架，location_migration.py）
+
+### 背景
+位置智能增强（2026-09-01-langtrack-location-intelligence.md）Task 1：冻结 places_v2/place_cells_v2/stays_v2/trips_v2/route_grids_v2/grid_pois_v2/anomalies_v2/place_tag_conflicts_v2 及迁移审计表（location_migration_state/mapping/issues/metrics）schema，落地事务化迁移骨架。此任务不切换生产消费者，只提供 create/validate/activate/rollback 四件套与 CLI 入口。
+
+### 已完成
+1. **`src/gacore/langTrack/location_migration.py`（新增）**：`SCHEMA_V2`（v2 事实表 + 审计表完整 DDL，含东八区 created_at/updated_at 默认值）、`EXPECTED_UNIQUES/EXPECTED_INDEXES/V1_FACT_TABLES/V2_FACT_TABLES/AUDIT_TABLES` 常量；`create_location_v2_tables()`、`validate_location_v2()`（唯一键/索引/孤儿 place_id 校验）、`activate_location_v2()`（`BEGIN IMMEDIATE` 事务内：v1 六张业务表备份为 *_v1_backup、shadow/v2 转正、写 `PRAGMA user_version=2` 与 pending_label_swap 状态）、`rollback_location_v2()`（恢复六表+索引+polyline/route_key 缓存，失败快照 *_failed_v2_<run_id>）、`read_migration_state()/_write_state()`；函数内无 geocode/文件 IO。
+2. **`src/gacore/langTrack/etl.py`（修改）**：main() 新增 `--location-shadow` CLI 入口，命中时调用 `build_location_shadow(args.db)` 后 return，不触碰正式表（Task 3 使用）。
+3. **`tests/test_langTrack_location_migration.py`（新增，14 用例）**：覆盖八项验收——迁移任意 SQL 异常后旧库完全不变、v2+审计表均含 CST 时间列、唯一键/索引与 §2.2 一致、孤儿 stays.place_id 阻止切换、pending 崩溃恢复、activate 用 BEGIN IMMEDIATE、rollback 恢复表/索引/路线缓存、事务内无 geocode/文件写入。
+
+### 验证（维护测试日志）
+- Task 1 单测：`test_langTrack_location_migration.py` **14 passed**（首跑 12 failed/2 passed，修复四类问题：PRAGMA index_list 不支持占位符改 f-string、IO 检查用 ast 剔除 docstring 避免误命中 geocode 字样、ALTER TABLE 标识符含连字符加双引号、BEGIN IMMEDIATE 断言改用 set_trace_callback 捕获 SQL）。
+- 回归：`test_langTrack_location_facts.py` + `test_langTrack_fact_card.py` **88 passed**，etl.py CLI 改动未引入破坏。
+- 说明：Task 1 不执行 activate、不切换生产消费者，v1 正式表保持 user_version=1 不变。
+
+### 待办更新
+- [x] Task 1：schema v2 冻结 + 事务迁移骨架（create/validate/activate/rollback + CLI 入口 + 单测 14 通过）。
+- [ ] Task 2：LocationPoint 与 canonical 纯算法（location_facts.py）。
+- [ ] Task 3：shadow 全量位置事实（--location-shadow 幂等重建）。
+- [ ] Task 4：迁移稳定 ID、人工 tag 与 geocode 缓存（label v3 两阶段切换）。
+- [ ] Task 5：v1/v2 双读消费者，不执行激活。
+- [ ] Task 6：坐标质量与完整高德坐标边界。
+
+
+## 2026-09-01：位置智能增强 Task 0（FactCard 已确认正确性问题止血）
+
+### 背景
+位置智能增强计划 Task 0（I0 止血）：修复 FactCard 三类已确认正确性问题——无 daily_stats 时误报「通知累计：0 条」、`has_facts=False` 时 tag/水位单独成卡、可选事实表（stays/trips/anomalies）缺失时整卡降级清空手机事实。
+
+### 已完成
+1. **`src/gacore/langTrack/fact_card.py`（修改）**：`_build_notification_section` 增加 `available` 门禁（无当日 daily_stats 不输出通知段，禁止「通知累计：0 条」冒充事实）；`_pack_compact` 增加 `has_facts` 门禁（无事实时 compact 直接置空，tag 不能单独成卡）；`_load_stays/_load_trips/_load_anomalies` 捕获 `sqlite3.OperationalError` 返回空列表（可选表缺失不清空手机事实）。
+2. **`tests/test_langTrack_fact_card.py`（修改 +89 行）**：新增三类失败测试——无 stats 有 stay 时 compact 不含通知 0、`has_facts=False` compact 为空、缺 stays/trips/anomalies 表时手机事实仍生成。
+
+### 验证（维护测试日志）
+- `test_langTrack_fact_card.py` 全部通过（49 passed），既有用例无回归。
+- 出门标准 I0 核对：无 stats 不出现通知 0 ✅；无事实 compact 为空 ✅；可选表缺失不清空手机事实 ✅。
+
+### 待办更新
+- [x] Task 0：FactCard 已确认正确性问题止血（notification 门禁 + has_facts 门禁 + 三表 OperationalError 容错）。
+- [ ] I0 出门后的 dashboard 回归留待 Task 9 一并验证。
+
+
+## 2026-09-01：位置智能增强 Task 2（LocationPoint 与 canonical 纯算法，location_facts.py）
+
+### 背景
+位置智能增强计划 Task 2：建立位置事实纯算法层——坐标解析、质量统计、canonical 几何聚类、新旧一对一 matching、显示契约与高德坐标转换。零 DB / 文件 / 网络访问，被 etl / migration / fact_card 共用（高内聚低耦合：算法归本模块，IO 归调用方）。
+
+### 已完成
+1. **`src/gacore/langTrack/location_facts.py`（新增 24821B）**：
+   - `LocationPoint`/`parse_location_point`：白名单键 lat/lon/acc/provider 严格解析；拒绝 bool/空串/NaN/Inf/越界/(0,0)；acc 负数按 unknown；provider 小写缺省 unknown；coord_system 来自配置不自动猜。
+   - `quality_stats`：按设备聚合 provider 分布、accuracy 四桶 + unknown、30 分钟覆盖格、平均/最大采样间隔。
+   - `cluster_stays`/`canonical_places`：§2.3 规则 1-6/9/12——(device_id,grid_key) 原子 seed 不可拆分、duration 加权质心、120m 中心距 + 150m spread 上限、代表 grid=sorted(keys)[0]、place_id=sha1(device_id|grids)[:16]、浮点距离 0.01m 归一比较、输入顺序无关。
+   - `match_old_new`/`resolve_place_ids`：§2.3 规则 7-11——Jaccard≥0.5 或中心距≤80m 候选边、Jaccard DESC/distance ASC 全局排序、旧 ID 与新 cluster 一对一认领、两旧并一写 merge_survivor_tag conflict。
+   - `resolve_place_name`/`format_place`/`user_tag_of`：§2.6 显示契约——name_confidence 决定 venue/area/neighborhood/district 粒度，label 只作 user_tag 不参与地名选择；compact 格式「真名〔tag〕」。
+   - `wgs84_to_gcj02`/`to_amap_coord`：§3.3 高德坐标边界——wgs84 境内近似转换、境外 guard 原样、unknown/gcj02 不转换不猜。
+2. **`src/gacore/langTrack/etl_config.py`（修改）**：DEFAULTS 新增 `location` 块（max_accuracy_m=150 / accept_missing_accuracy / apply_accuracy_filter=False 首版只观测 / regeo_shift_m=50）与 `trips.max_infer_gap_ms=7200000`；既有 stays/trips 键沿用。
+3. **`tests/test_langTrack_location_facts.py`（新增 39 用例 / 7 测试类）**：TestParseLocationPoint（合法数值/纯数字串/拒绝 bool/空串/0,0/越界/NaN/Inf/acc 负数/provider 小写）、TestQualityStats（provider 桶/accuracy 桶/30 分钟格/采样间隔/多设备隔离）、TestClusterStays（跨 grid 合并/半径上限/0.01m 归一/输入顺序无关）、TestCanonicalPlaces（place_id 稳定/visit_count=stay 段数/first_last_seen）、TestMatchOldNew（一旧拆二/两旧并一 conflict/多对多排序认领）、TestDisplayContract（venue/AOI/around 降级/真名+tag/仅 tag/全空）、TestToAmapCoord（unknown/gcj02 原样/WGS84 已知基准/境外 guard）。
+
+### 验证（维护测试日志）
+- Task 2 单测：`test_langTrack_location_facts.py` **39 passed**。
+- 回归：`test_langTrack_location_migration.py`（14）+ `test_langTrack_fact_card.py`（49）合计 **102 passed**。
+- `ruff check src/gacore/langTrack/location_facts.py src/gacore/langTrack/etl_config.py` 通过。
+
+### 待办更新
+- [x] Task 2：LocationPoint 与 canonical 纯算法（location_facts.py，39 用例通过）。
+- [x] etl_config.py location 块 + trips.max_infer_gap_ms（Task 2 收尾）。

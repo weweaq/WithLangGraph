@@ -265,14 +265,21 @@ def _load_places(conn: sqlite3.Connection, device_id: str | None) -> dict[str, d
 
 
 def _load_stays(conn: sqlite3.Connection, device_id: str | None, day_start_ms: int, day_end_ms: int) -> list[dict]:
-    """与日窗相交的 stay（时间窗相交，不 WHERE day=?）。"""
+    """与日窗相交的 stay（时间窗相交，不 WHERE day=?）。
+
+    可选事实表缺失（stays 表不存在）时返回空列表，不整卡降级——
+    有 daily_stats 仍应能生成手机事实。
+    """
     if device_id is None:
         return []
-    rows = conn.execute(
-        "SELECT start_ts, end_ts, grid_key FROM stays "
-        "WHERE device_id=? AND start_ts < ? AND end_ts > ?",
-        (device_id, day_end_ms, day_start_ms),
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT start_ts, end_ts, grid_key FROM stays "
+            "WHERE device_id=? AND start_ts < ? AND end_ts > ?",
+            (device_id, day_end_ms, day_start_ms),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
     return [
         {"start_ts": int(r["start_ts"]), "end_ts": int(r["end_ts"]), "grid_key": r["grid_key"]}
         for r in rows
@@ -280,13 +287,17 @@ def _load_stays(conn: sqlite3.Connection, device_id: str | None, day_start_ms: i
 
 
 def _load_trips(conn: sqlite3.Connection, device_id: str | None, day_start_ms: int, day_end_ms: int) -> list[dict]:
+    """同 _load_stays：trips 表缺失时返回空列表，不清空手机事实。"""
     if device_id is None:
         return []
-    rows = conn.execute(
-        "SELECT start_ts, end_ts, dist_m FROM trips "
-        "WHERE device_id=? AND start_ts < ? AND end_ts > ?",
-        (device_id, day_end_ms, day_start_ms),
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT start_ts, end_ts, dist_m FROM trips "
+            "WHERE device_id=? AND start_ts < ? AND end_ts > ?",
+            (device_id, day_end_ms, day_start_ms),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
     return [
         {"start_ts": int(r["start_ts"]), "end_ts": int(r["end_ts"]), "dist_m": int(r["dist_m"] or 0)}
         for r in rows
@@ -294,12 +305,16 @@ def _load_trips(conn: sqlite3.Connection, device_id: str | None, day_start_ms: i
 
 
 def _load_anomalies(conn: sqlite3.Connection, device_id: str | None, day: str) -> list[dict]:
+    """同 _load_stays：anomalies 表缺失时返回空列表，不清空手机事实。"""
     if device_id is None:
         return []
-    rows = conn.execute(
-        "SELECT kind, poi, detail FROM anomalies WHERE device_id=? AND day=?",
-        (device_id, day),
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT kind, poi, detail FROM anomalies WHERE device_id=? AND day=?",
+            (device_id, day),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
     return [
         {"kind": _row_val(r, "kind", "") or "", "poi": _row_val(r, "poi", "") or "",
          "detail": _row_val(r, "detail", "") or ""}
@@ -796,7 +811,13 @@ def _build_phone_section(card: FactCard) -> CompactSection | None:
 
 
 def _build_notification_section(card: FactCard) -> CompactSection | None:
-    """通知累计：总数/点击数/Top 来源；缺字段局部省略。"""
+    """通知累计：总数/点击数/Top 来源；缺字段局部省略。
+
+    门禁：必须有当日 daily_stats（available）才报通知数——无 stats 时
+    notification_count 为 0，不得输出「通知累计：0 条」冒充事实。
+    """
+    if not card.get("available"):
+        return None
     n = card.get("notification_count")
     if n is None:
         return None
@@ -838,7 +859,16 @@ def _pack_compact(card: FactCard) -> None:
     """运行全部 section builders 并做 600 字预算；记录 included / omitted。
 
     稳定性：按 priority 排序；预算器只整段纳入/整段省略，禁止截半文本。
+    门禁：has_facts=False 时不运行 builders（水位/tag 不能单独成卡）。
     """
+    if not card.get("has_facts"):
+        card["compact_sections"] = []
+        card["compact"] = ""
+        card["compact_chars"] = 0
+        card["compact_lines"] = []
+        card["compact_omitted"] = {}
+        card["card_fp"] = ""
+        return
     sections: list[CompactSection] = []
     for builder in _SECTION_BUILDERS:
         sec = builder(card)
