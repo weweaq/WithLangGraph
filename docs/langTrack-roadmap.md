@@ -2197,4 +2197,5 @@ subagent 独立复审提交 c97d2d5 + 工作区索引修复：无 P1 级正确�
 
 ### 待办更新
 - [x] Task 6：坐标质量与完整高德坐标边界（daily_location_quality + to_amap_coord 全入口 + trips 坐标制两列 + build_trips 参数化 + 44 用例，含 review-loop 两轮回归 7 项）。
+- [x] Task 6 终审（第三轮 subagent，对 952cda9/3e84ba6/6e35769 三提交整体复核）：**PASS**——两轮 review 发现的 P1×4/P2×3/P3×4 全部修复且带回归；langTrack 组 0 failed；ruff 与父提交基线逐规则比对零新增（26 条存量 BLE001/F841/I001/RUF059/S112/RUF100 完全一致）；schema 双路径（单条 execute / executescript）实测有效；DDL 后 in_transaction 保持 True、rollback 丢行保结构；增量 DELETE 仅命中受影响天。无遗留 P1/P2/P3。遗留观察（非 Task 6 引入）：存量 lint 建议后续统一治理；test_cli.py 依赖 pygraphviz 本机未装。
 - [ ] Task 7：迁移 FactCard 与 tool 兼容契约。
