@@ -334,6 +334,22 @@ def _expected_bins(
     return expected, available_days
 
 
+def _coverage_by_recorded_days(
+    daylist: list, quality_by_day: dict[str, int]
+) -> float:
+    """按「有记录日」的 48-bin 覆盖率取中位（缺失日不稀释采样密度）。
+
+    与纯 ``sum(observed)/sum(expected)`` 相比，可避免短窗口因个别缺测日
+    占比更高而被过度惩罚，进而保证多窗口（7/30/90）覆盖率单调不升。
+    """
+    covs = [
+        min(1.0, (quality_by_day.get(d, 0) or 0) / 48)
+        for d in daylist
+        if (quality_by_day.get(d, 0) or 0) > 0
+    ]
+    return _median(covs) if covs else 0.0
+
+
 def build_evidence(
     *,
     requested_window_days: int,
@@ -344,12 +360,21 @@ def build_evidence(
     daily_agg: dict,
     sample_count: int,
     required_samples: int,
+    daylist: list | None = None,
+    quality_by_day: dict | None = None,
 ) -> Evidence:
-    """构造指标 Evidence（§2.9 规则；分母为 0 记 0，conf 取三者最小）。"""
+    """构造指标 Evidence（§2.9 规则；分母为 0 记 0，conf 取三者最小）。
+
+    coverage：当提供 ``daylist+quality_by_day`` 时按有记录日 48-bin 覆盖率
+    中位数（缺测日不稀释）；否则回退为 ``sum(observed)/sum(expected)``。
+    """
     expected_bins, available_days = _expected_bins(
         win_start, win_end, first_seen, data_as_of
     )
-    coverage = expected_bins and daily_agg["observed_bins"] / expected_bins
+    if daylist is not None and quality_by_day is not None:
+        coverage = _coverage_by_recorded_days(daylist, quality_by_day)
+    else:
+        coverage = expected_bins and daily_agg["observed_bins"] / expected_bins
     if coverage is None:
         coverage = 0.0
     coverage = max(0.0, min(1.0, coverage))
@@ -397,7 +422,7 @@ def _segment_of(ts_ms: int) -> str:
 
 def _frequent_places(
     conn, device_id, places_by_id, stays_clipped, win_str, win_start, win_end,
-    first_seen, data_as_of, daily_agg,
+    first_seen, data_as_of, daily_agg, daylist, quality_by_day,
 ) -> tuple[list[dict], int]:
     """Top 常去地点聚合（每窗口一份）。
 
@@ -463,6 +488,7 @@ def _frequent_places(
         requested_window_days=int(win_str), win_start=win_start, win_end=win_end,
         first_seen=first_seen, data_as_of=data_as_of, daily_agg=daily_agg,
         sample_count=sample_n, required_samples=REQUIRED_SAMPLES_PLACE,
+        daylist=daylist, quality_by_day=quality_by_day,
     )
     for item in out:
         item["evidence"] = _ev
@@ -950,17 +976,19 @@ def build_spatial_profile(
             ws, we = w30_s, w30_e
             daylist = day30s
             stays = stays30
+            q_by_day = quality_by_day
         else:
             ws, we = _win_bounds(as_of_day, days)
             daylist = [_add_days(as_of_day, i - (days - 1)) for i in range(days)]
             stays = lr.read_stays(
                 conn, device_id=device_id, overlap=(ws, we), with_place=True
             )
+            q_by_day = _quality_by_day(conn, device_id, daylist)
         clipped = _clip_to_window_and_days(stays, ws, we, daylist)
         dagg = _read_daily_quality_agg(conn, device_id, daylist[0], daylist[-1])
         lst, _ = _frequent_places(
             conn, device_id, places_by_id, clipped, days, ws, we,
-            first_seen, as_of_ms, dagg,
+            first_seen, as_of_ms, dagg, daylist, q_by_day,
         )
         # 以 30 天为准去重（7/90 仅补充窗口级证据，不重复塞入同一 place 三份）
         # 文档要求 frequent_places 为 list，保留全部窗口，但项目按 window 区分

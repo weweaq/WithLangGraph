@@ -608,6 +608,52 @@ def test_90day_cold_query_performance():
     assert elapsed < 1.0, f"90 天冷查询耗时 {elapsed:.3f}s 未达标(<1s)"
 
 
+# ---------------------------------------------------------------------------
+# Evidence coverage：按有记录日 48-bin 中位数（缺失日不稀释，三窗单调不升）
+# ---------------------------------------------------------------------------
+
+def test_coverage_by_recorded_days_median_ignores_missing_days():
+    # 30 天窗恰好 1 个缺测日（8-05）→ 该日无 quality 行；
+    # 其余记录日均为满 48 bin。中位法应得到 1.0，而非被缺失日稀释到 ~0.967。
+    daylist = [_add_day_str("2026-08-02", i) for i in range(30)]
+    quality = {
+        d: 48 for d in daylist if d != "2026-08-05"
+    }  # 8-05 缺测
+    cov = sp._coverage_by_recorded_days(daylist, quality)
+    assert cov == 1.0
+    # 部分日（如周末）采样不足 24 bin → 中位下降
+    q2 = dict(quality)
+    q2["2026-08-08"] = 24
+    cov2 = sp._coverage_by_recorded_days(daylist, q2)
+    assert cov2 == 1.0  # 中位数不受单个异常日影响
+    q3 = {d: 48 for d in daylist[:15]}
+    assert sp._coverage_by_recorded_days(daylist, q3) == 1.0
+
+
+def _add_day_str(day: str, n: int) -> str:
+    y, mo, d = (int(x) for x in day.split("-"))
+    dt = date(y, mo, d) + timedelta(days=n)
+    return dt.isoformat()
+
+
+def test_build_evidence_coverage_uses_recorded_day_median():
+    conn = _make_db()
+    daylist = [_add_day_str("2026-08-02", i) for i in range(30)]
+    qbd = {}
+    for i, d in enumerate(daylist):
+        qbd[d] = 48 if d != "2026-08-05" else 0
+    daily_agg = {"observed_bins": 48 * 29, "points_total": 30, "points_valid": 30,
+                 "accuracy_known": 30}
+    ev = sp.build_evidence(
+        requested_window_days=30, win_start=0, win_end=10**13,
+        first_seen=None, data_as_of=None, daily_agg=daily_agg,
+        sample_count=29, required_samples=20,
+        daylist=daylist, quality_by_day=qbd,
+    )
+    # 记录日中位数 1.0（8-05 不稀释）；旧公式 sum(obs)/sum(expected) 会偏低
+    assert ev["coverage_ratio"] == 1.0
+
+
 if __name__ == "__main__":
     import pytest
 
