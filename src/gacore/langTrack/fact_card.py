@@ -161,6 +161,8 @@ class FactCard(TypedDict, total=False):
     anomalies: list[AnomalyBrief]
     daily_location_quality: dict | None
     tag_conflict_count: int
+    # Task 8 §2.9：长期空间画像（7/30/90 客观聚合，full 卡专属；compact 不携带）
+    spatial_profile: dict | None
     midnight_audio_n: int | None
     sleep_signal: str
     sleep_start_hhmm: str | None
@@ -486,6 +488,7 @@ def _new_card(day: str, now_ms: int) -> FactCard:
         anomalies=[],
         daily_location_quality=None,
         tag_conflict_count=0,
+        spatial_profile=None,
         midnight_audio_n=None,
         sleep_signal="",
         sleep_start_hhmm=None,
@@ -858,6 +861,15 @@ def _fill_full_extras(conn: sqlite3.Connection, card: FactCard, dev: str | None,
             card["tag_conflict_count"] = lr.read_tag_conflict_count(conn, device_id=dev)
         except Exception:  # noqa: BLE001
             card["tag_conflict_count"] = 0
+        # Task 8 §2.9：长期空间画像（7/30/90 聚合，纯读；缺表/无数据 → 空骨架 None）
+        try:
+            from gacore.langTrack.spatial_profile import build_spatial_profile
+
+            card["spatial_profile"] = build_spatial_profile(
+                conn, device_id=dev, as_of_day=day
+            )
+        except Exception:  # noqa: BLE001 - 缺表/空库降级
+            card["spatial_profile"] = None
     # A① 契约覆盖：非 ok 类型
     coverage: list[dict] = []
     try:
