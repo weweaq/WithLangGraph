@@ -751,6 +751,19 @@ def _home_work_rhythm(
         else:
             missing_days += 1
 
+    # 缺测口径补充：窗口自然日内、设备首次可见之后、完全无 quality 记录（定位
+    # 缺失）且当日也无家/公司锚点的自然日，同样计入 missing_days——此类日既不
+    # 进 day_meta、也不会被上面的 cov<0.5 分支捕获，漏计会导致 missing_days
+    # 低估（P3-2）。有 quality 但当日确凿未去家/公司的日不算缺测（真实行为）。
+    _span = set(day_strs)
+    if first_seen:
+        _first_day = datetime.fromtimestamp(
+            first_seen / 1000, tz=_TZ_CST
+        ).strftime("%Y-%m-%d")
+        _span = {d for d in _span if d >= _first_day}
+    _no_anchor = _span - set(day_meta.keys())
+    missing_days += len(_no_anchor - set(quality_by_day))
+
     def _summ(bucket):
         out = {}
         for key, vals in bucket.items():
@@ -779,7 +792,7 @@ def _home_work_rhythm(
         "calendar_basis": "weekday（周一至周五，不冒充法定工作日）",
         "anchor_days": anchor_days,
         "missing_days": missing_days,
-        "missing_ratio": round(missing_days / anchor_days, 4) if anchor_days else None,
+        "missing_ratio": round(min(1.0, missing_days / anchor_days), 4) if anchor_days else None,
         "coverage_required": 0.5,
         "computed_from": "daily_cst_stays",
         "evidence": _ev,

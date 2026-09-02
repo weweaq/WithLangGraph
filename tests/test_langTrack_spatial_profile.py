@@ -464,8 +464,9 @@ def test_home_work_rhythm_weekday_buckets_and_missing_days():
     # 周末在家时长 > 工作日、无公司样本
     assert we["home_ms"]["median_ms"] > wd["home_ms"]["median_ms"]
     assert we["work_ms"]["median_ms"] is None
-    # 缺测日：MISSING_DAYS 8-05/8-12 为工作日，被计入 missing_days
-    assert hr["missing_days"] >= 1   # 2 个工作日缺测日
+    # 缺测日：MISSING_DAYS 8-05（完全无数据）/8-12（低质量无 quality 行）均为
+    # 工作日，都被计入 missing_days（P3-2 补全口径后应==2）
+    assert hr["missing_days"] >= 2   # 8-05（无数据）+ 8-12（低质量）
     assert hr["missing_ratio"] is not None and 0 <= hr["missing_ratio"] <= 1
 
 
