@@ -8,11 +8,14 @@
 from __future__ import annotations
 
 import datetime
+import json
 import sqlite3
+import urllib.parse
 from html import escape
 from pathlib import Path
 
 from gacore.langTrack import fact_card
+from gacore.langTrack import location_reader as lr
 
 DB_PATH = Path(__file__).resolve().parents[3] / "data" / "langTrack.db"
 _TZ = datetime.timezone(datetime.timedelta(hours=8))
@@ -59,10 +62,28 @@ padding:12px;line-height:1.6;margin-top:8px}
 .meta{font-size:11px;color:var(--ink3);line-height:1.8;margin-bottom:8px}
 .meta b{color:var(--ink2);font-weight:600}
 .review-note{font-size:11px;color:var(--ink3);margin:-6px 0 10px}
+.warn{font-size:12px;color:var(--amber);background:rgba(242,166,90,.08);
+border:1px solid rgba(242,166,90,.35);border-radius:10px;padding:8px 12px;margin-bottom:12px}
+.ev{font-size:11px;color:var(--ink2);margin-top:8px;line-height:1.7;
+background:#0B0F18;border:1px solid var(--line);border-radius:10px;padding:8px 10px}
+.ev .evrow{color:var(--ink3)}
+.evrow+.evrow{margin-top:2px}
+.ev b{color:var(--green);font-weight:600}
+.tagb{display:inline-block;color:var(--cyan);font-size:11px}
+.nd{color:var(--amber);font-size:12px}
+.dim{color:var(--ink3);font-size:11px}
+.mig-note{font-size:11px;color:var(--ink3);margin-top:6px}
+.evtr td{background:none;border:0;padding:2px 8px 10px}
 """
 
 
 def _fmt_dur(ms: int) -> str:
+    if ms is None:
+        return "-"
+    try:
+        ms = int(ms)
+    except (TypeError, ValueError):
+        return "-"
     h, rem = divmod(ms // 1000, 3600)
     m = rem // 60
     return f"{h}小时{m}分" if h else f"{m}分钟"
@@ -304,25 +325,575 @@ def _render_fact_review(card: dict) -> str:
     )
 
 
-def render_dashboard_html(conn: sqlite3.Connection, day: str | None = None) -> str:
+# ---------------------------------------------------------------------------
+# Task 9：位置画像关键指标 + 迁移审查（§2.11）——只渲染，不重算画像
+# ---------------------------------------------------------------------------
+
+
+def _place_display(place_name, user_tag=""):
+    """统一地点文案：place_name〔tag〕；两者皆无 → 未知地点。"""
+    name = (place_name or "").strip()
+    tag = (user_tag or "").strip()
+    if name and tag:
+        return f"{name}〔{tag}〕"
+    if name:
+        return name
+    if tag:
+        return tag
+    return "未知地点"
+
+
+def _render_evidence(ev, *, metric="") -> str:
+    """渲染 Evidence components；None → “数据不足”，不以 0 冒充事实。"""
+    if not ev:
+        return '<div class="ev">数据不足（无样本窗口）</div>'
+    level = ev.get("confidence_level") or "low"
+    color = {"high": "var(--green)", "medium": "var(--amber)", "low": "var(--rose)"}.get(level, "var(--amber)")
+    cov = ev.get("coverage_ratio")
+    cov_txt = f"{cov * 100:.0f}%" if isinstance(cov, (int, float)) else "-"
+    rows = [
+        f"窗口 {ev.get('window_days', '-')} 天（请求 {ev.get('requested_window_days', '-')} / 可用 {ev.get('available_window_days', '-')}）",
+        f"覆盖率 {cov_txt}（{ev.get('observed_bins', 0)} / {ev.get('expected_bins', 0)} 格）",
+        f"样本 {ev.get('sample_count', 0)} / 需求 {ev.get('required_samples', 0)}",
+        "解析 {parse:.2f} · 精度已知 {acc:.2f} · 质量 {q:.2f}".format(
+            parse=ev.get("parse_validity_score", 0) or 0,
+            acc=ev.get("accuracy_known_score", 0) or 0,
+            q=ev.get("quality_score", 0) or 0,
+        ),
+    ]
+    low_note = (
+        '<div class="evrow" style="color:var(--amber)">数据不足（置信度低，不作确定结论）</div>'
+        if level == "low" else ""
+    )
+    return (
+        f'<div class="ev"><span class="badge" '
+        f'style="border:1px solid {color};color:{color}">{escape(level)}</span>'
+        f'<div class="evrow">' + "</div><div class=\"evrow\">".join(escape(r) for r in rows)
+        + f"</div>{low_note}</div>"
+    )
+
+
+def _coord_system_counts(conn: sqlite3.Connection, device_id: str, day: str) -> dict:
+    """所选日坐标制集合及点数：按事件 ts 经 etl_config 时间段匹配解析。"""
+    counts: dict[str, int] = {}
+    try:
+        from gacore.langTrack.etl_config import load_coord_systems, resolve_coord_system
+
+        cfg = load_coord_systems()
+    except Exception:  # noqa: BLE001 - 配置缺失/损坏降级 unknown
+        cfg = {"default": "unknown", "periods": []}
+    try:
+        rows = conn.execute(
+            "SELECT ts FROM events WHERE type='location' AND device_id=? AND "
+            "date(ts/1000,'unixepoch','+8 hours')=?",
+            (device_id, day),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return counts
+    for (ts,) in rows:
+        cs = resolve_coord_system(device_id, int(ts or 0), cfg)
+        counts[cs] = counts.get(cs, 0) + 1
+    return counts
+
+
+def _render_location_health(conn: sqlite3.Connection, device_id: str, day: str) -> str:
+    """定位健康卡：points / coverage / accuracy 三档 / provider / 采样间隔 / 坐标制。"""
+    try:
+        q = lr.read_daily_quality(conn, device_id=device_id, day=day)
+    except Exception:  # noqa: BLE001
+        q = None
+    coords = _coord_system_counts(conn, device_id, day)
+
+    warn_parts: list[str] = []
+    if q is None:
+        warn_parts.append("无定位质量日表")
+    if "unknown" in coords or not coords:
+        warn_parts.append("坐标制未知")
+    elif len(coords) > 1:
+        warn_parts.append("同日多坐标制")
+    warn = (
+        f'<div class="warn">{escape("；".join(warn_parts))}</div>' if warn_parts else ""
+    )
+
+    # 覆盖率：observed/expected 半小时格；expected 只计到当日数据水位，不把未来算缺测
+    observed = int(q.get("observed_half_hour_bins") or 0) if q else 0
+    expected = 1
+    try:
+        day0_ms = int(datetime.datetime(
+            *[int(x) for x in day.split("-")], tzinfo=_TZ
+        ).timestamp() * 1000)
+        wm = None
+        row = conn.execute(
+            "SELECT last_event_ts FROM etl_state WHERE device_id=?", (device_id,)
+        ).fetchone()
+        if row:
+            wm = row["last_event_ts"]
+        end_ms = min(wm or (day0_ms + 86400000 - 1), day0_ms + 86400000 - 1)
+        expected = max(1, int((max(end_ms, day0_ms) - day0_ms) // 1_800_000))
+    except Exception:  # noqa: BLE001
+        expected = 1
+    cov = min(1.0, observed / expected)
+
+    rows = ""
+    if q:
+        rows += (
+            f'<div class="row"><span class="name">有效点 / 总点</span>'
+            f'<span class="val">{q.get("points_valid", 0)} / {q.get("points_total", 0)}</span></div>'
+            f'<div class="row"><span class="name">30 分钟覆盖格</span>'
+            f'<span class="val">{observed} / {expected}（{cov * 100:.0f}%）</span></div>'
+            f'<div class="row"><span class="name">精度 ≤50m / 51–150m / >150m</span>'
+            f'<span class="val">{q.get("accuracy_le_50", 0)} / {q.get("accuracy_51_150", 0)} / {q.get("accuracy_gt_150", 0)}'
+            f'（已知 {q.get("accuracy_known", 0)}）</span></div>'
+            f'<div class="row"><span class="name">采样间隔中位数（所选日）</span>'
+            f'<span class="val">{_fmt_sec(q.get("median_interval_sec"))}</span></div>'
+        )
+        try:
+            prov = json.loads(q.get("providers_json") or "{}")
+        except (ValueError, TypeError):
+            prov = {}
+        if prov:
+            prov_txt = "、".join(f"{escape(str(k))}×{v}" for k, v in prov.items())
+            rows += f'<div class="row"><span class="name">provider</span><span class="val">{prov_txt}</span></div>'
+    else:
+        rows += '<div class="empty">今日无定位质量数据</div>'
+
+    if coords:
+        coord_txt = "、".join(
+            f"{escape(str(k))}×{v}" for k, v in sorted(coords.items())
+        )
+        rows += (
+            f'<div class="row"><span class="name">坐标制及点数</span>'
+            f'<span class="val">{coord_txt}</span></div>'
+        )
+    return (
+        f'<div class="card"><h2>定位健康 · {escape(day)}</h2>{warn}{rows}'
+        f'<div class="mig-note">坐标制集合按事件 ts 时间段解析；unknown 或同日多坐标制时黄色警告。</div></div>'
+    )
+
+
+def _fmt_sec(sec) -> str:
+    if sec is None:
+        return "-"
+    try:
+        sec = float(sec)
+    except (TypeError, ValueError):
+        return "-"
+    if sec < 1:
+        return f"{sec * 1000:.0f} 毫秒"
+    if sec < 60:
+        return f"{sec:.1f} 秒"
+    return f"{int(sec // 60)}分{int(sec % 60)}秒"
+
+
+def _has_home_work(sp) -> bool:
+    home_work_rhythm = (sp or {}).get("home_work_rhythm")
+    commute = (sp or {}).get("commute_profile")
+    return bool(home_work_rhythm or commute)
+
+
+def _has_spatial_data(sp) -> bool:
+    """是否具备任何位置画像内容：空骨架（全空）与“画像存在但缺家/公司”语义分离。"""
+    if not sp:
+        return False
+    return bool(
+        sp.get("frequent_places") or sp.get("spatial_extent")
+        or sp.get("commute_profile") or sp.get("home_work_rhythm")
+        or sp.get("scene_exposure") or sp.get("place_change")
+    )
+
+
+def _render_kpi30(sp: dict | None) -> str:
+    """30 天关键指标卡：覆盖率 / 有停留地点数 / 常去 Top1 / P90 生活半径 / 通勤 / 家·公司时长。"""
+    # 空骨架（全空）整卡走“数据不足”；仅画像存在且缺 home/work tag 才算“尚未确认家/公司”
+    if not sp or not _has_spatial_data(sp):
+        return (
+            '<div class="card"><h2>30 天关键指标</h2>'
+            '<div class="empty">数据不足，无法构建长期画像。</div></div>'
+        )
+    ext = sp.get("spatial_extent") or {}
+    freq = sp.get("frequent_places") or []
+    freq30 = [p for p in freq if 30 in (p.get("windows") or [])]
+    top = freq30[0] if freq30 else None
+    commute = sp.get("commute_profile")
+    rhythm = sp.get("home_work_rhythm")
+
+    pw = (sp.get("per_window") or {}).get("30") or {}
+    cov_obs = pw.get("observed_bins")
+    cov_exp = pw.get("expected_bins")
+    if not cov_exp:
+        ec = (ext.get("evidence") or {})
+        cov_obs, cov_exp = ec.get("observed_bins"), ec.get("expected_bins")
+    cov_txt = (
+        f"{cov_obs} / {cov_exp} 格（{cov_obs / cov_exp * 100:.0f}%）"
+        if cov_exp else "-"
+    )
+
+    home_d = ext.get("home_distance")
+    if not ext:
+        radius_txt = "数据不足"
+    elif not home_d or home_d.get("p90_m") is None:
+        radius_txt = "尚未确认家/公司"
+    else:
+        radius_txt = _fmt_km(home_d.get("p90_m"))
+
+    comm_rows = ""
+    if commute:
+        comm_rows += (
+            f'<div class="row"><span class="name">家→公司有效通勤天数</span>'
+            f'<span class="val">{commute.get("valid_days", 0)} 天'
+            f'（工作日 {commute.get("weekday_valid_days", 0)} / 周末 {commute.get("weekend_valid_days", 0)}）</span></div>'
+            f'<div class="row"><span class="name">通勤耗时中位 / IQR</span>'
+            f'<span class="val">{_fmt_dur(commute.get("duration_ms_median"))} / {_fmt_dur(commute.get("duration_ms_iqr"))}</span></div>'
+            f'<div class="row"><span class="name">端点直距 / 路线距</span>'
+            f'<span class="val">{_fmt_km(commute.get("endpoint_dist_m"))} / {'-' if commute.get("route_dist_m") is None else _fmt_km(commute.get("route_dist_m"))}</span></div>'
+        )
+    if rhythm:
+        wk = rhythm.get("weekday") or {}
+        home_ms_med = (wk.get("home_ms") or {}).get("median_ms")
+        work_ms_med = (wk.get("work_ms") or {}).get("median_ms")
+        comm_rows += (
+            f'<div class="row"><span class="name">工作日在家时长中位</span>'
+            f'<span class="val">{_fmt_dur(home_ms_med) if home_ms_med is not None else "无有效样本日"}</span></div>'
+            f'<div class="row"><span class="name">工作日公司时长中位</span>'
+            f'<span class="val">{_fmt_dur(work_ms_med) if work_ms_med is not None else "无有效样本日"}</span></div>'
+        )
+    if not comm_rows:
+        comm_rows = (
+            f'<div class="row"><span class="name">通勤 / 家·公司时长</span>'
+            f'<span style="color:var(--amber);font-size:12px">{"尚未确认家/公司" if not _has_home_work(sp) else "数据不足"}</span></div>'
+        )
+
+    items = [
+        ("可观测覆盖率（30 天）", cov_txt),
+        ("有停留地点数（30 天）", str(ext.get("place_count")) if ext.get("place_count") is not None else "-"),
+        ("常去地点 Top 1", _place_display(top.get("place_name"), top.get("user_tag")) if top else "数据不足"),
+        ("相对家 P90 生活半径", radius_txt),
+    ]
+    stat_rows = "".join(
+        f'<div class="row"><span class="name">{escape(k)}</span>'
+        f'<span class="val">{escape(str(v))}</span></div>'
+        for k, v in items
+    )
+    ev = ext.get("evidence")
+    ev_html = (
+        _render_evidence(ev, metric="30天画像")
+        if ev else '<div class="ev">数据不足（无画像样本）</div>'
+    )
+    return (
+        f'<div class="card"><h2>30 天关键指标</h2>'
+        f'{stat_rows}{comm_rows}{ev_html}'
+        f'</div>'
+    )
+
+
+def _fmt_km(m) -> str:
+    if m is None:
+        return "-"
+    try:
+        m = float(m)
+    except (TypeError, ValueError):
+        return "-"
+    return f"{m / 1000:.1f} 公里" if m >= 1000 else f"{m:.0f} 米"
+
+
+def _last_seen_str(ms) -> str:
+    if not ms:
+        return "-"
+    return datetime.datetime.fromtimestamp(ms / 1000, tz=_TZ).strftime("%Y-%m-%d")
+
+
+def _place_point_counts(conn: sqlite3.Connection, device_id: str) -> dict[str, int]:
+    """按 place_id 补齐全历史原始点数（places.point_count 静态统计），缺列降级 {}。"""
+    try:
+        return {
+            str(r["place_id"]): int(r["point_count"] or 0)
+            for r in conn.execute(
+                "SELECT place_id, point_count FROM places "
+                "WHERE device_id=? AND place_id IS NOT NULL",
+                (device_id,),
+            ).fetchall()
+        }
+    except (sqlite3.OperationalError, TypeError):
+        return {}
+
+
+def _render_frequent_places(conn: sqlite3.Connection, card: dict, sp: dict | None, window: int) -> str:
+    """常去地点表：地点场景 / tag / 原始点数 / 到访段数 / 停留时长 / 最近到访 / 分布。"""
+    if not sp:
+        return '<div class="card"><h2>常去地点</h2><div class="empty">数据不足</div></div>'
+    freq = sp.get("frequent_places") or []
+    items = [p for p in freq if window in (p.get("windows") or [])]
+    if not items:
+        return (
+            f'<div class="card"><h2>常去地点表 · {window} 天</h2>'
+            '<div class="empty">近窗口内无达到“常去”门槛的地点</div></div>'
+        )
+    # 原始点数来源：按 place_id 全表补齐，避免因“常去地点仅保留 top N”而漏掉其余地点
+    by_pid = {
+        (p.get("place_id") or ""): dict(p)
+        for p in (card.get("places") or []) if p.get("place_id")
+    }
+    for pid, c in _place_point_counts(conn, card.get("device_id") or "").items():
+        by_pid.setdefault(pid, {})["point_count"] = c
+    rows = ""
+    for p in items:
+        pid = p.get("place_id") or ""
+        full = by_pid.get(pid) or {}
+        pc = full.get("point_count")
+        pc_txt = str(pc) if pc is not None else "-"
+        week_n = p.get("weekday_visits") or 0
+        end_n = p.get("weekend_visits") or 0
+        wd_dist = (
+            f"{week_n} / {end_n}"
+            if (week_n or end_n)
+            else "-"
+        )
+        rows += (
+            f'<tr><td>{escape(_place_display(p.get("place_name"), p.get("user_tag")))}</td>'
+            f'<td>{escape(p.get("user_tag") or "") or "-"}</td>'
+            f'<td>{pc_txt}</td>'
+            f'<td>{p.get("visit_days", 0)}</td>'
+            f'<td>{p.get("visit_episodes", 0)}</td>'
+            f'<td>{_fmt_dur(p.get("stay_ms"))} / {_fmt_dur(p.get("median_stay_ms"))}</td>'
+            f'<td>{_last_seen_str(p.get("last_seen_ms"))}</td>'
+            f'<td>{wd_dist}</td></tr>'
+            # 每行挂该项自身 Evidence，不拿单个顶层样本代替全部指标
+            f'<tr class="evtr"><td colspan="8">'
+            f'{_render_evidence(p.get("evidence"), metric="常去地点")}'
+            f'</td></tr>'
+        )
+    body = (
+        f'<div class="card"><h2>常去地点表 · {window} 天</h2>'
+        f'<table class="tbl"><tr>'
+        f'<th>地点场景</th><th>tag</th><th>原始点数</th><th>到访天数</th>'
+        f'<th>到访段数</th><th>停留时长（总 / 中位）</th><th>最近到访</th><th>工作日 / 周末（天）</th>'
+        f'</tr>{rows}</table>'
+        f'<div class="mig-note">原始点数=全历史 location 点数（按 place 全表补齐）；到访段数/停留时长按所选窗口聚合；'
+        f'低于“常去”门槛的地点请见完整地点表。</div>'
+        f'</div>'
+    )
+    return body
+
+
+def _render_rhythm(sp: dict | None) -> str:
+    """家/公司节奏：首次离家 / 到公司 / 离公司 / 最后回家 median/IQR 与有效样本日。"""
+    if not _has_home_work(sp):
+        return '<div class="card"><h2>家 / 公司节奏</h2><div class="empty">尚未确认家/公司</div></div>'
+    rhythm = (sp or {}).get("home_work_rhythm")
+    if not rhythm:
+        return '<div class="card"><h2>家 / 公司节奏</h2><div class="empty">数据不足，无有效样本日</div></div>'
+    wk = rhythm.get("weekday") or {}
+
+    def _row(label, key):
+        med = (wk.get(key) or {}).get("median_hhmm") or "-"
+        iqr = (wk.get(key) or {}).get("iqr_hhmm") or "-"
+        return f'<div class="row"><span class="name">{label}</span><span class="val">{med} ± {iqr}</span></div>'
+
+    rows = "".join([
+        _row("首次离家", "first_leave"),
+        _row("到公司", "arrive_work"),
+        _row("离公司", "leave_work"),
+        _row("最后回家", "last_back"),
+    ])
+    home_med = (wk.get("home_ms") or {}).get("median_ms")
+    work_med = (wk.get("work_ms") or {}).get("median_ms")
+    rows += (
+        f'<div class="row"><span class="name">在家时长中位</span>'
+        f'<span class="val">{_fmt_dur(home_med) if home_med is not None else "-"}</span></div>'
+        f'<div class="row"><span class="name">公司时长中位</span>'
+        f'<span class="val">{_fmt_dur(work_med) if work_med is not None else "-"}</span></div>'
+        f'<div class="row"><span class="name">有效样本日 / 缺测日</span>'
+        f'<span class="val">{rhythm.get("anchor_days", 0)} / {rhythm.get("missing_days", 0)}</span></div>'
+    )
+    ev = rhythm.get("evidence") or {}
+    wd = ev.get("window_days") or 30
+    return (
+        f'<div class="card"><h2>家 / 公司节奏（工作日 · {wd} 天）</h2>'
+        f'{rows}{_render_evidence(rhythm.get("evidence"), metric="家/公司节奏")}'
+        f'<div class="mig-note">{escape(rhythm.get("calendar_basis") or "")}</div></div>'
+    )
+
+
+def _render_scene(sp: dict | None) -> str:
+    """场景暴露变化：poi_l1 当前窗口 vs 前窗口；旧窗口为 0 时不显示百分比。"""
+    items = (sp or {}).get("scene_exposure") or []
+    if not items:
+        return '<div class="card"><h2>场景暴露变化</h2><div class="empty">数据不足，无场景暴露样本</div></div>'
+    rows = ""
+    for it in items:
+        chg = it.get("change_pct")
+        chg_txt = (
+            f'{chg:+.0f}%'
+            if chg is not None else "旧窗口为 0（不显示百分比）"
+        )
+        rows += (
+            f'<tr><td>{escape(it.get("poi_l1") or "unknown")}</td>'
+            f'<td>{it.get("cur_visit_days", 0)}</td>'
+            f'<td>{it.get("cur_episodes", 0)}</td>'
+            f'<td>{_fmt_dur(it.get("cur_stay_ms"))}</td>'
+            f'<td>{it.get("prev_visit_days", 0)}</td>'
+            f'<td>{_fmt_dur(it.get("prev_stay_ms"))}</td>'
+            f'<td>{chg_txt}</td></tr>'
+            # 每行挂该项自身 Evidence
+            f'<tr class="evtr"><td colspan="7">'
+            f'{_render_evidence(it.get("evidence"), metric="场景暴露")}'
+            f'</td></tr>'
+        )
+    return (
+        f'<div class="card"><h2>场景暴露变化（当前 30 天 vs 前 30 天）</h2>'
+        f'<table class="tbl"><tr>'
+        f'<th>地点场景（poi_l1）</th><th>当前到访天数</th><th>当前段数</th>'
+        f'<th>当前时长</th><th>前窗口天数</th><th>前窗口时长</th><th>变化</th>'
+        f'</tr>{rows}</table>'
+        f'<div class="mig-note">归类口径=当前 places 语义（classification_basis=current_place_semantics），不作历史快照伪装。</div>'
+        f'</div>'
+    )
+
+
+def _render_place_change(sp: dict | None) -> str:
+    """地点变化：新 canonical 地点数 / 重复到访率 / 地点集合 Jaccard。"""
+    pc = (sp or {}).get("place_change")
+    if not pc:
+        return '<div class="card"><h2>地点变化</h2><div class="empty">数据不足，无当前窗口地点样本</div></div>'
+    jac = pc.get("place_set_jaccard")
+    jac_txt = f"{jac:.2f}" if jac is not None else "-"
+    rows = (
+        f'<div class="row"><span class="name">新 canonical 地点数</span>'
+        f'<span class="val">{pc.get("new_place_count", 0)}</span></div>'
+        f'<div class="row"><span class="name">重复到访率</span>'
+        f'<span class="val">{pc.get("repeat_visit_ratio", 0) * 100:.1f}%</span></div>'
+        f'<div class="row"><span class="name">地点集合 Jaccard</span>'
+        f'<span class="val">{jac_txt}</span></div>'
+        f'<div class="row"><span class="name">当前 / 前窗口地点数</span>'
+        f'<span class="val">{pc.get("cur_places", 0)} / {pc.get("prev_places", 0)}</span></div>'
+    )
+    return (
+        f'<div class="card"><h2>地点变化</h2>{rows}'
+        f'{_render_evidence(pc.get("evidence"), metric="地点变化")}</div>'
+    )
+
+
+def _render_migration(conn: sqlite3.Connection, device_id: str) -> str:
+    """迁移审查（shadow）：mapping 旧→新、孤儿 stay、tag 冲突、geocode 失效、metrics。"""
+    mapping_rows = ""
+    try:
+        maps = conn.execute(
+            "SELECT run_id, old_place_id, new_place_id, match_reason, jaccard, distance_m "
+            "FROM location_place_mapping WHERE old_device_id=? "
+            "ORDER BY run_id DESC, old_place_id LIMIT 50",
+            (device_id,),
+        ).fetchall()
+        for m in maps:
+            jac_txt = "-" if m["jaccard"] is None else f'{m["jaccard"]:.2f}'
+            mapping_rows += (
+                f'<tr><td>{escape(m["old_place_id"])}</td>'
+                f'<td>{escape(m["new_place_id"] or "（未匹配）")}</td>'
+                f'<td>{escape(m["match_reason"] or "-")}</td>'
+                f'<td>{jac_txt} / {_fmt_km(m["distance_m"])}</td></tr>'
+            )
+    except sqlite3.OperationalError:
+        pass
+
+    issues: dict[str, int] = {}
+    orphan_n: int | None = None
+    try:
+        for r in conn.execute(
+            "SELECT kind, COUNT(*) n FROM location_migration_issues "
+            "WHERE resolution_status='open' AND (device_id=? OR device_id IS NULL) "
+            "GROUP BY kind",
+            (device_id,),
+        ):
+            issues[r["kind"]] = r["n"]
+    except sqlite3.OperationalError:
+        pass
+    # 孤儿 stay：正式 stays 引用了不存在 place 的 stay 数（NOT EXISTS 避免全表扫）
+    try:
+        orphan_n = conn.execute(
+            "SELECT COUNT(*) FROM stays s WHERE s.place_id IS NOT NULL "
+            "AND NOT EXISTS (SELECT 1 FROM places p WHERE p.place_id = s.place_id)"
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        orphan_n = None
+
+    metrics: dict[str, int] = {}
+    try:
+        for r in conn.execute(
+            "SELECT metric, value FROM location_migration_metrics WHERE run_id = "
+            "(SELECT run_id FROM location_migration_metrics ORDER BY rowid DESC LIMIT 1)"
+        ):
+            metrics[r["metric"]] = r["value"]
+    except sqlite3.OperationalError:
+        pass
+
+    issue_txt = "、".join(f"{escape(k)}×{v}" for k, v in sorted(issues.items())) or "无"
+    metric_txt = "、".join(
+        f"{escape(k)}={v}" for k, v in sorted(metrics.items())
+    ) or "无"
+    orphan_txt = "未知（无 stays.place_id 列）" if orphan_n is None else str(orphan_n)
+
+    if not mapping_rows and not issues and not metrics:
+        return (
+            '<div class="card"><h2>迁移审查（shadow）</h2>'
+            '<div class="empty">无 shadow 迁移记录（尚未执行位置迁移）</div></div>'
+        )
+    return (
+        f'<div class="card"><h2>迁移审查（shadow）</h2>'
+        f'<div class="row"><span class="name">旧→新地点映射（前 50）</span>'
+        f'<span class="val">{"见下表" if mapping_rows else "无"}</span></div>'
+        f'<table class="tbl"><tr><th>旧 place_id</th><th>新 place_id</th>'
+        f'<th>匹配依据（match_reason）</th><th>Jaccard / 距离</th></tr>'
+        f'{mapping_rows or "<tr><td colspan=4 class=\"empty\">无映射</td></tr>"}</table>'
+        f'<div class="row"><span class="name">孤儿 stay</span><span class="val">{orphan_txt}</span></div>'
+        f'<div class="row"><span class="name">未解决迁移 issue</span><span class="val">{issue_txt}</span></div>'
+        f'<div class="row"><span class="name">迁移 metrics（最新 run）</span><span class="val">{metric_txt}</span></div>'
+        f'</div>'
+    )
+
+
+def render_dashboard_html(
+    conn: sqlite3.Connection,
+    day: str | None = None,
+    device_id: str | None = None,
+    window: int = 30,
+) -> str:
     conn.row_factory = sqlite3.Row
 
     today = datetime.datetime.now(tz=_TZ).strftime("%Y-%m-%d")
     requested = day or today
+    if window not in (7, 30, 90):
+        window = 30
 
     # 日期导航：合并 daily_stats / stays / anomalies；显式请求日即使不在列表也保留
     days = _collect_days(conn)
     nav_days = days
     if requested not in nav_days:
         nav_days = [requested] + nav_days
+
+    def _q(**extra) -> str:
+        params = {"day": requested, "window": window}
+        if device_id:
+            params["device_id"] = device_id
+        params.update(extra)
+        return "&".join(
+            f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items()
+        )
+
     nav = "".join(
-        f'<a href="/dashboard?day={d}" class="{"on" if d == requested else ""}">{d}</a>'
+        f'<a href="/dashboard?{_q(day=d)}" class="{"on" if d == requested else ""}">{escape(d)}</a>'
         for d in nav_days
     )
+    win_nav = "".join(
+        f'<a href="/dashboard?{_q(window=w)}" class="{"on" if w == window else ""}">{w} 天</a>'
+        for w in (7, 30, 90)
+    )
+    nav += f'<span class="dim" style="align-self:center">窗口</span>{win_nav}'
 
-    # 事实卡片：一次 build，全程不触发 ETL
+    # 事实卡片：一次 build，全程不触发 ETL；spatial_profile 由 fact_card 注入，不重复计算
     try:
-        card = fact_card.build(conn=conn, day=requested, detail="full", outlet="dashboard")
+        card = fact_card.build(
+            conn=conn, day=requested, device_id=device_id,
+            detail="full", outlet="dashboard",
+        )
     except Exception:  # noqa: BLE001 - 缺库/损坏时降级为读取失败
         card = None
 
@@ -330,13 +901,19 @@ def render_dashboard_html(conn: sqlite3.Connection, day: str | None = None) -> s
         body = ('<div class="card"><h2>读取失败</h2>'
                 '<div class="empty">数据读取失败，请稍后重试。</div></div>')
     elif card.get("ambiguous_device"):
-        cands = "、".join(escape(str(c)) for c in card.get("candidate_device_ids") or [])
+        cpart = "、".join(escape(str(c)) for c in card.get("candidate_device_ids") or [])
+        links = "".join(
+            f'<a href="/dashboard?{_q(device_id=str(c))}">{escape(str(c))}</a> &nbsp;'
+            for c in (card.get("candidate_device_ids") or [])
+        ) or cpart
         body = (
             f'<div class="card"><h2>多设备</h2>'
-            f'<div class="empty">检测到多台设备，请指定 device_id 后查看。候选设备：{cands}</div></div>'
+            f'<div class="empty">检测到多台设备，未指定 device_id：不合并画像。'
+            f'请选择设备后查看：{links}</div></div>'
         )
     else:
         dev = card.get("device_id") or ""
+        sp = card.get("spatial_profile") or {}
         body = _render_fact_review(card)
 
         # 唯一设备确定后才执行设备级统计查询（全部按 device_id 过滤）
@@ -404,12 +981,19 @@ def render_dashboard_html(conn: sqlite3.Connection, day: str | None = None) -> s
         {_render_arrivals(conn, dev, requested)}
         {_render_persona(card.get("persona"))}
         {_render_coverage(conn)}
+        {_render_location_health(conn, dev, requested)}
+        {_render_kpi30(sp)}
+        {_render_frequent_places(conn, card, sp, window)}
+        {_render_rhythm(sp)}
+        {_render_scene(sp)}
+        {_render_place_change(sp)}
+        {_render_migration(conn, dev)}
         """
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>langTrack · {requested}</title><style>{PAGE_CSS}</style></head>
+<title>langTrack · {escape(requested)}</title><style>{PAGE_CSS}</style></head>
 <body>
 <h1>langTrack 数据仪表盘</h1>
 <div class="sub">自用数据监控 · 数据源: events + ETL 事实表</div>
