@@ -36,7 +36,7 @@ _PLACE_COLS = (
     "id, device_id, grid_key, lat, lon, label, first_seen, last_seen, "
     "visit_count, is_primary, address, poi, poi_fallback, district, township, "
     "business_area, poi_type, behavior, matched_level, candidate_label, "
-    "confidence_home, confidence_work, geocoded_at"
+    "confidence_home, confidence_work, geocoded_at, poi_l1, poi_l2, poi_l3"
 )
 
 # v2 新增计数列（v1 无，由 reader 兼容映射）。
@@ -124,6 +124,9 @@ def _norm_place(row: sqlite3.Row, *, v2: bool) -> dict:
         "confidence_home": row["confidence_home"],
         "confidence_work": row["confidence_work"],
         "geocoded_at": row["geocoded_at"],
+        "poi_l1": row["poi_l1"] or "",
+        "poi_l2": row["poi_l2"] or "",
+        "poi_l3": row["poi_l3"] or "",
     }
     if v2:
         out["place_id"] = row["place_id"]

@@ -43,6 +43,7 @@ PLACE_FIELDS = {
     "township", "business_area", "poi_type", "behavior", "matched_level",
     "candidate_label", "confidence_home", "confidence_work", "geocoded_at",
     "name_confidence", "name_evidence", "parent_poi",
+    "poi_l1", "poi_l2", "poi_l3",
 }
 STAY_FIELDS = {
     "device_id", "place_id", "start_ts", "end_ts", "duration_ms",
