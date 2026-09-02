@@ -357,6 +357,31 @@ class TestDisplayContract:
         assert name == "雨花台区"
         assert source == "district"
 
+    def test_address_preferred_over_township_and_district(self):
+        """§2.6 阶梯：address(0.60) 高于 township/district(0.40)。"""
+        name, source, gran = resolve_place_name(
+            poi="", address="某某路1号", township="雨花街道", district="雨花台区"
+        )
+        assert name == "某某路1号"
+        assert source == "address"
+        assert gran == "address"
+
+    def test_township_before_district(self):
+        name, source, gran = resolve_place_name(
+            poi="", township="雨花街道", district="雨花台区"
+        )
+        assert name == "雨花街道"
+        assert source == "district"
+        assert gran == "neighborhood"
+
+    def test_low_confidence_poi_not_used(self):
+        """name_confidence < 0.75 时具体 POI 不得展示，落到 address。"""
+        name, source, _gran = resolve_place_name(
+            poi="某连锁快餐", address="某某路5号", name_confidence=0.55
+        )
+        assert name == "某某路5号"
+        assert source == "address"
+
     def test_all_empty_unknown(self):
         name, source, _gran = resolve_place_name()
         assert name == "未知地点"

@@ -675,19 +675,20 @@ def _pick_name(
     住宅附近不稳定 → address 中小区或 township；仍不确定 → district；完全无语义 → 未知地点。
     返回 (place_name, name_source, display_granularity)。
     """
-    # 优先级与分值映射（分值仅用于选粒度，不表示到访置信度）
+    # 优先级与分值映射（分值仅用于选粒度，不表示到访置信度）；
+    # 阶梯顺序对齐 §2.6：address(0.60) > township/district(0.40)，township 先于 district
     if name_confidence >= 0.75 and poi:
         return poi, "poi", "venue"
     if parent_poi and name_confidence >= 0.60:
         return parent_poi, "poi", "area"
     if business_area and name_confidence >= 0.55:
         return business_area, "poi_fallback", "area"
+    if address:
+        return address, "address", "address"
     if township:
         return township, "district", "neighborhood"
     if district:
         return district, "district", "district"
-    if address:
-        return address, "address", "address"
     return "未知地点", "unknown", "unknown"
 
 

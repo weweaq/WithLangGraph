@@ -42,9 +42,13 @@ _PLACE_COLS = (
 # v2 新增计数列（v1 无，由 reader 兼容映射）。
 _PLACE_V2_ONLY = ", place_id, point_count, stay_ms"
 
+# v2 新增命名证据列（v1 无：恒 NULL → 归一化默认值；FactCard PlaceRef 用）。
+_PLACE_NAME_V2_ONLY = ", name_confidence, name_evidence, parent_poi"
+
 _STAY_COLS = (
     "device_id, start_ts, end_ts, duration_ms, center_lat, center_lon, "
-    "min_lat, min_lon, max_lat, max_lon, n_points, radius_m, grid_key, day"
+    "min_lat, min_lon, max_lat, max_lon, n_points, radius_m, grid_key, day, "
+    "avg_accuracy_m"
 )
 
 _TRIP_COLS = (
@@ -131,6 +135,10 @@ def _norm_place(row: sqlite3.Row, *, v2: bool) -> dict:
         out["point_count"] = visit_count  # v1 近似：visits 兼容映射 point_count
         out["stay_ms"] = 0
         out["visit_episodes"] = visit_count
+    # 命名证据（v2 列；v1/缺列恒 NULL → 默认值，PlaceRef 经 resolve_place_name 使用）
+    out["name_confidence"] = float(row["name_confidence"] or 0.0)
+    out["name_evidence"] = row["name_evidence"] or ""
+    out["parent_poi"] = row["parent_poi"] or ""
     return out
 
 
@@ -149,8 +157,8 @@ def read_places(
         return []
     v2 = is_v2(conn)
     v2_cols = {"place_id", "point_count", "stay_ms"}
-    wanted = _PLACE_COLS + _PLACE_V2_ONLY
-    force_null = set() if v2 else v2_cols
+    wanted = _PLACE_COLS + _PLACE_V2_ONLY + _PLACE_NAME_V2_ONLY
+    force_null = set() if v2 else v2_cols | set(_PLACE_NAME_V2_ONLY.split(", "))
     sql = f"SELECT {_select_expr('p', wanted, actual, force_null)} FROM places p WHERE 1=1"
     params: list = []
     if device_id is not None:
@@ -263,6 +271,8 @@ def read_stays(
             "grid_key": r["grid_key"],
             "day": r["day"],
             "place_id": r["place_id"],
+            # stay 中心质量（stays_v2.avg_accuracy_m；v1 恒 None）
+            "avg_accuracy_m": r["avg_accuracy_m"],
         }
         if join_sql:
             row["place_label"] = r["place_label"]
@@ -441,3 +451,44 @@ def place_grid_map(
             if p is not None and c["grid_key"]:
                 grid_map.setdefault(str(c["grid_key"]), p)
     return grid_map
+
+
+def read_daily_quality(
+    conn: sqlite3.Connection,
+    *,
+    device_id: str,
+    day: str,
+) -> dict | None:
+    """读取 (day, device_id) 的坐标质量日行（Task 6 §3.2，FactCard full 透传）。
+
+    表缺失（v1 旧库 / 未跑 Task 6 ETL）或无行返回 None；
+    created_at/updated_at 审计列不透传（保证快照确定性）。
+    """
+    if not table_columns(conn, "daily_location_quality"):
+        return None
+    try:
+        row = conn.execute(
+            "SELECT * FROM daily_location_quality WHERE day=? AND device_id=?",
+            (day, device_id),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if row is None:
+        return None
+    out = dict(row)
+    out.pop("created_at", None)
+    out.pop("updated_at", None)
+    return out
+
+
+def read_tag_conflict_count(conn: sqlite3.Connection, *, device_id: str) -> int:
+    """读取设备的人工 tag 冲突数（v2 place_tag_conflicts；v1/缺表恒 0）。"""
+    if not table_columns(conn, "place_tag_conflicts"):
+        return 0
+    try:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM place_tag_conflicts WHERE device_id=?", (device_id,)
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        return 0
+    return int(n or 0)

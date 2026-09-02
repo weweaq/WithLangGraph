@@ -42,11 +42,12 @@ PLACE_FIELDS = {
     "stay_ms", "is_primary", "address", "poi", "poi_fallback", "district",
     "township", "business_area", "poi_type", "behavior", "matched_level",
     "candidate_label", "confidence_home", "confidence_work", "geocoded_at",
+    "name_confidence", "name_evidence", "parent_poi",
 }
 STAY_FIELDS = {
     "device_id", "place_id", "start_ts", "end_ts", "duration_ms",
     "center_lat", "center_lon", "min_lat", "min_lon", "max_lat", "max_lon",
-    "n_points", "radius_m", "grid_key", "day",
+    "n_points", "radius_m", "grid_key", "day", "avg_accuracy_m",
     "place_label", "place_poi", "place_poi_fallback", "place_address",
     "place_behavior", "place_district",
 }
@@ -107,16 +108,17 @@ def _seed_v2(conn: sqlite3.Connection) -> None:
         pass  # 已被 v2 表覆盖
     conn.executemany(
         "INSERT INTO places(device_id, place_id, grid_key, lat, lon, label, first_seen, "
-        "last_seen, point_count, visit_count, stay_ms, is_primary, poi, address) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "last_seen, point_count, visit_count, stay_ms, is_primary, poi, address, "
+        "name_confidence, name_evidence, parent_poi) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [
             # home place：代表网格 HOME_GK，成员含 HOME_MEMBER_GK；visit_count=段数2
             ("dev1", "pid_home", HOME_GK, 31.992, 118.783, "家", DAY_START, DAY_END,
-             100, 2, 8_600_000, 1, "甲小区南门", "某某路1号"),
+             100, 2, 8_600_000, 1, "甲小区南门", "某某路1号", 0.9, "regeo_poi", "某某商圈"),
             ("dev1", "pid_work", WORK_GK, 31.998, 118.790, "公司", DAY_START, DAY_END,
-             80, 1, 11_000, 1, "乙大厦", "某某路2号"),
+             80, 1, 11_000, 1, "乙大厦", "某某路2号", 0.85, "regeo_poi", ""),
             ("dev2", "pid_home2", HOME_GK, 31.992, 118.783, "家", DAY_START, DAY_END,
-             20, 1, 5_000, 0, None, None),
+             20, 1, 5_000, 0, None, None, 0.0, "", ""),
         ],
     )
     conn.executemany(
@@ -131,15 +133,15 @@ def _seed_v2(conn: sqlite3.Connection) -> None:
     # v2 关键差异：dev1 home stay 发生在成员网格 HOME_MEMBER_GK（≠ place 代表网格）
     conn.executemany(
         "INSERT INTO stays(device_id, start_ts, end_ts, duration_ms, center_lat, center_lon, "
-        "min_lat, min_lon, max_lat, max_lon, n_points, radius_m, grid_key, place_id, day) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "min_lat, min_lon, max_lat, max_lon, n_points, radius_m, grid_key, place_id, day, "
+        "avg_accuracy_m) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         [
             ("dev1", DAY_START, 8_000, 7_000, 31.993, 118.784, 31.992, 118.783, 31.994, 118.785,
-             20, 50.0, HOME_MEMBER_GK, "pid_home", DAY),
+             20, 50.0, HOME_MEMBER_GK, "pid_home", DAY, 12.5),
             ("dev1", 9_000, 20_000, 11_000, 31.998, 118.790, 31.997, 118.789, 31.999, 118.791,
-             30, 60.0, WORK_GK, "pid_work", DAY),
+             30, 60.0, WORK_GK, "pid_work", DAY, 20.0),
             ("dev2", DAY_START, 6_000, 5_000, 31.992, 118.783, 31.991, 118.782, 31.993, 118.784,
-             15, 45.0, HOME_GK, "pid_home2", DAY),
+             15, 45.0, HOME_GK, "pid_home2", DAY, None),
         ],
     )
     conn.execute(
@@ -153,6 +155,16 @@ def _seed_v2(conn: sqlite3.Connection) -> None:
         "INSERT INTO anomalies(day, kind, device_id, place_id, grid_key, poi, detail, ts) "
         "VALUES (?,?,?,?,?,?,?,?)",
         (DAY, "new_place", "dev1", "pid_home", HOME_GK, "甲小区南门", "访问 1 次", 12_000),
+    )
+    # v2 独有：dev1 两条 tag 冲突、dev2 一条（read_tag_conflict_count 用）
+    conn.executemany(
+        "INSERT INTO place_tag_conflicts(device_id, new_place_id, old_place_id, tag, reason) "
+        "VALUES (?,?,?,?,?)",
+        [
+            ("dev1", "pid_home", "pid_a", "家", "merge"),
+            ("dev1", "pid_work", "pid_b", "公司", "merge"),
+            ("dev2", "pid_home2", "pid_c", "家", "merge"),
+        ],
     )
     conn.execute("PRAGMA user_version = 2")
     conn.commit()
@@ -213,6 +225,18 @@ class TestReadPlaces:
         assert len(rows) == 1
         assert rows[0]["candidate_label"] == "家"
 
+    def test_name_evidence_fields(self, loc_db):
+        """v2 透传命名证据（PlaceRef 用）；v1/缺列归一为默认值。"""
+        home = next(r for r in lr.read_places(loc_db, device_id="dev1") if r["label"] == "家")
+        if lr.is_v2(loc_db):
+            assert home["name_confidence"] == 0.9
+            assert home["name_evidence"] == "regeo_poi"
+            assert home["parent_poi"] == "某某商圈"
+        else:
+            assert home["name_confidence"] == 0.0
+            assert home["name_evidence"] == ""
+            assert home["parent_poi"] == ""
+
 
 class TestReadStays:
     def test_field_set_identical_across_versions(self, loc_db):
@@ -251,6 +275,21 @@ class TestReadStays:
         for r in rows:
             assert r["place_label"] is None
             assert r["place_poi"] is None
+
+    def test_avg_accuracy_m(self, loc_db):
+        """v2 透传 stay 中心精度（stays_v2.avg_accuracy_m）；v1 恒 None。"""
+        home_stay = next(
+            r for r in lr.read_stays(loc_db, device_id="dev1") if r["end_ts"] == 8_000
+        )
+        if lr.is_v2(loc_db):
+            assert home_stay["avg_accuracy_m"] == 12.5
+        else:
+            assert home_stay["avg_accuracy_m"] is None
+
+    def test_avg_accuracy_m_null_passthrough(self, loc_db):
+        """未知精度的 stay 透传 None（不归一为 0）。"""
+        dev2_stay = lr.read_stays(loc_db, device_id="dev2")[0]
+        assert dev2_stay["avg_accuracy_m"] is None
 
 
 class TestReadTrips:
@@ -446,3 +485,87 @@ class TestDayFromFilter:
     def test_trips_day_from(self, loc_db):
         assert len(lr.read_trips(loc_db, day_from=DAY)) == 1
         assert lr.read_trips(loc_db, day_from="2099-01-01") == []
+
+
+class TestReadDailyQuality:
+    """Task 6 §3.2 坐标质量日行读取（FactCard full 透传数据源）。"""
+
+    def test_missing_table_returns_none(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        assert lr.read_daily_quality(conn, device_id="dev1", day=DAY) is None
+        conn.close()
+
+    def test_no_row_returns_none(self, loc_db):
+        # etl._SCHEMA 已建表但无行（未跑 Task 6 ETL 的旧库形态）
+        assert lr.read_daily_quality(loc_db, device_id="dev1", day=DAY) is None
+
+    def test_row_passthrough_without_audit_columns(self, loc_db):
+        loc_db.execute(
+            "INSERT INTO daily_location_quality(day, device_id, points_total, points_valid, "
+            "accuracy_known, accuracy_le_50, accuracy_51_150, accuracy_gt_150, "
+            "observed_half_hour_bins, median_interval_sec, providers_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (DAY, "dev1", 120, 100, 100, 60, 30, 10, 16, 45.0, '{"gps":80}'),
+        )
+        loc_db.commit()
+        q = lr.read_daily_quality(loc_db, device_id="dev1", day=DAY)
+        assert q is not None
+        assert q["day"] == DAY
+        assert q["device_id"] == "dev1"
+        assert q["points_total"] == 120
+        assert q["points_valid"] == 100
+        assert q["accuracy_le_50"] == 60
+        assert q["median_interval_sec"] == 45.0
+        assert q["providers_json"] == '{"gps":80}'
+        # 审计列不透传（快照确定性）
+        assert "created_at" not in q
+        assert "updated_at" not in q
+
+    def test_day_device_isolated(self, loc_db):
+        loc_db.executemany(
+            "INSERT INTO daily_location_quality(day, device_id, points_total, points_valid, "
+            "accuracy_known, accuracy_le_50, accuracy_51_150, accuracy_gt_150, "
+            "observed_half_hour_bins, median_interval_sec, providers_json) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            [
+                (DAY, "dev1", 120, 100, 100, 60, 30, 10, 16, 45.0, "{}"),
+                ("2026-08-18", "dev1", 10, 8, 8, 4, 2, 2, 5, 60.0, "{}"),
+                (DAY, "dev2", 50, 40, 40, 20, 10, 10, 12, 30.0, "{}"),
+            ],
+        )
+        loc_db.commit()
+        q = lr.read_daily_quality(loc_db, device_id="dev1", day=DAY)
+        assert q["points_total"] == 120
+        assert lr.read_daily_quality(loc_db, device_id="dev2", day=DAY)["points_total"] == 50
+        assert lr.read_daily_quality(loc_db, device_id="dev1", day="2026-08-18")["points_total"] == 10
+        assert lr.read_daily_quality(loc_db, device_id="dev1", day="2020-01-01") is None
+
+
+class TestReadTagConflictCount:
+    """v2 place_tag_conflicts 人工 tag 冲突计数（FactCard full 透传数据源）。"""
+
+    def test_missing_table_returns_zero(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        assert lr.read_tag_conflict_count(conn, device_id="dev1") == 0
+        conn.close()
+
+    def test_counts_per_device(self, loc_db):
+        if lr.is_v2(loc_db):
+            assert lr.read_tag_conflict_count(loc_db, device_id="dev1") == 2
+            assert lr.read_tag_conflict_count(loc_db, device_id="dev2") == 1
+        else:
+            # v1 无该表，恒 0
+            assert lr.read_tag_conflict_count(loc_db, device_id="dev1") == 0
+            assert lr.read_tag_conflict_count(loc_db, device_id="dev2") == 0
+
+    def test_empty_table_returns_zero(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            "CREATE TABLE place_tag_conflicts (device_id TEXT, new_place_id TEXT, "
+            "old_place_id TEXT, tag TEXT, reason TEXT)"
+        )
+        assert lr.read_tag_conflict_count(conn, device_id="dev1") == 0
+        conn.close()
