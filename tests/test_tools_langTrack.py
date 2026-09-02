@@ -145,14 +145,14 @@ def test_stats_returns_day_profile(monkeypatch, tmp_path):
     assert r["top_apps"][0]["app"] == "微信"
     assert r["notification_count"] == 10
     assert "疑似熬夜" in r["sleep_signal"]  # 6 条凌晨音频样本触发
-    assert r["places"][0]["label"] == "公司"
+    assert r["places"][0]["label"] == "江东路1号〔公司〕"
     # FactCard 公共字段透传
     assert r["device_id"] == "d"
     assert r["ambiguous_device"] is False
     assert isinstance(r["etl_watermark_ms"], int)
     assert r["day_window_closed"] is False  # 历史日且 ETL 水位(17:06)未跨日末
-    assert r["current_known"]["label"] == "公司"
-    assert r["stays"] and r["stays"][0]["label"] == "公司"
+    assert r["current_known"]["label"] == "江东路1号〔公司〕"
+    assert r["stays"] and r["stays"][0]["label"] == "江东路1号〔公司〕"
     assert r["trips"] and r["trips"][0]["start_hhmm"] == "12:00"  # 嵌入 stay 内，不配 from_label
     assert isinstance(r["trips"][0]["from_label"], str)
     assert r["anomalies"] and r["anomalies"][0]["kind"] == "new_place"

@@ -202,6 +202,10 @@ class LangTrackDayStats(TypedDict):
     day_window_closed: bool
     current_known: CurrentKnown | None
 
+    # 位置质量（Task 6 §3.2）：当日定位质量画像 + 人工 tag 冲突数（v1/缺表 → None/0）
+    daily_location_quality: dict | None
+    tag_conflict_count: int
+
     # compact 事实卡片（注入用 / 审计用；空串/空表表示未生成）
     compact_sections: list
     compact: str
@@ -229,6 +233,7 @@ def _unavailable(day: str, reason: str) -> LangTrackDayStats:
         data_as_of="", data_as_of_ms=None, data_as_of_source="unknown",
         location_as_of="", location_as_of_ms=None, data_age_min=None,
         day_window_closed=False, current_known=None,
+        daily_location_quality=None, tag_conflict_count=0,
         compact_sections=[], compact="", compact_chars=0, compact_lines=[],
         compact_omitted={}, card_fp="",
     )
@@ -293,6 +298,8 @@ def _map_card_to_stats(card: dict, day: str) -> LangTrackDayStats:
         data_age_min=card["data_age_min"],
         day_window_closed=card["day_window_closed"],
         current_known=card["current_known"],
+        daily_location_quality=card.get("daily_location_quality"),
+        tag_conflict_count=card.get("tag_conflict_count", 0),
         compact_sections=card["compact_sections"],
         compact=card["compact"],
         compact_chars=card["compact_chars"],

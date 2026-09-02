@@ -55,6 +55,7 @@ TRIP_FIELDS = {
     "device_id", "from_place_id", "to_place_id", "start_ts", "end_ts",
     "duration_ms", "start_lat", "start_lon", "end_lat", "end_lon", "dist_m",
     "n_points", "day", "polyline", "route_key", "route_mode", "route_encoded_at",
+    "route_dist_m",
 }
 ANOMALY_FIELDS = {"day", "kind", "device_id", "place_id", "grid_key", "poi", "detail", "ts"}
 

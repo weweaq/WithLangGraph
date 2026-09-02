@@ -56,7 +56,7 @@ _TRIP_COLS = (
     "end_lat, end_lon, dist_m, n_points, day"
 )
 
-_TRIP_V2_ONLY = ", from_place_id, to_place_id, polyline, route_key, route_mode, route_encoded_at"
+_TRIP_V2_ONLY = ", from_place_id, to_place_id, polyline, route_key, route_mode, route_encoded_at, route_dist_m"
 
 _ANOMALY_COLS = "day, kind, device_id, grid_key, poi, detail, ts"
 
@@ -305,7 +305,7 @@ def read_trips(
     if not actual:
         return []
     v2 = is_v2(conn)
-    v2_cols = {"from_place_id", "to_place_id", "polyline", "route_key", "route_mode", "route_encoded_at"}
+    v2_cols = {"from_place_id", "to_place_id", "polyline", "route_key", "route_mode", "route_encoded_at", "route_dist_m"}
     wanted = _TRIP_COLS + _TRIP_V2_ONLY
     force_null = set() if v2 else v2_cols
     sql = f"SELECT {_select_expr('t', wanted, actual, force_null)} FROM trips t WHERE 1=1"
@@ -346,6 +346,7 @@ def read_trips(
             "route_key": r["route_key"],
             "route_mode": r["route_mode"],
             "route_encoded_at": r["route_encoded_at"],
+            "route_dist_m": r["route_dist_m"],
         }
         for r in rows
     ]

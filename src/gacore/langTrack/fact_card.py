@@ -28,6 +28,12 @@ from pathlib import Path
 from typing import Final, Literal, TypedDict
 
 from gacore.jsonl_logger import get_logger
+from gacore.langTrack.location_facts import (
+    PlaceRef,
+    format_place,
+    resolve_place_name,
+    user_tag_of,
+)
 from gacore.langTrack.persona import build as build_persona
 
 _TZ = datetime.timezone(datetime.timedelta(hours=8))
@@ -44,28 +50,48 @@ logger = get_logger("langTrack.fact_card")
 
 
 class CurrentKnown(TypedDict):
+    # PlaceRef 地名载荷（§2.6）：与 StayBrief 保持一致，以 place_name 为显示名
     label: str
-    since_hhmm: str
-    observed_until_hhmm: str
+    place_id: str | None
+    place_name: str
+    user_tag: str
+    name_source: str
     poi: str
+    poi_fallback: str
     behavior: str
     district: str
+    since_hhmm: str
+    observed_until_hhmm: str
 
 
 class StayBrief(TypedDict):
+    # §2.6 兼容契约：新增 PlaceRef 字段，保留 label/poi 旧字段（label=format_place 结果）
+    place_id: str | None
     label: str
+    place_name: str
+    user_tag: str
+    name_source: str
     poi: str
+    poi_fallback: str
+    district: str
+    behavior: str
     start_hhmm: str
     end_hhmm: str
     mins: int
+    point_count: int
+    avg_accuracy_m: float | None
 
 
 class TripBrief(TypedDict):
+    # §2.7 兼容契约：from_place/to_place 为 PlaceRef；保留 from_label/to_label 旧字段
     start_hhmm: str
     end_hhmm: str
     dist_m: int
+    from_place: PlaceRef | None
+    to_place: PlaceRef | None
     from_label: str
     to_label: str
+    route_dist_m: int | None  # 高德实测距离；本轮未落实际距离 → None
 
 
 class AnomalyBrief(TypedDict):
@@ -75,11 +101,21 @@ class AnomalyBrief(TypedDict):
 
 
 class PlaceBrief(TypedDict):
+    # §2.6 兼容契约：label=format_place 结果；旧字段 visits/poi/behavior/address 已废弃待移除
     label: str
-    visits: int
-    poi: str
-    behavior: str
-    address: str
+    visits: int  # deprecated：旧消费者兼容，映射 point_count
+    poi: str  # deprecated：保留
+    behavior: str  # deprecated：保留
+    address: str  # deprecated：保留
+    place_id: str | None
+    place_name: str
+    user_tag: str
+    name_source: str
+    poi_fallback: str
+    district: str
+    point_count: int
+    visit_episodes: int
+    stay_ms: int
 
 
 class CompactSection(TypedDict):
@@ -123,6 +159,8 @@ class FactCard(TypedDict, total=False):
     trips: list[TripBrief]
     stay_minutes: dict[str, int]
     anomalies: list[AnomalyBrief]
+    daily_location_quality: dict | None
+    tag_conflict_count: int
     midnight_audio_n: int | None
     sleep_signal: str
     sleep_start_hhmm: str | None
@@ -235,20 +273,124 @@ def _resolve_device(conn: sqlite3.Connection, device_id: str | None):
 
 # ---------------------------------------------------------------------------
 # 查询（位置事实经 location_reader 双读层，v1: grid_key 关联 / v2: place_id 关联）
+# PlaceRef 地名解析只发生在本模块（§2.6 resolver 唯一入口），服务方不得再造第二份。
 # ---------------------------------------------------------------------------
 
 
-def _place_of_stay(stay: dict) -> dict | None:
-    """stay 行内嵌的关联 place（v2 按 place_id JOIN；未命中返回 None）。"""
+def _load_places(conn: sqlite3.Connection, device_id: str | None) -> tuple[dict, dict]:
+    """读取该设备全部 canonical places（含命名证据列），构建两个索引。
+
+    返回 (by_id, by_grid)：v2 优先按 place_id 寻址；v1/缺表按 grid_key 回落。
+    读取失败降级为空索引不抛——stay 内嵌字段仍可用，展示降级为「未知地点」。
+    """
+    by_id: dict[str, dict] = {}
+    by_grid: dict[str, dict] = {}
+    if device_id is None:
+        return by_id, by_grid
+    try:
+        from gacore.langTrack import location_reader as lr
+
+        for p in lr.read_places(conn, device_id=device_id):
+            if p.get("place_id"):
+                by_id[str(p["place_id"])] = p
+            if p.get("grid_key"):
+                by_grid.setdefault(str(p["grid_key"]), p)
+        # v2：place_cells 成员网格展开（同网格多 place 取 visit_count 高者，已按访问降序）
+        if by_id:
+            for c in lr.read_place_cells(conn, device_id=device_id):
+                p = by_id.get(str(c.get("place_id")))
+                if p is not None and c.get("grid_key"):
+                    by_grid.setdefault(str(c["grid_key"]), p)
+    except Exception:  # noqa: BLE001 - 缺表/坏库降级
+        return {}, {}
+    return by_id, by_grid
+
+
+def _place_of_stay(
+    stay: dict,
+    by_id: dict[str, dict] | None = None,
+    by_grid: dict[str, dict] | None = None,
+) -> dict | None:
+    """stay 关联的 canonical place（含命名证据列）。
+
+    解析顺序：v2 按 stay.place_id 取 → 按 stay.grid_key 查 → 回退为 location_reader
+    内嵌 place 字段（只剩基本语义、命名证据归零，展示降级）。全无地点信息返回 None。
+    """
+    by_id = by_id or {}
+    by_grid = by_grid or {}
+    top = stay.get("place_id")
+    if top:
+        p = by_id.get(str(top))
+        if p is not None:
+            return p
+    gk = stay.get("grid_key")
+    if gk:
+        p = by_grid.get(str(gk))
+        if p is not None:
+            return p
     if stay.get("place_label") is None and stay.get("place_poi") is None:
         return None
     return {
+        "place_id": stay.get("place_id"),
+        "grid_key": stay.get("grid_key"),
         "label": stay.get("place_label") or "",
         "poi": stay.get("place_poi") or "",
+        "poi_fallback": stay.get("place_poi_fallback") or "",
+        "address": stay.get("place_address") or "",
         "behavior": stay.get("place_behavior") or "",
         "district": stay.get("place_district") or "",
-        "address": stay.get("place_address") or "",
+        "township": "",
+        "business_area": "",
+        "parent_poi": "",
+        "name_confidence": 0.0,
+        "name_evidence": "",
+        "point_count": int(stay.get("n_points") or 0),
+        "visit_episodes": 0,
+        "stay_ms": 0,
     }
+
+
+def _place_ref(place: dict | None) -> PlaceRef | None:
+    """唯一 PlaceRef 派生（§2.6）：只调 resolve_place_name + user_tag_of。"""
+    if not place:
+        return None
+    name, source, gran = resolve_place_name(
+        poi=place.get("poi") or "",
+        poi_fallback=place.get("poi_fallback") or "",
+        address=place.get("address") or "",
+        district=place.get("district") or "",
+        township=place.get("township") or "",
+        business_area=place.get("business_area") or "",
+        parent_poi=place.get("parent_poi") or "",
+        name_confidence=float(place.get("name_confidence") or 0.0),
+        label=place.get("label") or "",
+    )
+    return PlaceRef(
+        place_id=str(place.get("place_id") or "") or "",
+        grid_key=str(place.get("grid_key") or "") or "",
+        place_name=name,
+        name_source=source,
+        user_tag=user_tag_of(place.get("label") or ""),
+        poi=place.get("poi") or "",
+        poi_fallback=place.get("poi_fallback") or "",
+        address=place.get("address") or "",
+        district=place.get("district") or "",
+        township=place.get("township") or "",
+        business_area=place.get("business_area") or "",
+        parent_poi=place.get("parent_poi") or "",
+        behavior=place.get("behavior") or "",
+        display_granularity=gran,
+        name_confidence=float(place.get("name_confidence") or 0.0),
+        name_evidence=place.get("name_evidence") or "",
+    )
+
+
+def _friendly_label(place: dict | None) -> str:
+    """展示名：format_place(place_name, user_tag)（§2.6），compact 与旧 label 字段共用。"""
+    ref = _place_ref(place)
+    if ref is None:
+        return "未知地点"
+    return format_place(ref["place_name"], ref["user_tag"])
 
 
 def _load_stays(conn: sqlite3.Connection, device_id: str | None, day_start_ms: int, day_end_ms: int) -> list[dict]:
@@ -301,17 +443,6 @@ def _read_daily_stats(conn: sqlite3.Connection, device_id: str | None, day: str)
         return None
 
 
-def _resolve_label(place: dict | None, poi: str | None = None) -> str:
-    """label 优先人工（非「未知」），其次非网格 poi，否则「未知地点」。"""
-    if place:
-        lab = (place.get("label") or "").strip()
-        if lab and lab != "未知":
-            return lab
-    if poi and not _looks_like_coord(poi):
-        return poi.strip()
-    return "未知地点"
-
-
 # ---------------------------------------------------------------------------
 # build 主入口
 # ---------------------------------------------------------------------------
@@ -353,6 +484,8 @@ def _new_card(day: str, now_ms: int) -> FactCard:
         trips=[],
         stay_minutes={},
         anomalies=[],
+        daily_location_quality=None,
+        tag_conflict_count=0,
         midnight_audio_n=None,
         sleep_signal="",
         sleep_start_hhmm=None,
@@ -483,6 +616,8 @@ def _fill_card(
     # 当日 stays / trips（时间窗相交；place 字段由 location_reader 内嵌）
     stays_raw = _load_stays(conn, dev, day_start_ms, day_end_ms)
     trips_raw = _load_trips(conn, dev, day_start_ms, day_end_ms)
+    # 地点索引：全卡 stay/trip/place 的 PlaceRef 解析唯一数据源（§2.6）
+    place_by_id, place_by_grid = _load_places(conn, dev)
 
     # 事实水位：ETL 优先，其次当日 stays/trips 最大 end_ts
     fallback = None
@@ -536,17 +671,41 @@ def _fill_card(
     clipped_stays.sort(key=lambda x: x[1])
     clipped_trips.sort(key=lambda x: x[1])
 
-    # stay_minutes：按人工 label 聚合（家/公司/其他/未知）
+    # stay_minutes：按人工 tag 聚合（家/公司/其他/未知）；StayBrief 带全量 PlaceRef 载荷
     stay_minutes: dict[str, int] = {}
     stay_briefs: list[StayBrief] = []
     for s, cs, ce in clipped_stays:
-        place = _place_of_stay(s)
-        label = _resolve_label(place, place.get("poi") if place else None)
+        place = _place_of_stay(s, place_by_id, place_by_grid)
+        ref = _place_ref(place)
+        label = _friendly_label(place)
         poi = (place.get("poi") or "") if place else ""
         mins = (ce - cs) // 60000
-        bucket = label if label in ("家", "公司") else ("未知" if label == "未知地点" else "其他")
+        tag = (ref or {}).get("user_tag", "")
+        if tag == "家":
+            bucket = "家"
+        elif tag == "公司":
+            bucket = "公司"
+        elif label == "未知地点":
+            bucket = "未知"
+        else:
+            bucket = "其他"
         stay_minutes[bucket] = stay_minutes.get(bucket, 0) + mins
-        stay_briefs.append(StayBrief(label=label, poi=poi, start_hhmm=_hhmm(cs), end_hhmm=_hhmm(ce), mins=mins))
+        stay_briefs.append(StayBrief(
+            place_id=(str((place or {}).get("place_id") or "") if place else None),
+            label=label,
+            place_name=(ref or {}).get("place_name", ""),
+            user_tag=tag,
+            name_source=(ref or {}).get("name_source", ""),
+            poi=poi,
+            poi_fallback=(place.get("poi_fallback") or "") if place else "",
+            district=(place.get("district") or "") if place else "",
+            behavior=(place.get("behavior") or "") if place else "",
+            start_hhmm=_hhmm(cs),
+            end_hhmm=_hhmm(ce),
+            mins=mins,
+            point_count=int((place or {}).get("point_count") or 0),
+            avg_accuracy_m=s.get("avg_accuracy_m"),
+        ))
 
     # location_as_of：裁剪后 stays 最大 end_ts
     loc_as_of = max((ce for _, _, ce in clipped_stays), default=None)
@@ -559,20 +718,25 @@ def _fill_card(
         covering = [(s, cs, ce) for s, cs, ce in clipped_stays if s["start_ts"] <= cutoff <= ce]
         if covering:
             s, cs, ce = covering[-1]
-            place = _place_of_stay(s)
-            label = _resolve_label(place, place.get("poi") if place else None)
+            place = _place_of_stay(s, place_by_id, place_by_grid)
+            ref = _place_ref(place)
             current_known = CurrentKnown(
-                label=label,
-                since_hhmm=_hhmm(cs),
-                observed_until_hhmm=_hhmm(ce),
+                label=_friendly_label(place),
+                place_id=(str((place or {}).get("place_id") or "") if place else None),
+                place_name=(ref or {}).get("place_name", ""),
+                user_tag=(ref or {}).get("user_tag", ""),
+                name_source=(ref or {}).get("name_source", ""),
                 poi=(place.get("poi") or "") if place else "",
+                poi_fallback=(place.get("poi_fallback") or "") if place else "",
                 behavior=(place.get("behavior") or "") if place else "",
                 district=(place.get("district") or "") if place else "",
+                since_hhmm=_hhmm(cs),
+                observed_until_hhmm=_hhmm(ce),
             )
     card["current_known"] = current_known
     card["stays"] = stay_briefs
 
-    # trips：逐条匹配前后最近 stay（禁全日首尾复用）
+    # trips：逐条匹配前后最近 stay（禁全日首尾复用）；from/to PlaceRef 直取（§2.7）
     trip_briefs: list[TripBrief] = []
     for t, cs, ce in clipped_trips:
         prev_label, next_label = "", ""
@@ -580,13 +744,25 @@ def _fill_card(
         next_candidates = [(s[1], s) for s in clipped_stays if s[1] >= t["end_ts"]]
         if prev_candidates:
             prev_candidates.sort(key=lambda x: x[0], reverse=True)
-            prev_label = _stay_label(prev_candidates[0][1])
+            prev_label = _stay_label(prev_candidates[0][1], place_by_id, place_by_grid)
         if next_candidates:
             next_candidates.sort(key=lambda x: x[0])
-            next_label = _stay_label(next_candidates[0][1])
+            next_label = _stay_label(next_candidates[0][1], place_by_id, place_by_grid)
+        from_place = None
+        if t.get("from_place_id"):
+            fp = place_by_id.get(str(t["from_place_id"]))
+            from_place = _place_ref(fp) if fp else None
+        to_place = None
+        if t.get("to_place_id"):
+            tp = place_by_id.get(str(t["to_place_id"]))
+            to_place = _place_ref(tp) if tp else None
         trip_briefs.append(TripBrief(
             start_hhmm=_hhmm(cs), end_hhmm=_hhmm(ce),
-            dist_m=int(t["dist_m"] or 0), from_label=prev_label, to_label=next_label,
+            dist_m=int(t["dist_m"] or 0),
+            from_place=from_place,
+            to_place=to_place,
+            from_label=prev_label, to_label=next_label,
+            route_dist_m=t.get("route_dist_m"),
         ))
     card["trips"] = trip_briefs
     card["stay_minutes"] = stay_minutes
@@ -619,10 +795,9 @@ def _fill_card(
     _pack_compact(card)
 
 
-def _stay_label(stay_tuple) -> str:
+def _stay_label(stay_tuple, by_id: dict[str, dict], by_grid: dict[str, dict]) -> str:
     s, _, _ = stay_tuple
-    place = _place_of_stay(s)
-    return _resolve_label(place, place.get("poi") if place else None)
+    return _friendly_label(_place_of_stay(s, by_id, by_grid))
 
 
 def _map_daily_stats(card: FactCard, stat) -> None:
@@ -647,22 +822,42 @@ def _map_daily_stats(card: FactCard, stat) -> None:
 def _fill_full_extras(conn: sqlite3.Connection, card: FactCard, dev: str | None, day: str) -> None:
     """full 模式补齐：全历史 places / coverage / persona。不查 events 之外的非必要数据。"""
     if dev is not None:
-        try:
-            from gacore.langTrack import location_reader as lr
+        from gacore.langTrack import location_reader as lr
 
+        try:
             rows = lr.read_places(conn, device_id=dev, limit=4)
-            card["places"] = [
-                PlaceBrief(
-                    label=r.get("label") or "",
-                    visits=int(r.get("visit_count") or 0),
+            card["places"] = []
+            for r in rows:
+                ref = _place_ref(r)
+                card["places"].append(PlaceBrief(
+                    label=_friendly_label(r),
+                    visits=int(r.get("point_count") or 0),
                     poi=r.get("poi") or "",
                     behavior=r.get("behavior") or "",
                     address=r.get("address") or "",
-                )
-                for r in rows
-            ]
+                    place_id=str(r.get("place_id") or "") or None,
+                    place_name=(ref or {}).get("place_name", ""),
+                    user_tag=(ref or {}).get("user_tag", ""),
+                    name_source=(ref or {}).get("name_source", ""),
+                    poi_fallback=r.get("poi_fallback") or "",
+                    district=r.get("district") or "",
+                    point_count=int(r.get("point_count") or 0),
+                    visit_episodes=int(r.get("visit_episodes") or 0),
+                    stay_ms=int(r.get("stay_ms") or 0),
+                ))
         except Exception:  # noqa: BLE001 - 缺表降级
             card["places"] = []
+        # full 卡透传（Task 6 §3.2 / 人工 tag 冲突；v1/缺表 → None/0）
+        try:
+            card["daily_location_quality"] = lr.read_daily_quality(
+                conn, device_id=dev, day=day
+            )
+        except Exception:  # noqa: BLE001
+            card["daily_location_quality"] = None
+        try:
+            card["tag_conflict_count"] = lr.read_tag_conflict_count(conn, device_id=dev)
+        except Exception:  # noqa: BLE001
+            card["tag_conflict_count"] = 0
     # A① 契约覆盖：非 ok 类型
     coverage: list[dict] = []
     try:
@@ -899,6 +1094,8 @@ def _log_built(card: FactCard, t0: float, outlet: str) -> None:
             midnight_audio_n=card.get("midnight_audio_n"),
             anomaly_kind=anoms[0].get("kind", "") if anoms else "",
             anomaly_poi=anoms[0].get("poi", "") if anoms else "",
+            daily_quality_present=int(card.get("daily_location_quality") is not None),
+            tag_conflict_count=card.get("tag_conflict_count", 0),
             lines=card.get("compact_lines", []),
             compact=card.get("compact", ""),
             compact_chars=card.get("compact_chars", 0),

@@ -47,11 +47,27 @@ def _ts(hh: int, mm: int) -> int:
 
 
 # 字面契约快照（旧 JSON shape；只增不删——删字段/改名在此处即失败）
-STAY_BRIEF_KEYS = {"label", "poi", "start_hhmm", "end_hhmm", "mins"}
-TRIP_BRIEF_KEYS = {"start_hhmm", "end_hhmm", "dist_m", "from_label", "to_label"}
-PLACE_BRIEF_KEYS = {"label", "visits", "poi", "behavior", "address"}
+# Task 7：StayBrief/TripBrief/PlaceBrief/CurrentKnown 增 PlaceRef 载荷，
+# 旧字段 label/from_label/to_label/visits 保留兼容（label=format_place）
+STAY_BRIEF_KEYS = {
+    "label", "poi", "start_hhmm", "end_hhmm", "mins",
+    "place_id", "place_name", "user_tag", "name_source", "poi_fallback",
+    "point_count", "avg_accuracy_m", "behavior", "district",
+}
+TRIP_BRIEF_KEYS = {
+    "start_hhmm", "end_hhmm", "dist_m", "from_label", "to_label",
+    "from_place", "to_place", "route_dist_m",
+}
+PLACE_BRIEF_KEYS = {
+    "label", "visits", "poi", "behavior", "address",
+    "place_id", "place_name", "user_tag", "name_source", "poi_fallback",
+    "district", "point_count", "stay_ms", "visit_episodes",
+}
 ANOMALY_BRIEF_KEYS = {"kind", "poi", "detail"}
-CURRENT_KNOWN_KEYS = {"label", "since_hhmm", "observed_until_hhmm", "poi", "behavior", "district"}
+CURRENT_KNOWN_KEYS = {
+    "label", "since_hhmm", "observed_until_hhmm", "poi", "behavior", "district",
+    "place_id", "place_name", "user_tag", "name_source", "poi_fallback",
+}
 REPORT_PROFILE_TOP_KEYS = {
     "date", "device_id", "generated_at", "screen", "notifications", "sleep",
     "scenes", "outings", "anomalies", "consumption", "rhythm", "persona", "weather",
@@ -235,38 +251,64 @@ class TestFactCardShape:
 class TestFactCardLegacySemantics:
     """旧字段含义在 v1/v2 不变：label 仍来自关联 place，v2 用 place_id 关联。"""
 
-    def test_stay_labels_and_poi(self, sema_db):
-        c = fc.build(conn=sema_db, day=DAY, device_id="dev1", now_ms=NOW_MS, detail="full")
+    def test_stay_labels_and_poi(self, sema_pair):
+        conn, ver = sema_pair
+        c = fc.build(conn=conn, day=DAY, device_id="dev1", now_ms=NOW_MS, detail="full")
         home, work = c["stays"]
-        assert home["label"] == "家" and home["poi"] == "甲小区南门"
-        assert work["label"] == "公司" and work["poi"] == "乙大厦"
+        assert home["label"] == "某某路1号〔家〕" and home["poi"] == "甲小区南门"
+        assert work["label"] == "某某路2号〔公司〕" and work["poi"] == "乙大厦"
         assert home["start_hhmm"] == "00:00" and home["end_hhmm"] == "08:00"
         assert home["mins"] == 480
+        assert home["place_name"] == "某某路1号" and home["name_source"] == "address"
+        assert home["user_tag"] == "家"
+        if ver == "v2":
+            assert home["place_id"] == "pid_home"
+        else:
+            assert home["place_id"] in ("", None)  # v1 无 place_id
 
-    def test_trip_from_to_labels(self, sema_db):
-        c = fc.build(conn=sema_db, day=DAY, device_id="dev1", now_ms=NOW_MS, detail="full")
+    def test_trip_from_to_labels(self, sema_pair):
+        conn, ver = sema_pair
+        c = fc.build(conn=conn, day=DAY, device_id="dev1", now_ms=NOW_MS, detail="full")
         t = c["trips"][0]
-        assert t["from_label"] == "家" and t["to_label"] == "公司"
+        assert t["from_label"] == "某某路1号〔家〕" and t["to_label"] == "某某路2号〔公司〕"
         assert t["dist_m"] == 900
+        assert t["route_dist_m"] is None  # 未落路线距离恒 None
+        if ver == "v2":
+            assert t["from_place"]["place_id"] == "pid_home"
+            assert t["to_place"]["place_id"] == "pid_work"
+        else:
+            assert t["from_place"] is None and t["to_place"] is None  # v1 无 PlaceRef
 
-    def test_current_known_from_place_id_join(self, sema_db):
+    def test_current_known_from_place_id_join(self, sema_pair):
         """current_known 的 label/poi 语义跨版本一致（v2 成员网格不漂移）。"""
-        c = fc.build(conn=sema_db, day=DAY, device_id="dev1", now_ms=NOW_MS, detail="full")
+        conn, ver = sema_pair
+        c = fc.build(conn=conn, day=DAY, device_id="dev1", now_ms=NOW_MS, detail="full")
         ck = c["current_known"]
-        assert ck["label"] == "公司" and ck["poi"] == "乙大厦"
+        assert ck["label"] == "某某路2号〔公司〕" and ck["poi"] == "乙大厦"
+        assert ck["user_tag"] == "公司" and ck["place_name"] == "某某路2号"
+        if ver == "v2":
+            assert ck["place_id"] == "pid_work"
+        else:
+            assert ck["place_id"] in ("", None)
 
     def test_stay_minutes_buckets(self, sema_db):
         c = fc.build(conn=sema_db, day=DAY, device_id="dev1", now_ms=NOW_MS, detail="full")
         assert c["stay_minutes"]["家"] == 480
         assert c["stay_minutes"]["公司"] == 540
 
-    def test_place_brief_visits_present(self, sema_db):
+    def test_place_brief_visits_present(self, sema_pair):
         """旧字段 PlaceBrief.visits 在两版本都存在且为 int（计数语义见 Task 7 扩展）。"""
-        c = fc.build(conn=sema_db, day=DAY, device_id="dev1", now_ms=NOW_MS, detail="full")
+        conn, ver = sema_pair
+        c = fc.build(conn=conn, day=DAY, device_id="dev1", now_ms=NOW_MS, detail="full")
         labels = [p["label"] for p in c["places"]]
-        assert labels == ["家", "公司"]
+        assert labels == ["某某路1号〔家〕", "某某路2号〔公司〕"]
         for p in c["places"]:
             assert isinstance(p["visits"], int)
+        p0 = c["places"][0]
+        assert p0["point_count"] == (100 if ver == "v2" else 30)
+        if ver == "v2":
+            assert p0["place_id"] == "pid_home"
+            assert p0["visit_episodes"] == 2 and p0["stay_ms"] == 61_200_000
 
     def test_compact_rendered_both_versions(self, sema_db):
         c = fc.build(conn=sema_db, day=DAY, device_id="dev1", now_ms=NOW_MS, detail="full")

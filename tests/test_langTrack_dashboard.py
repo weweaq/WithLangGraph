@@ -166,7 +166,7 @@ def test_dashboard_with_stays_but_no_daily_stats():
     html = _render(_make_db(with_stats=False), day="2026-08-18")
     assert "2026-08-18" in html
     assert "今日轨迹" in html
-    assert "家 00:00-08:32" in html
+    assert "XX路1号〔家〕 00:00-08:32" in html
 
 
 def test_dashboard_lists_stays_trips_anomalies():
