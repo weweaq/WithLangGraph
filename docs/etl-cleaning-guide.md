@@ -3,7 +3,9 @@
 > 对应代码：`src/gacore/langTrack/etl.py`
 > 本文档逐条对应代码实现，讲清楚"每一条脏数据从哪来、为什么被清、清了之后数据变成什么样"。
 >
-> **数据基准**：本文所有"当前库"数字均为 2026-08-19 全量重跑结果（events 6360 / 脏数据 77 / sessions 413 / daily_stats 4 / places 14）。历史运行数字单独标注「历史值」。
+> **数据基准**：本文所有"当前库"数字均为 2026-08-19 全量重跑结果（events 6360 / 脏数据 77 / sessions 413 / daily_stats 4 / places 14）。历史运行数字单独标注「历史值」。
+
+> **位置口径（2026-09-03 更新）**：places 计数**由 stays 主导**，不再以「原始点访问次数」为口径。长期空间画像、停留聚合、直达点判断均以 `stays_v2`/`places_v2` 为准（详见 langTrack-tech.md §4.2/§5.5/§6.1）；v1 `places.visit_count` 仅作兼容保留。
 > **数字可信度标注**：`[代码]` 可从源码直接推导；`[实测]` 为真实数据运行结果；`[推断]` 为设计假设。
 
 ---
@@ -245,7 +247,9 @@ Top-N 存 JSON 列（前 10 app / 前 5 通知），report/dashboard 直接读�
 
 ## 8. 常驻点聚类（places）
 
-### 8.1 网格聚类（不用 DBSCAN 的理由）
+### 8.1 网格聚类（不用 DBSCAN 的理由）
+
+> **口径演进（2026-09-03）**：本节 `×87次/×46次` 是**网格聚类输入样本数**（原始定位点计数），**不是** places 语义。旧纪要曾把 `places.visit_count` 当作「原始点访问次数」（如「公司 264 次 / 家 56 次」）——**该口径已废弃**。位置智能起（Task 1-6）places 三计数统一**由 stays 主导**：`places_v2.visit_count`=canonical 停留段数（总和=stays 数）、`stay_ms`=累计停留时长、`point_count`=聚入地点的驻留采样点数；v1 `places.visit_count` 仅作兼容保留。
 
 ```python
 # etl.py:246-265
@@ -269,7 +273,7 @@ for tid, _, _ in top2:
     conn.execute("UPDATE places SET is_primary=1 WHERE id=?", (tid,))
 ```
 
-**要点**：`is_primary=1` 是**只置标记、不覆盖 label**——按访问次数选出 top2 主点，但标签仍由 `place_labels.json` 持久化决定。**主点标记是 ETL 算的，家/公司标签是用户确认的**，两者独立。
+**要点**：`is_primary=1` 是**只置标记、不覆盖 label**——按访问次数（注：此处 visit_count 为 v1 旧口径=原始点访问次数，位置智能起以 stays 主导、该字段仅兼容保留）选出 top2 主点，但标签仍由 `place_labels.json` 持久化决定。**主点标记是 ETL 算的，家/公司标签是用户确认的**，两者独立。
 
 ```mermaid
 flowchart TB
@@ -277,7 +281,7 @@ flowchart TB
     E[ETL build_places] -->|upsert 不覆盖| P[places.label]
     E -->|visit_count top2| M[is_primary=1 标记]
     CFG -->|apply_labels 恢复| P
-    P --> R[report: 公司264次/家156次]
+    P --> R["report: 公司264次/家156次（历史口径=原始点访问次数，已废弃；v2 起由 stays 主导）"]
 ```
 
 ---
@@ -332,4 +336,5 @@ sequenceDiagram
 
 | 日期 | 内容 |
 |---|---|
-| 2026-08-19 | 按 review 修订：统一数字基准(6360/77/413/4/14)、修时间戳年份(1.7e12=2023)、拆全局/会话清洗路径、补 is_primary/通知过滤/purge 拆分、删重复包名(43→42)、速查表提前+来源标注、阈值标注 TODO |
+| 2026-08-19 | 按 review 修订：统一数字基准(6360/77/413/4/14)、修时间戳年份(1.7e12=2023)、拆全局/会话清洗路径、补 is_primary/通知过滤/purge 拆分、删重复包名(43→42)、速查表提前+来源标注、阈值标注 TODO |
+| 2026-09-03 | 删除「places=原始点访问次数」旧口径（§8.1/§8.2 标注废弃），写明 places 计数由 stays 主导（visit_count=停留段数、stay_ms=累计时长），头部补位置口径声明 |

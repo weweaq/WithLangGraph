@@ -47,10 +47,13 @@ AIGC:
 > 本文是 langTrack 服务端的**代码级技术参考**，所有字段/接口/阈值均对照源码（标注 `文件:行号`）。
 > 配套文档：数据链路总览与工作日志见 [`langTrack-roadmap.md`](langTrack-roadmap.md)；ETL 清洗规则细节见 [`etl-cleaning-guide.md`](etl-cleaning-guide.md)。
 > 生成日期：2026-08-22，基于 ETL_VERSION `1.0.0`（`etl.py:159`）。
+> 2026-09-03 更新：位置智能增强 Task 1-11 落地后同步——位置事实 schema 增加 v2（shadow v2 / 迁移审计表）、双坐标边界（`to_amap_coord` 全高德入口统一转换 + `daily_location_quality` 坐标质量观测）、PlaceRef/FactCard 消费侧契约、mermaid 数据流分 v1/v2 双轨。
 
 ---
 
 ## 1. 端到端数据流总览
+
+> 位置事实自 Task 1-6 起改为 **v1 / v2 双轨**：v1 为既有 per-grid 口径（向后兼容）；v2 为 stays 主导的 canonical 地点口径（shadow 只读验证，待 `--location-activate` 切换）。二者见 §4.4 与 §6。
 
 ```mermaid
 flowchart LR
@@ -69,6 +72,7 @@ flowchart LR
 
     subgraph 加工层["加工层 etl.py（全量/增量重建）"]
         D["事实表 12 张<br/>sessions/daily_stats/stays/trips/places/<br/>anomalies/route_grids/grid_pois/<br/>contract_coverage/etl_runs/dirty_events/etl_state"]
+        V["位置 v2 影子区（shadow，只读）<br/>places_v2/place_cells_v2/stays_v2/...<br/>+ 迁移审计表"]
     end
 
     subgraph 出口层["出口层"]
@@ -80,6 +84,7 @@ flowchart LR
 
     A -->|批量 JSON 上报| B --> C
     C -->|"① server 周期线程(默认30min)<br/>② CLI python -m ...etl<br/>③ 工具调用前 _ensure_etl"| D
+    D -->|"location-shadow / prepare<br/>（Shadow 只读验证）"| V
     D --> F & G & T
     D <-->|增量外呼/回写语义列| X
 ```
@@ -293,6 +298,28 @@ schema 校验不过的事件落此处（type/raw/reason），**不进 events 主
 
 `route_grids` PK`(device_id,day,grid_lat,grid_lon)`：trips.polyline 网格量化后的高频经过网格（纯本地零配额）；`grid_pois` PK`(grid_lat,grid_lon)`：每网格一条周边 POI 缓存（高德 around 约 100 次/日，低频克制）。
 
+#### shadow v2 全套表（位置智能 Task 1-6，`location_migration.py:105` `SCHEMA_V2`）
+
+仅 `--location-shadow` / `--location-prepare` 时在**只读影子区**构建（`*_v2` 表），影子运行不触碰 v1 事实表；`--location-activate` 校验后才接管正式查询（此前 v1 仍是对外口径）。
+
+| 表 | 用途 |
+|---|---|
+| stays_v2 / trips_v2 | canonical 停驻/移动段（location_migration.py:148/175，device+时间窗+cluster+gap 组键；起止/中心/包围盒/stays_num/avg_radius 等） |
+| places_v2 | canonical 常驻点（location_migration.py:106）：`place_id = sha1(device+join(sorted(member_grids)))[:16]`；**v2 三计数**：`point_count`=聚入地点的驻留采样点数、`visit_count`=canonical 停留段数（总和=stays 数）、`stay_ms`=累计停留时长 |
+| place_cells_v2 | 地点 ↔ 代表网格映射（location_migration.py:139，place_id ↔ grid_key） |
+| place_tag_conflicts_v2 | 旧标签合并冲突登记（location_migration.py:202，`merge_conflicting_tags` 等，标签置未知待人工处置） |
+| anomalies_v2 / route_grids_v2 | anomalies_v2 v2 异常叙事（location_migration.py:213，打破规律的新地点）；**路线变化复用 anomalies(kind=`route_change`)**，非独立表；route_grids_v2 为通勤网格（location_migration.py:232） |
+| location_place_mapping / location_migration_issues / location_migration_metrics | **迁移审计三表**（location_migration.py:263/276/289）：旧 place→新 place 映射（`match_reason`/`jaccard`/`distance_m`）、未映射标签 open issue（`unmapped_tag`）、迁移统计（tag_migrated/tag_conflicts/geocode_reused/geocode_invalidated 等）；影子运行按模式构建 `shadow_*` 前缀只读对比表（派生自 SCHEMA_V2，location_migration.py:568-580） |
+| etl_runs | v2 影子运行血缘写 v1 `etl_runs` 表（mode=`location_v2_full`，location_migration.py:843-847/1066-1068）；无独立 etl_runs_v2 表 |
+
+#### daily_location_quality — 每日定位质量观测（Task 6，引入 commit 952cda9；Task 7 起纳入 FactCard 契约字段）
+
+`day+device_id` 唯一（11 行实测结果见 Task 10 验收）：`points_total / points_valid / accuracy_known / accuracy_le_50 / accuracy_51_150 / accuracy_gt_150 / observed_half_hour_bins / median_interval_sec / providers_json`（当日 GPS/network 计数分布）。
+
+#### trips 坐标制双列（双坐标边界）
+
+`endpoint_coord_system`（WGS84|GCJ02|unknown，起点/终点实测坐标系）+ `polyline_coord_system`（高德 GCJ02，polyline 所属坐标系）。**约定：落库存实测原始坐标系，高德外呼前统一经 `to_amap_coord(lat,lon,coord_system)` 转为 GCJ02 再调用**（边界见 §6.1）。
+
 ### 4.3 表关系
 
 ```mermaid
@@ -303,10 +330,17 @@ erDiagram
     devices ||--o{ stays : "device_id"
     devices ||--o{ trips : "device_id"
     devices ||--o{ places : "device_id"
+    devices ||--o{ daily_location_quality : "device_id"
     places ||--o{ stays : "grid_key(逻辑外键)"
     trips }o--|| places : "起点/终点邻近网格"
     events ||--o{ contract_coverage : "type 对照契约"
     etl_state ||..|| devices : "per-device 水位线"
+    devices ||--o{ places_v2 : "device_id (shadow,只读)"
+    places_v2 ||--o{ place_cells_v2 : "place_id"
+    places_v2 ||--o{ stays_v2 : "place_id"
+    places_v2 ||--o{ place_tag_conflicts_v2 : "new_place_id"
+    places  "迁移映射" ||--o{ location_place_mapping : "old_place_id→new_place_id"
+    location_migration_metrics ||..o{ location_migration_issues : "run 审计"
 ```
 
 ---
@@ -397,9 +431,27 @@ flowchart LR
 
 核心字段：`day / available / has_facts / data_as_of / etl_watermark / current_known / stays / trips / stay_minutes / places / anomalies / sleep_signal / top_apps / notification_count / persona / compact`。降级原则：构建失败只记日志返回空卡，不抛异常、不挡对话；无 daily_stats 但已有位置时 `available=False, has_facts=True` 仍产轨迹；多设备未指定 device 时仅允许唯一设备，多设备明确降级不猜。注入路径（I2）不扫 events、不跑 ETL。
 
+### 5.5 PlaceRef 与位置消费契约（Task 3-6，事实层语义的统一出口）
+
+> 位置语义（地点名/标签/粒度）在 `location_facts.py` 收敛，`fact_card.py` 以 TypedDict 直接引用 `PlaceRef`；report/persona/工具统一走该契约，**禁止在出口再次拼 SQL 重算地名**（Task 10 证据边界：report/persona 只消费 `fact_card` / CleanPlace 载荷，不重复构造）。
+
+**`PlaceRef`（`location_facts.py:643-660`）**：
+
+| 字段 | 含义 |
+|---|---|
+| place_id | canonical 地点 ID（v2 shadow 前为 v1 place 网格生成的稳定 ID） |
+| grid_key | 代表网格 |
+| place_name / name_source | 显示名 / 来源（`poi\|poi_fallback\|address\|district\|unknown`） |
+| display_granularity / name_confidence | 显示粒度（venue/address/district/...）/ 置信度（仅选粒度，非到访置信） |
+| user_tag | 家 / 公司 / `""`（= `NULLIF(label,'未知')`） |
+| poi / poi_fallback / address / district / township / business_area / parent_poi / behavior | regeo 语义回填字段 |
+| name_evidence | 地名证据（供审计） |
+
+**FactCard 位置字段（`fact_card.py:52-166`）**：`current_known`、`places`（PlaceBrief：`place_id/place_name/user_tag/name_source/point_count/visit_episodes/stay_ms`，旧字段 `visits/poi/behavior/address` 标 deprecated 仅兼容）、`stays`（StayBrief：PlaceRef 载荷 + `point_count/avg_accuracy_m`）、`trips`（TripBrief：`from_place/to_place=PlaceRef|None`，保留 `from_label/to_label`）、`anomalies`（kind/poi/detail）、`daily_location_quality`（Task 7 观测）、`tag_conflict_count`、`spatial_profile`（Task 8 `places_v2` 长期空间画像，7/30/90 客观聚合，仅 full 卡携带）。`label = format_place(place_name, user_tag)` 展示。
+
 ---
 
-## 6. ETL 流程详解（`etl.run`, etl.py:1204-1409）
+## 6. ETL 流程详解（`etl.run`, etl.py:2332-2617）
 
 ```mermaid
 flowchart TD
@@ -420,13 +472,29 @@ flowchart TD
     F1 --> F2["encode_belt_pois沿途POI<br/>单次上限 _POI_MAX_PER_RUN"]
     F2 --> G1["build_contract_coverage → contract_coverage"]
     G1 --> G2["_stamp_fact_tables(B8 打标)<br/>+_update_etl_state(写水位线)"]
+    G2 --> H{"位置 v2 模式?"}
+    H -->|--location-shadow / prepare| H1["构建 shadow v2（只读影子区）<br/>places_v2/stays_v2/trips_v2/...<br/>+ mapping/issues/metrics 审计"]
+    H1 --> H2["prepare: 生成 place_labels.json.v3.pending<br/>+ place_labels.json.v2_backup，待人工确认"]
+    H2 --> H3["--location-activate: 校验 → 切换正式查询<br/>（本 Task 仅 shadow/prepare，未 activate）"]
+    H -->|无/仅 v1| G3["保持 v1 对外口径"]
 ```
 
 要点：
 - **失败隔离**：geocode/补路/POI 任一外呼失败只打日志跳过，不影响事实表重建（各步 try/except SystemExit/Exception）。
 - **places 是唯一不完全重建的表**：UPSERT 累计统计 + label 优先级「已确认 > 别名 > 未知」。
-- CLI：`python -m gacore.langTrack.etl [--db PATH] [--purge] [--no-geocode] [--no-route] [--no-poi] [--incremental]`（etl.py:1412-1423）；`--purge` 先清理异常事件再重建。
+- **v2 不碰 v1**：shadow/prepare 只写 `*_v2` + 审计表，v1 事实表与 `data/place_labels.json` 原样保留；activate 前对外仍是 v1（回家/公司标签不丢的保证）。
+- CLI：`python -m gacore.langTrack.etl [--db PATH] [--purge] [--no-geocode] [--no-route] [--no-poi] [--incremental] [--location-shadow] [--location-prepare] [--location-activate] [--location-rollback] [--location-recover]`（参数定义 etl.py:2622-2645）；`--purge` 先清理异常事件再重建；`--location-rollback`/`--location-recover` 为 v2 迁移回滚/恢复（Task 4，etl.py:2642/2645）。
 - 三种触发：server 周期线程（§2.1）/ 手动 CLI / `langTrack_stats` 调用前 `_ensure_etl()`。
+
+### 6.1 双坐标边界（`location_facts.py:778-818`）
+
+| 坐标系 | 用途 |
+|---|---|
+| WGS84 | 客户端 GPS 原始上报（网络定位多数已带国内偏移，标 `unknown` 原样放行） |
+| GCJ02 | 高德系（regeo / 路径规划 / POI）唯一可接受坐标系；`trips.polyline` 落库即 GCJ02 |
+| unknown | 无法判定的定位，`to_amap_coord` 原样透传 |
+
+**边界约定**：所有高德外呼入口必须经 `to_amap_coord(lat, lon, coord_system)`（`location_facts.py:793-818`）——`unknown` 原样放行、WGS84 走 `wgs84_to_gcj02` 近似转换（`location_facts.py:778`），**禁止任何出口自行再转一次**；落库坐标以实测为主原样保存，避免双重偏移。
 
 ---
 
@@ -450,14 +518,24 @@ flowchart TD
 $env:PYTHONPATH="src"
 & "D:\softwares\miniconda\envs\py12\python.exe" -m pytest tests/ -k langTrack -q
 
-# ETL / 报告 / 地理编码 / 标签确认
+# Task 11 验收的 12 个 langTrack 测试文件（.venv 亦可通过：273 passed）
+$env:PYTHONPATH="src"
+python -m pytest tests/test_langTrack_location_migration.py tests/test_langTrack_location_facts.py `
+  tests/test_langTrack_fact_card.py tests/test_langTrack_dashboard.py tests/test_langTrack_etl_location.py `
+  tests/test_langTrack_geocode.py tests/test_langTrack_routes.py tests/test_langTrack_label_places.py `
+  tests/test_langTrack_spatial_profile.py tests/test_langTrack_report_evidence.py tests/test_langTrack_persona.py `
+  tests/test_tools_langTrack.py -q
+
+# ETL / 报告 / 地理编码 / 标签确认 / 位置 v2
 python -m gacore.langTrack.etl --purge
 python -m gacore.langTrack.report --day 2026-08-22
 python -m gacore.langTrack.geocode
 python -m gacore.langTrack.label_places
+python -m gacore.langTrack.etl --location-shadow   # 只读影子 v2
+python -m gacore.langTrack.etl --location-prepare  # 生成标签 pending + 审计（不 activate）
 ```
 
-测试覆盖锚点：storage 幂等事务（test_langTrack_storage）、server 端点（test_langTrack_server）、契约覆盖（test_langTrack_contract，3 例）、persona 五维+降级（test_langTrack_persona，6 例）、工具出口（test_tools_langTrack）。
+测试覆盖锚点：storage 幂等事务（test_langTrack_storage）、server 端点（test_langTrack_server）、契约覆盖（test_langTrack_contract，3 例）、persona 五维+降级（test_langTrack_persona，6 例）、工具出口（test_tools_langTrack）；Task 1-10 验收另覆盖 location migration / facts / fact_card / dashboard / etl_location / geocode / routes / label_places / spatial_profile / report_evidence。
 
 
 ---

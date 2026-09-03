@@ -2199,3 +2199,51 @@ subagent 独立复审提交 c97d2d5 + 工作区索引修复：无 P1 级正确�
 - [x] Task 6：坐标质量与完整高德坐标边界（daily_location_quality + to_amap_coord 全入口 + trips 坐标制两列 + build_trips 参数化 + 44 用例，含 review-loop 两轮回归 7 项）。
 - [x] Task 6 终审（第三轮 subagent，对 952cda9/3e84ba6/6e35769 三提交整体复核）：**PASS**——两轮 review 发现的 P1×4/P2×3/P3×4 全部修复且带回归；langTrack 组 0 failed；ruff 与父提交基线逐规则比对零新增（26 条存量 BLE001/F841/I001/RUF059/S112/RUF100 完全一致）；schema 双路径（单条 execute / executescript）实测有效；DDL 后 in_transaction 保持 True、rollback 丢行保结构；增量 DELETE 仅命中受影响天。无遗留 P1/P2/P3。遗留观察（非 Task 6 引入）：存量 lint 建议后续统一治理；test_cli.py 依赖 pygraphviz 本机未装。
 - [ ] Task 7：迁移 FactCard 与 tool 兼容契约。
+
+## 2026-09-03：位置智能增强 Task 7-10（补录，git 历史 + 当日日志回溯）
+
+- **Task 7：迁移 FactCard 与 tool 兼容契约**。FactCard TypedDict 契约收敛（places/stays/trips/current_known/anomalies/daily_location_quality/tag_conflict_count/spatial_profile），旧字段 deprecated 兼容保留；工具出口、report/persona 统一消费该契约；contract_coverage 对照 18 条。测试：`test_langTrack_fact_card.py` 56 passed、`test_tools_langTrack.py` 通过。
+- **Task 8：spatial_profile 长期空间画像**。fact_card 增 `spatial_profile`（places_v2 客观聚合的 7/30/90 家/公司/通勤/节奏），仅 full 卡携带，persona/report 只读消费。测试：`test_langTrack_spatial_profile.py` 通过。
+- **Task 9：dashboard 关键指标展示与迁移审查**（提交 `da1da8f` feat + `1714818` test）。dashboard 事实审查块（关键指标 + 迁移审查）。测试：`test_langTrack_dashboard.py` 通过。
+- **Task 10：统一 report/persona 证据边界**（提交 `b417736` feat + `3000b5f` test）。report.py 新增 `_place_safe_text/_place_safe_from_stay`（不输出坐标/grid_key/payload、无动机叙事）、入口数据水位；persona 读 SpatialProfile 的 median/IQR/Evidence、`home_days/work_days` 独立统计、`regular/commute_stable` 客观判定；etl new_place 分档（v2"停留 N 段"/v1"记录到 N 点"）。验证：13 → 209 → 全量 langTrack 416 passed；审核 P1-1/P1-2/P1-3/P2-1/P2-2/P2-3 逐项闭合（详见 `memory/daily/2026-09-03.md`）。
+
+## 2026-09-03：位置智能增强 Task 11（文档、真实库迁移验证与总回归）
+
+### 背景
+Task 11：三份文档同步 + 真实库**备份后**全量 ETL（v1 + v2 shadow/prepare）并记录 7 类迁移统计 + codegraph sync + 12 个 langTrack pytest + py12 回归 context/middleware/proactive + ruff + 维护日志。不提交 git，禁用 daily-report-v2 相关文件。
+
+### 文档修改
+- `docs/langTrack-tech.md`：头部加 2026-09-03 更新说明；§1 端到端 mermaid 增 v2 影子区节点与 shadow/prepare 箭头；§4.2 增「shadow v2 全套表 / daily_location_quality / trips 坐标制双列」小节；§4.3 erDiagram 增 v2 实体与 daily_location_quality、location_place_mapping 关系；新增 **§5.5 PlaceRef 与位置消费契约**；§6 ETL mermaid 增 v2 shadow/prepare/activate 分支与 CLI 三项；新增 **§6.1 双坐标边界**；§8 补 12 个 pytest 清单与 v2 命令。
+- `docs/etl-cleaning-guide.md`：头部补「位置口径（2026-09-03）：places 由 stays 主导」；§8.1 新增口径演进说明（删除「places=原始点访问次数」旧口径，标注废弃）；§8.2 要点与 mermaid 标注 visit_count 历史口径已废弃；修订记录追加 2026-09-03 行。
+- `docs/langTrack-roadmap.md`：本记录（含 Task 7-10 补录）。
+
+### 真实库迁移验证（备份后全量 ETL）
+- **基线（备份后、ETL 前）**：`user_version=0`、devices=1、events **44594** / sessions **2602** / daily_stats **17** / daily_location_quality **11** / stays **15** / trips **9** / places **55** / anomalies **4** / route_grids **245** / grid_pois **221**；`data/place_labels.json` 4 条（公司×1、家×3）。
+- **备份**：`data/backup/langTrack.task11_bak_20260903_132050.db`（206,008,320 字节）。
+- **v1 全量 ETL**：sessions 2602 / daily_stats 17 / daily_location_quality 11 / stays 15 / trips 9 / places 55 幂等重跑；家/公司候选 8、恢复标签 4；anomalies 2 + route_change 2；contract_coverage 18；增量缓存命中**零外呼**。
+- **shadow v2（只读影子区）**：places_v2 5 / place_cells_v2 5 / stays_v2 15 / trips_v2 9。
+- **prepare（迁移审计，7 类统计）**：
+  - **places 总数**：v1=55，v2 shadow=5；
+  - **三计数分布**：`point_count` min=0 / max=366 / sum=726；`visit_count` sum=**15**（=stays 15，语义一致）；`stay_ms` sum=664,338,696ms≈**184.5h**；
+  - **orphan stay**=0（void stay 无 orphan）；**旧新地点映射**：mapping 55（matched 11 / unmatched 44）；
+  - **tag migrated=2 / conflict=3**（家×2、公司×1 合并入新点 `9c71...`，`merge_conflicting_tags`）/ **issues=2**（`unmapped_tag`：`31.991,118.782`、`31.992,118.782` 两处「家」无对应 v2 place，open）；
+  - **geocode 待重跑=3**（`geocode_invalidated=3`、`reused=0`，中心偏移>50m 失效）；
+  - **provider/accuracy 分布**（daily_location_quality 11 行）：providers_json 聚合 **gps 304 / network 592**（合计 896）；accuracy **≤50m 859 / 51-150m 26 / >150m 11**（known=valid=total=896）；
+  - **家/公司 tag**：v1 侧保持（place_labels 恢复，v1_places 标签 公司 4 / 家 3 / 未知 48）；v2 shadow 仅 1 点带标签「公司」（prepare 未 apply，`tag_migrated=2`），两处「家」待人工映射；**未 activate**，生产口径仍为 v1，标签不丢。
+
+### codegraph sync
+- 项目根执行成功：**40 changed files / 1626 nodes**。
+
+### 测试与回归（维护测试日志）
+- **12 个 langTrack pytest**（`.venv` Py3.13，`PYTHONPATH=src`）：**273 passed in 10.86s**。
+- **py12 回归**（`D:\softwares\miniconda\envs\py12\python.exe`）`tests/test_context.py` + `tests/test_middleware.py` + `tests/test_proactive*.py`：**212 passed, 2 warnings in 73.92s**，无收集失败（Py3.13 缺 langchain 的问题在 py12 规避）。
+
+### ruff
+- 本轮改动均为 markdown 文档，Python 侧零改动（`git status` 仅 docs 三份 + 存量 daily-report-v2 未动）。`ruff check src/gacore/langTrack tests/test_langTrack_*.py tests/test_tools_langTrack.py`：63 项全部为存量问题（geocode/spatial_profile/persona/report 的 F841·E702·F401 + 测试文件 E402 等），与 git 基线逐项一致**无新增**；另 1 条存量 `# noqa` 格式 warning（`report.py:837`）。
+
+### 待办更新
+- [x] Task 7：迁移 FactCard 与 tool 兼容契约（补录）。
+- [x] Task 8：spatial_profile 长期空间画像（补录）。
+- [x] Task 9：dashboard 关键指标与迁移审查（补录）。
+- [x] Task 10：report/persona 证据边界统一（补录）。
+- [x] Task 11：文档、真实库迁移验证与总回归（本记录）。**未 commit**；未改动/提交任何 daily-report-v2 相关文件（scheduler.py / daily_info_pack.py / schedule.json / test_scheduler.py 等原样保留）。
