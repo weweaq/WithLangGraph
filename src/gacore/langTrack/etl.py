@@ -1323,8 +1323,15 @@ def detect_anomalies(conn: sqlite3.Connection, lookback_days: int = 7) -> int:
         n_points = r["point_count"] if v2 else r["visit_count"]
         if r["first_seen"] and r["first_seen"] >= now_ms - lookback_days * 86400000 and n_points <= 3:
             day = datetime.datetime.fromtimestamp(r["first_seen"] / 1000, tz=_TZ_CST).strftime("%Y-%m-%d")
-            name = r["poi"] or r["poi_fallback"] or r["grid_key"]
-            detail = f"首次到访新地点：{name}（访问 {r['visit_count']} 次）"
+            name = r["poi"] or r["poi_fallback"] or "未知地点"  # 不输出坐标网格
+            # Task 10 证据边界：detail 不写动机式"首次到访"，且口径按版本分档：
+            # v2 用 visit_count（即 stay 段数 / visit_episodes 口径）输出"停留 N 段"；
+            # v1 的 visit_count 与 point_count 同源（原始定位点数），没有段数概念，
+            # 只能如实写"记录到 N 点"，严禁把点数伪称成段数。
+            if v2:
+                detail = f"新地点停留：{name}（停留 {int(r['visit_count'])} 段）"
+            else:
+                detail = f"新地点停留：{name}（记录到 {int(r['visit_count'])} 点）"
             if v2:
                 rows.append((day, "new_place", r["device_id"], r["place_id"], r["grid_key"], name, detail, r["first_seen"]))
             else:

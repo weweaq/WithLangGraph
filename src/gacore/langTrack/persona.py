@@ -27,6 +27,7 @@ from typing import Any
 
 
 _CATEGORIES_FILE = Path(__file__).resolve().parents[3] / "data" / "app_categories.json"
+_TZ_CST = datetime.timezone(datetime.timedelta(hours=8))
 
 
 
@@ -518,25 +519,58 @@ def _build(conn: sqlite3.Connection, device_id: str | None, days: int) -> dict[s
 
 
     # ---- 4. 生活规律（routine）---- 位置事实经 location_reader 双读层（v1/v2 兼容）
+
+    # ---- deprecated 计数口径（仅缺 SpatialProfile 骨架时降级）----
     try:
         from gacore.langTrack import location_reader as lr
         all_stays = lr.read_stays(conn, device_id=device_id, with_place=True)
         home = [(s["start_ts"],) for s in all_stays if s["place_label"] == "家"]
         work = [(s["start_ts"],) for s in all_stays if s["place_label"] == "公司"]
     except Exception:  # noqa: BLE001 缺表降级：规律维度退化为空
-        home, work = [], []
-    work_start = _avg_hhmm(work)
-
-    home_n, work_n = len(home), len(work)
-
-    regular = home_n >= 3 and work_n >= 3
+        all_stays, home, work = [], [], []
 
     try:
         from gacore.langTrack import location_reader as lr
-        trips = [(t["start_ts"],) for t in lr.read_trips(conn, device_id=device_id, day_from=min_day)]
+        trips_legacy = [(t["start_ts"],) for t in lr.read_trips(conn, device_id=device_id, day_from=min_day)]
     except Exception:  # noqa: BLE001 缺表降级：通勤稳定性退化为 False
-        trips = []
-    commute_stable = len(trips) >= 3
+        trips_legacy = []
+
+    # deprecated：旧口径以「家/公司停留条数」「trip 数」直接推断「作息规律/通勤稳定」，
+    # 证据强度不足（trip 数量≠通勤稳定，停留条数≠工作日节奏）。Task 10 起改读
+    # SpatialProfile 的 median/IQR/Evidence，以下字段仅在无 spatial 骨架时回退借用。
+    home_n_legacy, work_n_legacy = len(home), len(work)
+    # P2-2：home_days/work_days 分别按"家/公司出现的不同本地日期数"独立统计，
+    # 不再把合并口径 anchor_days 同时复制给两个字段（两个字段同为一个合并值，语义失真）。
+    # 独立无样本时回退 legacy（历史停留条数，仅作兼容兜底）。
+    def _local_day(ts_ms: int) -> str:
+        return datetime.datetime.fromtimestamp(ts_ms / 1000, tz=_TZ_CST).strftime("%Y-%m-%d")
+
+    home_n = len({_local_day(s["start_ts"]) for s in all_stays
+                  if s["place_label"] == "家" and s.get("start_ts")}) or home_n_legacy
+    work_n = len({_local_day(s["start_ts"]) for s in all_stays
+                  if s["place_label"] == "公司" and s.get("start_ts")}) or work_n_legacy
+    commute_stable_legacy = len(trips_legacy) >= 3
+    work_start_legacy = _avg_hhmm(work)
+
+    # ---- Task 10：通勤/节奏改读 SpatialProfile 客观聚合（median/IQR/Evidence）----
+    sp = {}
+    try:
+        from gacore.langTrack import spatial_profile as sprofile
+        sp = sprofile.build_spatial_profile(
+            conn, device_id=device_id, as_of_day=rows[0][0],
+        ) or {}
+    except Exception:  # noqa: BLE001 缺表/降级：spatial 骨架为空，不回退旧口径之外
+        sp = {}
+    _cp = sp.get("commute_profile") or {}
+    _hr = sp.get("home_work_rhythm") or {}
+    _cp_ev = _cp.get("evidence") or {}
+    _hr_ev = _hr.get("evidence") or {}
+
+    # 证据边界：有客观样本才算「规律/稳定」。anchor_days = 有家或公司锚点的有效天数；
+    # valid_days = 有效家↔公司往返样本天数。不凭 trip 条数直接断言“通勤稳定”。
+    regular = bool(_hr) and int(_hr.get("anchor_days") or 0) >= 3
+    commute_stable = bool(_cp) and int(_cp.get("valid_days") or 0) >= 3
+    work_start = (_cp.get("depart_hhmm_median") or work_start_legacy)
 
     note = []
 
@@ -550,6 +584,7 @@ def _build(conn: sqlite3.Connection, device_id: str | None, days: int) -> dict[s
 
     result["routine"] = {
 
+        # deprecated：以下常规键为兼容旧消费者保留；证据来源已切换到 SpatialProfile。
         "regular": regular,
 
         "work_start": work_start,
@@ -561,6 +596,20 @@ def _build(conn: sqlite3.Connection, device_id: str | None, days: int) -> dict[s
         "work_days": work_n,
 
         "note": "；".join(note) if note else "作息数据不足",
+
+        # Task 10：通勤/节奏证据边界——附 SpatialProfile 客观聚合（median/IQR/Evidence）。
+        # 通勤稳定性/作息规律只由下列证据判定，不直接由 trip 数量或停留条数断言。
+        "commute_evidence": {
+            "depart_median": _cp.get("depart_hhmm_median"),
+            "depart_iqr": _cp.get("depart_hhmm_iqr"),
+            "duration_human": _cp.get("duration_human"),
+            "valid_days": _cp.get("valid_days"),
+            "weekday_valid_days": _cp.get("weekday_valid_days"),
+            "endpoint_dist_m": _cp.get("endpoint_dist_m"),
+            "evidence": _cp_ev,
+        },
+
+        "home_work_rhythm": _hr,  # 含 weekday/weekend median/IQR/anchor_days/evidence
 
     }
 

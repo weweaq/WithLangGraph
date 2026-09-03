@@ -1,7 +1,5 @@
 """langTrack 分析报告：基于事实表生成"今天发生了什么"的数字生活画像与决策建议。
 
-
-
 用法：
 
     python -m gacore.langTrack.report            # 今日
@@ -14,8 +12,6 @@
 
 设备语义（Task 5d）：多设备库当日有 >=2 台设备数据时，必须 --device 显式
 选择一台，报告禁止跨设备合并画像；单设备自动采用唯一设备。
-
-
 
 输出分四块（对应修订文档 R6-P2）：
 
@@ -31,8 +27,6 @@
 
 from __future__ import annotations
 
-
-
 import argparse
 
 import datetime
@@ -46,17 +40,15 @@ import sys
 from collections import defaultdict
 
 from pathlib import Path
+from gacore.langTrack.location_facts import format_place, resolve_place_name, user_tag_of
 from gacore.langTrack.location_reader import table_columns
 from gacore.langTrack.persona import build as build_persona
 
-
 _TZ_CST = datetime.timezone(datetime.timedelta(hours=8))
-
 
 def now_cst() -> datetime.datetime:
     """当前东八区时间（显式 +8，不依赖服务器本地时区）。"""
     return datetime.datetime.now(tz=_TZ_CST)
-
 
 DB_PATH = Path(__file__).resolve().parents[3] / "data" / "langTrack.db"
 def fmt_dur(ms: int) -> str:
@@ -66,10 +58,6 @@ def fmt_dur(ms: int) -> str:
     m = rem // 60
 
     return f"{h}小时{m}分" if h else f"{m}分钟"
-
-
-
-
 
 # P1-4 时段划分（本地时间）：名称 / 起时 / 止时
 
@@ -81,10 +69,6 @@ _SEGMENTS = [
 
 ]
 
-
-
-
-
 def _seg_of(hour: int) -> str:
 
     for name, a, b in _SEGMENTS:
@@ -95,10 +79,8 @@ def _seg_of(hour: int) -> str:
 
     return "深夜"
 
-
 class MultiDeviceError(RuntimeError):
     """多设备库未选择设备：report 禁止跨设备合并画像（Task 5d）。"""
-
 
 def devices_of_day(conn: sqlite3.Connection, day: str) -> list[str]:
     """当日有数据的设备（daily_stats / sessions / stays / anomalies 并集，含最小 schema 容错）。"""
@@ -113,7 +95,6 @@ def devices_of_day(conn: sqlite3.Connection, day: str) -> list[str]:
         except sqlite3.OperationalError:
             continue
     return sorted(devs)
-
 
 def resolve_report_device(
     conn: sqlite3.Connection, day: str, device_id: str | None
@@ -133,7 +114,6 @@ def resolve_report_device(
         )
     return devs[0] if devs else None
 
-
 def _dev_bind(device_id: str | None) -> tuple[str, list]:
     """(SQL 片段, 参数) 成对返回，杜绝拼接与参数列表不同步：
 
@@ -142,10 +122,6 @@ def _dev_bind(device_id: str | None) -> tuple[str, list]:
     if device_id is None:
         return "", []
     return " AND device_id=?", [device_id]
-
-
-
-
 
 def _fusion(conn: sqlite3.Connection, day: str, device_id: str | None = None) -> None:
 
@@ -175,8 +151,6 @@ def _fusion(conn: sqlite3.Connection, day: str, device_id: str | None = None) ->
 
         return
 
-
-
     per_seg_screen: dict[str, int] = defaultdict(int)
 
     per_seg_app: dict[str, list] = defaultdict(list)
@@ -199,8 +173,8 @@ def _fusion(conn: sqlite3.Connection, day: str, device_id: str | None = None) ->
 
         e_sec = st["end_ts"] / 1000
 
-        # stay 行内嵌关联 place（v2 按 place_id JOIN）
-        name = st["place_poi"] or st["place_poi_fallback"] or st["grid_key"]
+        # Task 10：统一 PlaceRef 安全文案（不输出坐标、grid_key）
+        name = _place_safe_from_stay(st)
 
         lbl = st["place_label"] or "未知"
 
@@ -217,8 +191,6 @@ def _fusion(conn: sqlite3.Connection, day: str, device_id: str | None = None) ->
                     (max(s_sec, seg_start), min(e_sec, seg_end), name, lbl)
 
                 )
-
-
 
     for name, a, b in _SEGMENTS:
 
@@ -247,8 +219,6 @@ def _fusion(conn: sqlite3.Connection, day: str, device_id: str | None = None) ->
         else:
 
             print(f"  {a:02d}:00-{b:02d}:00 {name}  {loc or '—'}")
-
-
 
     # 叙事句：比较白天(5-18)在家与在公司/外出的屏幕使用，支撑"宅家刷手机"类描述
 
@@ -284,7 +254,7 @@ def _fusion(conn: sqlite3.Connection, day: str, device_id: str | None = None) ->
 
         main_app = tops[0][0] if tops else "手机"
 
-        print(f"  → 叙事：白天宅家（{fmt_dur(home_ms)}）为主，屏幕共 {fmt_dur(day_screen)}，主要打发时间的是 {main_app}")
+        print(f"  → 叙事：白天宅家（{fmt_dur(home_ms)}）为主，屏幕共 {fmt_dur(day_screen)}，屏幕上用时最长的是 {main_app}")
 
     elif day_screen > 0 and work_ms > home_ms:
 
@@ -296,21 +266,15 @@ def _fusion(conn: sqlite3.Connection, day: str, device_id: str | None = None) ->
 
         )
 
-        print(f"  → 叙事：白天主要在公司（{fmt_dur(work_ms)}），屏幕共 {fmt_dur(day_screen)}，工作间隙刷 {wtops and wtops[0][0] or '手机'}")
+        print(f"  → 叙事：白天主要在公司（{fmt_dur(work_ms)}），屏幕共 {fmt_dur(day_screen)}，屏幕上用时最长的是 {wtops and wtops[0][0] or '手机'}")
 
     elif day_screen > 0:
 
         print(f"  → 叙事：白天屏幕 {fmt_dur(day_screen)}，主要活跃地点非家非公司（外出/通勤）")
 
-
-
-
-
 def _outings(conn: sqlite3.Connection, day: str, device_id: str | None = None) -> list:
 
     """P2：识别正式停留(stays)之外、且非家/公司的'短暂外出'，让已落库地点语义出现在画像里。
-
-
 
     方法：按网格聚合当日 GPS 精度较好(acc<=150)的点；每个网格内按 >45min 空档切段，
 
@@ -348,8 +312,6 @@ def _outings(conn: sqlite3.Connection, day: str, device_id: str | None = None) -
 
             work_windows.append((st["start_ts"] / 1000, st["end_ts"] / 1000))
 
-
-
     grid_pts: dict[str, list] = defaultdict(list)
 
     for r in conn.execute(
@@ -373,8 +335,6 @@ def _outings(conn: sqlite3.Connection, day: str, device_id: str | None = None) -
             continue
 
         grid_pts[f"{pl['lat']:.3f},{pl['lon']:.3f}"].append((r["ts"] / 1000, pl["lat"], pl["lon"]))
-
-
 
     cands = []
 
@@ -412,8 +372,6 @@ def _outings(conn: sqlite3.Connection, day: str, device_id: str | None = None) -
 
         return []
 
-
-
     cands.sort(key=lambda x: x["s"])
 
     groups, cur = [], [cands[0]]
@@ -432,19 +390,15 @@ def _outings(conn: sqlite3.Connection, day: str, device_id: str | None = None) -
 
     groups.append(cur)
 
-
-
     def _name(gk: str) -> str:
 
         p = grid_places.get(gk)
 
         if not p:
 
-            return gk
+            return "未知地点"  # 不输出坐标网格
 
-        return p["poi"] or p["poi_fallback"] or p["address"] or gk
-
-
+        return _place_safe_text(p)
 
     outings: list = []
 
@@ -498,31 +452,35 @@ def _outings(conn: sqlite3.Connection, day: str, device_id: str | None = None) -
 
     return outings
 
-
-
-
-
 _ACTIVITY_MAP = {
 
-    "餐饮服务": "用餐", "购物服务": "购物", "医疗保健服务": "就医",
+    # Task 10 证据边界：只给“场景”，不输出“用餐/就医”等确定性活动动词。
 
-    "体育休闲服务": "休闲", "科教文化服务": "学习/文娱", "娱乐场所": "娱乐",
+    "餐饮服务": "餐饮", "购物服务": "购物", "医疗保健服务": "医疗",
 
-    "生活服务": "生活服务", "住宿服务": "住宿", "风景名胜": "游玩",
+    "体育休闲服务": "休闲", "科教文化服务": "文娱", "娱乐场所": "娱乐",
+
+    "生活服务": "生活服务", "住宿服务": "住宿", "风景名胜": "风景",
 
 }
 
+_BEHAVIOR_SCENE = {
 
+    "用餐": "餐饮", "购物": "购物", "就医": "医疗", "休闲": "休闲",
 
+    "娱乐": "娱乐", "游玩": "风景", "住宿": "住宿",
 
+}
 
 def _activity_of(poi_type: str | None, behavior: str | None) -> str | None:
 
-    """P2-1 活动语义增强：把 POI type 中文大类/行为映射为活动动词（餐饮→用餐、医疗→就医等）。"""
+    """P2-1 活动语义增强：POI type 中文大类/行为 → 中性场景词（餐饮/医疗…）。
 
-    if behavior and behavior in _ACTIVITY_MAP.values():
+    Task 10 证据边界：只陈述“在 X 场景附近停留”，不断言用户“在用餐/就医”。"""
 
-        return behavior
+    if behavior and behavior in _BEHAVIOR_SCENE:
+
+        return _BEHAVIOR_SCENE[behavior]
 
     if poi_type:
 
@@ -534,9 +492,58 @@ def _activity_of(poi_type: str | None, behavior: str | None) -> str | None:
 
     return None
 
+def _place_safe_text(p: dict) -> str:
+
+    """统一 PlaceRef 安全文案（§2.6）：不输出坐标、grid_key、payload。"""
+
+    pn, _src, _gran = resolve_place_name(
+
+        poi=p.get("poi") or "",
+
+        poi_fallback=p.get("poi_fallback") or "",
+
+        address=p.get("address") or "",
+
+        district=p.get("district") or "",
+
+        township=p.get("township") or "",
+
+        business_area=p.get("business_area") or "",
+
+        parent_poi=p.get("parent_poi") or "",
+
+        name_confidence=p.get("name_confidence") or 0.0,
+
+        label=p.get("label") or "",
+
+    )
+
+    return format_place(pn, user_tag_of(p.get("label") or ""))
 
 
+def _place_safe_from_stay(st: dict) -> str:
 
+    """read_stays 行（内嵌 place_* 前缀字段）→ PlaceRef 安全文案。"""
+
+    pn, _s, _g = resolve_place_name(
+
+        poi=st.get("place_poi") or "",
+
+        poi_fallback=st.get("place_poi_fallback") or "",
+
+        address=st.get("place_address") or "",
+
+        district=st.get("place_district") or "",
+
+        township="", business_area="", parent_poi="",
+
+        name_confidence=st.get("place_name_confidence") or 0.0,
+
+        label=st.get("place_label") or "",
+
+    )
+
+    return format_place(pn, user_tag_of(st.get("place_label") or ""))
 
 def _consumption(conn: sqlite3.Connection, day: str, device_id: str | None = None) -> list:
 
@@ -568,15 +575,15 @@ def _consumption(conn: sqlite3.Connection, day: str, device_id: str | None = Non
 
     for p in rows:
 
-        act = _activity_of(p["poi_type"], p["behavior"]) or p["behavior"] or "活动"
+        # Task 10 证据边界：只陈述“在 X 场景附近停留”，不断言“在用餐/就医/上班”。
+
+        act = _activity_of(p["poi_type"], p["behavior"]) or "活动"
 
         items.append({
 
-            "activity": act,
+            "activity": f"在{act}附近停留",
 
-            "name": p["poi"] or p["address"] or p["grid_key"],
-
-            "lat": round(p["lat"], 4), "lon": round(p["lon"], 4),
+            "name": _place_safe_text(p),
 
             "visit_count": p["visit_count"],
 
@@ -600,25 +607,15 @@ def _consumption(conn: sqlite3.Connection, day: str, device_id: str | None = Non
 
             ba = f" · 商圈:{it['business_area']}" if it["business_area"] else ""
 
-            print(f"  [{it['activity']}] {it['name']} ({it['lat']},{it['lon']}) "
-
-                  f"常去 {it['visit_count']} 次{ba}")
+            print(f"  [{it['activity']}] {it['name']} 常去 {it['visit_count']} 次{ba}")
 
     return items
-
-
-
-
 
 def _avg_hhmm(dts: list) -> str:
 
     mins = sum(dt.hour * 60 + dt.minute for dt in dts) / max(1, len(dts))
 
     return f"{int(mins // 60):02d}:{int(mins % 60):02d}"
-
-
-
-
 
 def _avg_hhmm_night(dts: list) -> str:
 
@@ -639,10 +636,6 @@ def _avg_hhmm_night(dts: list) -> str:
     avg = sum(mins) // len(mins) % (24 * 60)
 
     return f"{avg // 60:02d}:{avg % 60:02d}"
-
-
-
-
 
 def _rhythm_weather(conn: sqlite3.Connection, day: str, device_id: str | None = None) -> dict:
 
@@ -731,8 +724,6 @@ def _rhythm_weather(conn: sqlite3.Connection, day: str, device_id: str | None = 
 
     result["rhythm"] = rhythm
 
-
-
     print("\n■ 节律与天气")
 
     print(f"  节律（近{len(days)}天）:")
@@ -756,8 +747,6 @@ def _rhythm_weather(conn: sqlite3.Connection, day: str, device_id: str | None = 
     print(f"    屏幕: 工作日平均 {fmt_dur(rhythm['weekday_screen_avg_ms'])}"
 
           f" / 周末平均 {fmt_dur(rhythm['weekend_screen_avg_ms'])}")
-
-
 
     try:
 
@@ -787,10 +776,6 @@ def _rhythm_weather(conn: sqlite3.Connection, day: str, device_id: str | None = 
 
     return result
 
-
-
-
-
 def _write_snapshot(
     conn: sqlite3.Connection, day: str, profile: dict,
     device_id: str | None = None,
@@ -814,13 +799,10 @@ def _write_snapshot(
 
     print(f"  → L5 画像快照已落盘: {p}")
 
-
-
-
-
 def report(
     conn: sqlite3.Connection, day: str, verbose: bool = False,
     device_id: str | None = None,
+    now_override: datetime.datetime | None = None,
 ) -> None:
     """生成某日画像报告。
 
@@ -828,6 +810,10 @@ def report(
     MultiDeviceError（禁止合并画像），单设备自动采用，无数据按全库空态处理。
     指定后所有事实查询（daily_stats/sessions/events/places/stays/anomalies/
     persona）都按该设备过滤。
+
+    now_override（P2-3 注入点）：数据水位比较用的“当前时刻”，仅影响
+    “最后定位早于当前”的措辞分支；默认 now_cst()。测试可传固定时刻，
+    避免断言随时间漂移。
     """
 
     conn.row_factory = sqlite3.Row
@@ -844,7 +830,41 @@ def report(
 
     print("=" * 52)
 
+    # ---------- 数据水位（Task 10 证据边界：不冒充“此刻”） ----------
 
+    # 最后定位早于当前时间时只输出“最后记录到”，避免把历史画像写成“当前正在”。
+
+    import datetime  # noqa: F401（函数体内已有 local import 约定）
+
+    try:
+
+        _last_row = conn.execute(
+
+            f"SELECT MAX(ts) m FROM events WHERE type='location'{dev_frag}",
+
+            list(dev_args),
+
+        ).fetchone()
+
+    except sqlite3.OperationalError:  # 缺 events 表（极简库）
+
+        _last_row = None
+
+    if _last_row and _last_row["m"]:
+
+        last_dt = datetime.datetime.fromtimestamp(_last_row["m"] / 1000, tz=_TZ_CST)
+
+        now_ref = now_override or now_cst()
+
+        if last_dt < now_ref:
+
+            print(f"  最后定位记录到 {last_dt:%Y-%m-%d %H:%M}"
+
+                  "（早于当前，以下画像均截至该时刻）")
+
+        else:
+
+            print(f"  最后定位记录到 {last_dt:%Y-%m-%d %H:%M}（时间近似当前）")
 
     # ---------- 1. 屏幕时间 ----------
 
@@ -872,8 +892,6 @@ def report(
 
         print(f"  {i}. {app['app']}: {fmt_dur(app['ms'])}")
 
-
-
     # 最长连续使用段（沉浸时段）
 
     top = conn.execute(
@@ -896,8 +914,6 @@ def report(
 
             print(f"    {t} {s['app']} {fmt_dur(s['duration_ms'])}")
 
-
-
     # ---------- 2. 通知疲劳 ----------
 
     print("\n■ 通知疲劳")
@@ -915,8 +931,6 @@ def report(
         for a in notif_apps:
 
             print(f"    {a['app']}: {a['n']} 条")
-
-
 
     # 每小时分布（找轰炸时段）
 
@@ -941,8 +955,6 @@ def report(
 
             print(f"    {r['h']}:00 {r['n']:3d} {bar}")
 
-
-
     # 高量低点击 → 建议关闭
 
     if notif_apps:
@@ -954,8 +966,6 @@ def report(
             if a["n"] >= 3:
 
                 print(f"    「{a['app']}」{a['n']} 条 — 若多为无关推送可考虑关通知")
-
-
 
     # ---------- 3. 睡眠推断 ----------
 
@@ -997,8 +1007,6 @@ def report(
 
     print(f"  亮屏 {screen_on} 次, 解锁 {row['unlock_count']} 次")
 
-
-
     # ---------- 4. 场景分布 ----------
 
     print("\n■ 场景分布")
@@ -1011,11 +1019,7 @@ def report(
 
     for p in places:
 
-        # P2：优先 label；未知且无候选时用已落库 poi 名展示，不再一律藏成 [未知]
-
-        poi_name = p["poi"] or p["poi_fallback"] or ""
-
-        disp = p["label"]
+        # Task 10 证据边界：统一 PlaceRef 安全文案，不输出坐标、grid_key、payload。
 
         if p["label"] == "未知":
 
@@ -1025,29 +1029,25 @@ def report(
 
             else:
 
-                disp = poi_name or "未知"
+                disp = _place_safe_text(p)
 
-        print(f"  [{disp}] ({p['lat']:.4f},{p['lon']:.4f}) 访问 {p['visit_count']} 次"
+        else:
 
-              + (f" · {poi_name}" if poi_name and poi_name != disp else ""))
+            disp = _place_safe_text(p)
+
+        print(f"  [{disp}] 访问 {p['visit_count']} 次")
 
         scenes.append({
 
-            "display": disp, "poi": poi_name,
-
-            "lat": round(p["lat"], 6), "lon": round(p["lon"], 6),
+            "display": disp,
 
             "visit_count": p["visit_count"], "label": p["label"],
 
         })
 
-
-
     # ---------- 4.5 短暂停留/外出（P2：让'去了哪'如实出现在画像里） ----------
 
     outings = _outings(conn, day, device_id)
-
-
 
     # ---------- 5. 家/公司确认（P1-1 画像确认闭环入口） ----------
 
@@ -1061,9 +1061,9 @@ def report(
 
             conf = f"家 {p['confidence_home']:.2f} / 公司 {p['confidence_work']:.2f}"
 
-            print(f"  [疑似{p['candidate_label']}] ({p['lat']:.4f},{p['lon']:.4f}) "
+            print(f"  [疑似{p['candidate_label']}] 访问 {p['visit_count']} 次"
 
-                  f"访问 {p['visit_count']} 次 · {conf} · {p['poi'] or '无POI'}")
+                  f" · {conf} · {_place_safe_text(p)}")
 
         print("  → 运行 python -m gacore.langTrack.label_places 确认定名，"
 
@@ -1072,8 +1072,6 @@ def report(
     else:
 
         print("  暂无待确认候选点")
-
-
 
     # ---------- 6. 新地点/异常事件（P1-3 打破规律的点，作画像叙事节点） ----------
 
@@ -1117,12 +1115,9 @@ def report(
 
             print(f"  [{kind_label}] {a['detail']}")
 
-
-
     # ---------- 7. 时段·位置·App 融合（P1-4 位置语义与使用数据对齐） ----------
     print("\n■ 时段·位置·App 融合")
     _fusion(conn, day, device_id)
-
 
     # ---------- 7.5 采集覆盖（A① 契约覆盖校验） ----------
     print("\n■ 采集覆盖")
@@ -1149,19 +1144,13 @@ def report(
                         r["last_seen_ts"] / 1000).strftime("%Y-%m-%d %H:%M")
                 print(f"  [{label}] {r['type']}（{r['desc'] or '—'}） 消耗:{r['consumed']}{last}")
 
-
     # ---------- 8. 消费/商圈画像（P2-1） ----------
 
     consumption = _consumption(conn, day, device_id)
 
-
-
     # ---------- 9. 节律建模 + 天气语境（P2-2） ----------
 
     rhythm_weather = _rhythm_weather(conn, day, device_id)
-
-
-
 
     # ---------- 9.5 人物画像（C1 north-star 输出） ----------
     print("\n■ 人物画像")
@@ -1266,8 +1255,6 @@ def report(
 
     _write_snapshot(conn, day, profile, device_id=multi_day_device)
 
-
-
     if verbose:
 
         print("\n■ 原始明细（usage 今日）")
@@ -1285,10 +1272,6 @@ def report(
             t = datetime.datetime.fromtimestamp(s["start_ms"] / 1000).strftime("%H:%M")
 
             print(f"    {t} {s['app']} {fmt_dur(s['duration_ms'])}")
-
-
-
-
 
 def main() -> None:
 
@@ -1331,10 +1314,6 @@ def main() -> None:
         raise SystemExit(2)
 
     conn.close()
-
-
-
-
 
 if __name__ == "__main__":
 
